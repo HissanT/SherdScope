@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments and local configuration
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Runtime data and generated outputs
+projects/
+outputs/
+pdf2img_outputs/
+uploads/
+logs/
+*.log
+
+# Downloaded model weights and caches
+models_vision/
+models_classifier/
+models_llm/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Research source documents and local datasets
+*.pdf
+*.csv
+*.tsv
+*.xlsx
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
