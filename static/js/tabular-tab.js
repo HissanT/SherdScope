@@ -15,7 +15,11 @@ let tabularState = {
     fullImageUrl: null,  // Full resolution image URL for zoom
     showBoxes: true,  // Toggle bounding-box overlay on the page image
     metadataLinkState: null,
-    metadataLinkPoll: null
+    metadataLinkPoll: null,
+    metadataSaveTimers: new Map(),
+    metadataDirty: new Set(),
+    metadataUndo: new Map(),
+    metadataSnapshots: new Map()
 };
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -26,6 +30,11 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('projectChanged', (e) => {
         const project = e.detail && e.detail.project ? e.detail.project : null;
         tabularState.currentProject = project;
+        tabularState.metadataDirty.clear();
+        tabularState.metadataUndo.clear();
+        tabularState.metadataSnapshots.clear();
+        tabularState.metadataSaveTimers.forEach(timer => clearTimeout(timer));
+        tabularState.metadataSaveTimers.clear();
         loadProjectCards();
     });
 });
@@ -791,6 +800,7 @@ const HESBAN_LINK_COLUMNS = HESBAN_LINK_FIELDS.map(field => field[0]);
 
 function hesbanGroupedHeaders() {
     return `<tr class="metadata-link-group-header">
+        <th rowspan="2" class="sticky-col sticky-actions">Actions</th>
         <th rowspan="2" class="sticky-col sticky-no">No.</th>
         <th rowspan="2" class="sticky-col sticky-type">Type</th>
         <th rowspan="2">Sq</th><th rowspan="2">Loc</th><th rowspan="2">Pail</th><th rowspan="2">Reg</th>
@@ -910,15 +920,67 @@ function renderMetadataLinkState(state, active) {
         progress.title = state?.progress?.message || '';
     }
     if (!figuresContainer) return;
+    // Progress polling runs every 1.5 seconds while OCR is active. Preserve
+    // the reviewer's UI state before replacing the updated figure markup;
+    // otherwise every poll closes the figure they are currently inspecting.
+    const renderProject = String(tabularState.currentProject?.project_id || '');
+    const hadPreviousRender = figuresContainer.dataset.renderProject === renderProject;
+    const editingCurrentFigure = hadPreviousRender && (
+        tabularState.metadataDirty.size > 0 || figuresContainer.contains(document.activeElement));
+    if (editingCurrentFigure) return;
+    const openFigures = new Set(
+        [...figuresContainer.querySelectorAll('.metadata-link-figure[open]')]
+            .map(element => element.dataset.linkFigure));
+    const tableScroll = new Map(
+        [...figuresContainer.querySelectorAll('.metadata-link-figure')].map(element => {
+            const wrap = element.querySelector('.metadata-link-table-wrap');
+            return [element.dataset.linkFigure, {
+                left: wrap?.scrollLeft || 0,
+                top: wrap?.scrollTop || 0
+            }];
+        }));
     figuresContainer.innerHTML = figures.map(renderMetadataFigure).join('');
+    figures.forEach(figure => tabularState.metadataSnapshots.set(
+        figure.figure_id, structuredClone(figure)));
+    figuresContainer.dataset.renderProject = renderProject;
+    if (hadPreviousRender) {
+        figuresContainer.querySelectorAll('.metadata-link-figure').forEach(element => {
+            element.open = openFigures.has(element.dataset.linkFigure);
+            const wrap = element.querySelector('.metadata-link-table-wrap');
+            const saved = tableScroll.get(element.dataset.linkFigure);
+            if (wrap && saved) {
+                wrap.scrollLeft = saved.left;
+                wrap.scrollTop = saved.top;
+            }
+        });
+    }
     figuresContainer.querySelectorAll('[data-link-save]').forEach(button =>
-        button.addEventListener('click', () => saveMetadataFigure(button.dataset.linkSave)));
+        button.addEventListener('click', () => saveMetadataFigure(button.dataset.linkSave)
+            .catch(error => window.PyPotteryUtils.showToast(error.message, 'error'))));
     figuresContainer.querySelectorAll('[data-link-approve]').forEach(button =>
         button.addEventListener('click', () => approveMetadataFigure(button.dataset.linkApprove)));
     figuresContainer.querySelectorAll('[data-link-reject]').forEach(button =>
         button.addEventListener('click', () => rejectMetadataFigure(button.dataset.linkReject)));
     figuresContainer.querySelectorAll('[data-link-add-row]').forEach(button =>
         button.addEventListener('click', () => addMetadataTableRow(button.dataset.linkAddRow)));
+    figuresContainer.querySelectorAll('[data-link-delete-row]').forEach(button =>
+        button.addEventListener('click', () => deleteMetadataTableRow(
+            button.dataset.linkDeleteRow, Number(button.dataset.rowIndex))));
+    figuresContainer.querySelectorAll('[data-link-duplicate-row]').forEach(button =>
+        button.addEventListener('click', () => duplicateMetadataTableRow(
+            button.dataset.linkDuplicateRow, Number(button.dataset.rowIndex))));
+    figuresContainer.querySelectorAll('[data-link-sort-rows]').forEach(button =>
+        button.addEventListener('click', () => sortMetadataTableRows(button.dataset.linkSortRows)));
+    figuresContainer.querySelectorAll('[data-link-undo-row]').forEach(button =>
+        button.addEventListener('click', () => undoMetadataRowDelete(button.dataset.linkUndoRow)));
+    figuresContainer.querySelectorAll('[data-link-restore]').forEach(button =>
+        button.addEventListener('click', () => restoreMetadataFigure(button.dataset.linkRestore)));
+    figuresContainer.querySelectorAll('[data-warning-toggle]').forEach(button =>
+        button.addEventListener('click', () => toggleMetadataWarning(
+            button.dataset.figureId, button.dataset.warningToggle)));
+    figuresContainer.querySelectorAll('[data-warning-focus]').forEach(button =>
+        button.addEventListener('click', () => focusMetadataWarning(
+            button.dataset.figureId, button.dataset.warningFocus)));
     figuresContainer.querySelectorAll('[data-link-rerun]').forEach(button =>
         button.addEventListener('click', () => rerunMetadataFigure(button.dataset.linkRerun)));
     figuresContainer.querySelectorAll('.metadata-link-table textarea').forEach(textarea => {
@@ -929,11 +991,33 @@ function renderMetadataLinkState(state, active) {
         textarea.addEventListener('input', resize);
         resize();
     });
+    figuresContainer.querySelectorAll(
+        '[data-link-figure-id], [data-link-caption], [data-link-table-pages], ' +
+        '[data-link-drawing-number], [data-link-column], [data-warning-reason], [data-warning-note]'
+    ).forEach(input => {
+        input.addEventListener('input', () => {
+            input.classList.add('metadata-link-edited');
+            scheduleMetadataAutosave(input.closest('[data-link-figure]').dataset.linkFigure);
+        });
+        input.addEventListener('change', () =>
+            scheduleMetadataAutosave(input.closest('[data-link-figure]').dataset.linkFigure));
+    });
+    figuresContainer.querySelectorAll('[data-link-drawing-number]').forEach(input => {
+        input.addEventListener('focus', () => selectMetadataDrawing(
+            input.closest('[data-link-figure]').dataset.linkFigure, input));
+        input.addEventListener('click', () => selectMetadataDrawing(
+            input.closest('[data-link-figure]').dataset.linkFigure, input));
+    });
+    figuresContainer.querySelectorAll('[data-link-figure]').forEach(element =>
+        validateMetadataFigureDom(element.dataset.linkFigure));
 }
 
 function renderMetadataFigure(figure) {
     const projectId = tabularState.currentProject.project_id;
-    const status = figure.review_status === 'approved' ? 'approved' : figure.status;
+    const processing = figure.processing_status === 'processing';
+    const status = figure.review_status === 'approved' ? 'approved'
+        : processing ? 'processing' : figure.status;
+    const disabled = processing ? 'disabled' : '';
     const evidencePages = [
         ...(figure.drawing_pages || []).map(page => ({...page, kind: 'drawing'})),
         ...(figure.table_pages || []).map(page => ({...page, kind: 'table'}))
@@ -942,46 +1026,101 @@ function renderMetadataFigure(figure) {
         const evidenceUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/${encodeURIComponent(page.image_name)}` +
             `?figure=${encodeURIComponent(figure.figure_id)}&kind=${page.kind}&overlay=1&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
         return `<a href="${evidenceUrl}" target="_blank">
-            <img src="${evidenceUrl}" alt="${linkEscape(page.image_name)}"
+            <img src="${evidenceUrl}" data-evidence-kind="${page.kind}" alt="${linkEscape(page.image_name)}"
                  title="${linkEscape(page.kind)}: ${linkEscape(page.image_name)}">
         </a>`;
     }).join('');
     const drawings = (figure.drawings || []).map(drawing => `
-        <label class="metadata-link-drawing">
-            <span title="${linkEscape(drawing.mask_file)}">No.</span>
+        <label class="metadata-link-drawing" data-mask-file="${linkEscape(drawing.mask_file)}">
+            <span title="${linkEscape(drawing.mask_file)}">Printed No.</span>
             <input class="form-control" data-link-drawing-number data-mask-file="${linkEscape(drawing.mask_file)}"
-                   value="${linkEscape(drawing.vessel_number || '')}" aria-label="Printed vessel number">
+                   value="${linkEscape(drawing.vessel_number || '')}" aria-label="Printed vessel number" ${disabled}>
         </label>`).join('');
     const rows = (figure.table_rows || []).map((row, rowIndex) => `
-        <tr data-link-row="${rowIndex}">${HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
-            `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}">${linkEscape(row[column] || '')}</textarea></td>`).join('')}</tr>`).join('');
-    const warnings = (figure.warnings || []).map(warning => `<li>${linkEscape(warning.message)}</li>`).join('');
+        <tr data-link-row="${rowIndex}">
+            <td class="sticky-col sticky-actions metadata-link-row-actions">
+                <button type="button" aria-label="Duplicate row ${rowIndex + 1}" title="Duplicate row"
+                        data-link-duplicate-row="${linkEscape(figure.figure_id)}" data-row-index="${rowIndex}" ${disabled}>⧉</button>
+                <button type="button" aria-label="Delete row ${rowIndex + 1}" title="Delete row"
+                        data-link-delete-row="${linkEscape(figure.figure_id)}" data-row-index="${rowIndex}" ${disabled}>🗑</button>
+            </td>${HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
+            `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}" ${disabled}>${linkEscape(row[column] || '')}</textarea></td>`).join('')}</tr>`).join('');
+    const overrides = figure.warning_overrides || {};
+    const warnings = (figure.warnings || []).map(warning => {
+        const active = !!warning.overridden;
+        const reasonOptions = warning.code === 'missing_table_end'
+            ? [['visually_confirmed_complete', 'Visually confirmed table ending']]
+            : warning.code === 'missing_required_value'
+                ? [['publication_field_blank', 'Publication field is genuinely blank']]
+                : [['column_alignment_verified', 'Column alignment visually verified']];
+        const override = overrides[warning.id] || {};
+        const controls = warning.overrideable ? `<div class="metadata-link-warning-review">
+            <select data-warning-reason ${disabled}>${reasonOptions.map(([value, label]) =>
+                `<option value="${value}" ${override.reason === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+            <input data-warning-note placeholder="Optional reviewer note" value="${linkEscape(override.note || '')}" ${disabled}>
+            <button type="button" data-warning-toggle="${warning.id}" data-figure-id="${linkEscape(figure.figure_id)}" ${disabled}>
+                ${active ? 'Remove override' : 'Mark reviewed and ignore'}
+            </button></div>` : '';
+        const focus = warning.row || warning.mask_file ? `<button type="button" class="metadata-warning-focus"
+            data-warning-focus="${warning.id}" data-figure-id="${linkEscape(figure.figure_id)}">Go to problem</button>` : '';
+        return `<article class="metadata-link-warning-card ${warning.blocking ? 'blocking' : 'resolved'}"
+                         data-warning-id="${warning.id}" data-warning-code="${warning.code}"
+                         data-warning-row="${linkEscape(warning.row || '')}"
+                         data-warning-mask="${linkEscape(warning.mask_file || '')}"
+                         data-override-active="${active ? '1' : '0'}">
+            <div><strong>${active ? 'Reviewed' : warning.blocking ? 'Needs attention' : 'Information'}</strong>
+            <span>${linkEscape(warning.message)}</span>${focus}</div>${controls}</article>`;
+    }).join('');
     const tablePageNames = (figure.table_pages || []).map(page => page.image_name).join(', ');
     const open = figure.status === 'needs_review' ? 'open' : '';
-    return `<details class="metadata-link-figure" data-link-figure="${linkEscape(figure.figure_id)}" ${open}>
+    const blockers = (figure.warnings || []).filter(warning => warning.blocking).length;
+    const unmatched = (figure.matches || []).filter(match => match.status !== 'ready').length;
+    return `<details class="metadata-link-figure" data-link-figure="${linkEscape(figure.figure_id)}"
+                    data-reviewer-revision="${Number(figure.reviewer_revision || 0)}" ${open}>
         <summary><strong>Figure ${linkEscape(figure.figure_id)}</strong>
             <span class="metadata-link-badge ${linkEscape(status)}">${linkEscape(status)}</span>
             <span>${(figure.drawings || []).length} drawings / ${(figure.table_rows || []).length} rows</span>
         </summary>
         <div class="metadata-link-figure-body">
-            <label>Figure ID <input class="form-control" data-link-figure-id value="${linkEscape(figure.figure_id || '')}"></label>
-            <label>Caption <input class="form-control" data-link-caption value="${linkEscape(figure.figure_caption || '')}"></label>
+            <div class="metadata-link-save-strip">
+                <strong>Review workspace</strong>
+                <span data-link-save-status aria-live="polite">${processing ? 'OCR processing…' : 'Saved'}</span>
+            </div>
+            <label>Figure ID <input class="form-control" data-link-figure-id value="${linkEscape(figure.figure_id || '')}" ${disabled}></label>
+            <label>Caption <input class="form-control" data-link-caption value="${linkEscape(figure.figure_caption || '')}" ${disabled}></label>
             <label>Table page image names (comma-separated)
-                <input class="form-control" data-link-table-pages value="${linkEscape(tablePageNames)}">
+                <input class="form-control" data-link-table-pages value="${linkEscape(tablePageNames)}" ${disabled}>
             </label>
             <div class="metadata-link-evidence">
                 <div><h4>Source evidence</h4><div class="metadata-link-pages">${pageHtml}</div></div>
-                <div><h4>Drawing numbers</h4><div class="metadata-link-drawings">${drawings}</div></div>
+                <div class="metadata-link-number-workspace"><h4>Drawing numbers</h4>
+                    <p>Click a number to highlight its linked table row and drawing box.</p>
+                    <div class="metadata-link-drawings">${drawings}</div></div>
             </div>
-            <div class="metadata-link-table-section"><h4>Extracted table</h4><div class="metadata-link-table-wrap">
+            <div class="metadata-link-table-section"><div class="metadata-link-table-toolbar">
+                <h4>Extracted table</h4>
+                <button type="button" data-link-add-row="${linkEscape(figure.figure_id)}" ${disabled}>Add row</button>
+                <button type="button" data-link-sort-rows="${linkEscape(figure.figure_id)}" ${disabled}>Sort by No.</button>
+                <button type="button" data-link-undo-row="${linkEscape(figure.figure_id)}" ${disabled}>Undo delete</button>
+                <button type="button" data-link-restore="${linkEscape(figure.figure_id)}" ${disabled}>Restore last saved</button>
+            </div><div class="metadata-link-table-wrap">
                 <table class="metadata-link-table"><thead>${hesbanGroupedHeaders()}</thead><tbody>${rows}</tbody></table>
-            </div><button class="btn btn-secondary" data-link-add-row="${linkEscape(figure.figure_id)}">Add row</button></div>
-            ${warnings ? `<ul class="metadata-link-warnings">${warnings}</ul>` : ''}
+            </div></div>
+            ${warnings ? `<section class="metadata-link-warnings"><h4>Review warnings</h4>${warnings}</section>` : ''}
+            <div class="metadata-link-readiness ${blockers || unmatched ? 'blocked' : 'ready'}">
+                <strong>CSV readiness</strong>
+                <span>${processing ? 'This figure is still processing.' : blockers
+                    ? `${blockers} blocking warning(s) remain.` : unmatched
+                        ? `${unmatched} drawing/table match(es) remain unresolved.`
+                        : 'Unique matches are ready for approval.'}</span>
+            </div>
             <div class="metadata-link-review-actions">
-                <button class="btn btn-secondary" data-link-save="${linkEscape(figure.figure_id)}">Save edits</button>
-                <button class="btn btn-secondary" data-link-rerun="${linkEscape(figure.figure_id)}">Rerun OCR for this figure</button>
-                <button class="btn btn-success" data-link-approve="${linkEscape(figure.figure_id)}" ${figure.status !== 'ready' ? 'disabled' : ''}>Approve and apply to CSV</button>
-                <button class="btn btn-danger" data-link-reject="${linkEscape(figure.figure_id)}">Reject</button>
+                <button class="btn btn-secondary" data-link-save="${linkEscape(figure.figure_id)}" ${disabled}>Save now</button>
+                <button class="btn btn-secondary" data-link-rerun="${linkEscape(figure.figure_id)}"
+                        ${processing || tabularState.metadataLinkState?.status === 'running' ? 'disabled' : ''}>Rerun OCR for this figure</button>
+                <button class="btn btn-success" data-link-approve="${linkEscape(figure.figure_id)}"
+                        ${figure.status !== 'ready' || tabularState.metadataLinkState?.status === 'running' ? 'disabled' : ''}>Approve and apply to CSV</button>
+                <button class="btn btn-danger" data-link-reject="${linkEscape(figure.figure_id)}" ${disabled}>Reject</button>
             </div>
         </div></details>`;
 }
@@ -992,9 +1131,146 @@ function addMetadataTableRow(figureId) {
     const body = figureEl?.querySelector('.metadata-link-table tbody');
     if (!body) return;
     const row = document.createElement('tr');
-    row.innerHTML = HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
-        `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}"></textarea></td>`).join('');
+    row.innerHTML = metadataDynamicRowCells(figureId, body.children.length, {});
     body.appendChild(row);
+    wireMetadataDynamicRow(row, figureId);
+    scheduleMetadataAutosave(figureId);
+    row.querySelector('[data-link-column="table_no"]')?.focus();
+}
+
+function metadataDynamicRowCells(figureId, rowIndex, values) {
+    return `<td class="sticky-col sticky-actions metadata-link-row-actions">
+        <button type="button" title="Duplicate row" aria-label="Duplicate row ${rowIndex + 1}"
+                data-link-duplicate-row="${linkEscape(figureId)}" data-row-index="${rowIndex}">⧉</button>
+        <button type="button" title="Delete row" aria-label="Delete row ${rowIndex + 1}"
+                data-link-delete-row="${linkEscape(figureId)}" data-row-index="${rowIndex}">🗑</button>
+    </td>` + HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
+        `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}">${linkEscape(values[column] || '')}</textarea></td>`).join('');
+}
+
+function wireMetadataDynamicRow(row, figureId) {
+    row.querySelector('[data-link-delete-row]')?.addEventListener('click', event =>
+        deleteMetadataTableRow(figureId, Number(event.currentTarget.dataset.rowIndex)));
+    row.querySelector('[data-link-duplicate-row]')?.addEventListener('click', event =>
+        duplicateMetadataTableRow(figureId, Number(event.currentTarget.dataset.rowIndex)));
+    row.querySelectorAll('textarea').forEach(textarea => {
+        autoGrowMetadataTextarea(textarea);
+        textarea.addEventListener('input', () => {
+            autoGrowMetadataTextarea(textarea);
+            textarea.classList.add('metadata-link-edited');
+            scheduleMetadataAutosave(figureId);
+        });
+    });
+}
+
+function autoGrowMetadataTextarea(textarea) {
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.max(44, textarea.scrollHeight)}px`;
+}
+
+function reindexMetadataRows(figureId) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    [...(figureEl?.querySelectorAll('.metadata-link-table tbody tr') || [])].forEach((row, index) => {
+        row.dataset.linkRow = index;
+        row.querySelectorAll('[data-row-index]').forEach(button => button.dataset.rowIndex = index);
+    });
+    validateMetadataFigureDom(figureId);
+}
+
+function readMetadataRow(row) {
+    const result = {};
+    row.querySelectorAll('[data-link-column]').forEach(input => result[input.dataset.linkColumn] = input.value);
+    return result;
+}
+
+function deleteMetadataTableRow(figureId, rowIndex) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    const rows = [...(figureEl?.querySelectorAll('.metadata-link-table tbody tr') || [])];
+    const row = rows[rowIndex];
+    if (!row) return;
+    const stack = tabularState.metadataUndo.get(figureId) || [];
+    stack.push({index: rowIndex, row: readMetadataRow(row)});
+    tabularState.metadataUndo.set(figureId, stack);
+    row.remove();
+    reindexMetadataRows(figureId);
+    scheduleMetadataAutosave(figureId);
+}
+
+function undoMetadataRowDelete(figureId) {
+    const stack = tabularState.metadataUndo.get(figureId) || [];
+    const deleted = stack.pop();
+    if (!deleted) return;
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    const body = figureEl?.querySelector('.metadata-link-table tbody');
+    if (!body) return;
+    const row = document.createElement('tr');
+    row.innerHTML = metadataDynamicRowCells(figureId, deleted.index, deleted.row);
+    body.insertBefore(row, body.children[deleted.index] || null);
+    wireMetadataDynamicRow(row, figureId);
+    reindexMetadataRows(figureId);
+    scheduleMetadataAutosave(figureId);
+}
+
+function duplicateMetadataTableRow(figureId, rowIndex) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    const body = figureEl?.querySelector('.metadata-link-table tbody');
+    const source = body?.children[rowIndex];
+    if (!source) return;
+    const row = document.createElement('tr');
+    row.innerHTML = metadataDynamicRowCells(figureId, rowIndex + 1, readMetadataRow(source));
+    body.insertBefore(row, body.children[rowIndex + 1] || null);
+    wireMetadataDynamicRow(row, figureId);
+    reindexMetadataRows(figureId);
+    scheduleMetadataAutosave(figureId);
+}
+
+function sortMetadataTableRows(figureId) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    const body = figureEl?.querySelector('.metadata-link-table tbody');
+    if (!body) return;
+    [...body.children].sort((a, b) =>
+        (a.querySelector('[data-link-column="table_no"]')?.value || '').localeCompare(
+            b.querySelector('[data-link-column="table_no"]')?.value || '', undefined,
+            {numeric: true, sensitivity: 'base'})).forEach(row => body.appendChild(row));
+    reindexMetadataRows(figureId);
+    scheduleMetadataAutosave(figureId);
+}
+
+function restoreMetadataFigure(figureId) {
+    const snapshot = tabularState.metadataSnapshots.get(figureId);
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    if (!snapshot || !figureEl) return;
+    const body = figureEl.querySelector('.metadata-link-table tbody');
+    body.innerHTML = (snapshot.table_rows || []).map((row, index) =>
+        `<tr data-link-row="${index}">${metadataDynamicRowCells(figureId, index, row)}</tr>`).join('');
+    body.querySelectorAll('tr').forEach(row => wireMetadataDynamicRow(row, figureId));
+    const numbers = new Map((snapshot.drawings || []).map(drawing => [drawing.mask_file, drawing.vessel_number || '']));
+    figureEl.querySelectorAll('[data-link-drawing-number]').forEach(input =>
+        input.value = numbers.get(input.dataset.maskFile) || '');
+    const figureIdInput = figureEl.querySelector('[data-link-figure-id]');
+    const captionInput = figureEl.querySelector('[data-link-caption]');
+    const pagesInput = figureEl.querySelector('[data-link-table-pages]');
+    if (figureIdInput) figureIdInput.value = snapshot.figure_id || '';
+    if (captionInput) captionInput.value = snapshot.figure_caption || '';
+    if (pagesInput) pagesInput.value = (snapshot.table_pages || [])
+        .map(page => page.image_name).filter(Boolean).join(', ');
+    const overrides = snapshot.warning_overrides || {};
+    figureEl.querySelectorAll('[data-warning-id]').forEach(card => {
+        const override = overrides[card.dataset.warningId];
+        card.dataset.overrideActive = override ? '1' : '0';
+        card.classList.toggle('resolved', !!override);
+        card.classList.toggle('blocking', !override);
+        const reason = card.querySelector('[data-warning-reason]');
+        const note = card.querySelector('[data-warning-note]');
+        const toggle = card.querySelector('[data-warning-toggle]');
+        if (reason) reason.value = override?.reason || '';
+        if (note) note.value = override?.note || '';
+        if (toggle) toggle.textContent = override
+            ? 'Remove override' : 'Mark reviewed and ignore';
+    });
+    tabularState.metadataDirty.delete(figureId);
+    setMetadataSaveStatus(figureId, 'Restored');
+    validateMetadataFigureDom(figureId);
 }
 
 function collectMetadataFigureEdits(figureId) {
@@ -1006,34 +1282,185 @@ function collectMetadataFigureEdits(figureId) {
         drawingNumbers[input.dataset.maskFile] = input.value;
     });
     const tableRows = [...figureEl.querySelectorAll('.metadata-link-table tbody tr')].map(row => {
-        const result = {};
-        row.querySelectorAll('[data-link-column]').forEach(input => result[input.dataset.linkColumn] = input.value);
-        return result;
+        return readMetadataRow(row);
     });
     const existing = tabularState.metadataLinkState.figures.find(figure => figure.figure_id === figureId);
     const existingPages = new Map((existing?.table_pages || []).map(page => [page.image_name, page]));
     const pageNames = (figureEl.querySelector('[data-link-table-pages]')?.value || '')
         .split(',').map(value => value.trim()).filter(Boolean);
+    const warningOverrides = {};
+    figureEl.querySelectorAll('[data-warning-id][data-override-active="1"]').forEach(card => {
+        warningOverrides[card.dataset.warningId] = {
+            reason: card.querySelector('[data-warning-reason]')?.value || '',
+            note: card.querySelector('[data-warning-note]')?.value || ''
+        };
+    });
     return {
+        reviewer_revision: Number(figureEl.dataset.reviewerRevision || existing?.reviewer_revision || 0),
         figure_id: figureEl.querySelector('[data-link-figure-id]')?.value || figureId,
         figure_caption: figureEl.querySelector('[data-link-caption]')?.value || '',
         drawing_numbers: drawingNumbers,
         table_rows: tableRows,
-        table_pages: pageNames.map(name => existingPages.get(name) || {image_name: name})
+        table_pages: pageNames.map(name => existingPages.get(name) || {image_name: name}),
+        warning_overrides: warningOverrides
     };
 }
 
-async function saveMetadataFigure(figureId, quiet = false) {
+function setMetadataSaveStatus(figureId, text, failed = false) {
+    const element = document.querySelector(
+        `[data-link-figure="${CSS.escape(figureId)}"] [data-link-save-status]`);
+    if (element) {
+        element.textContent = text;
+        element.classList.toggle('failed', failed);
+    }
+}
+
+function scheduleMetadataAutosave(figureId) {
+    if (!figureId) return;
+    tabularState.metadataDirty.add(figureId);
+    setMetadataSaveStatus(figureId, 'Unsaved');
+    validateMetadataFigureDom(figureId);
+    clearTimeout(tabularState.metadataSaveTimers.get(figureId));
+    tabularState.metadataSaveTimers.set(figureId, setTimeout(
+        () => saveMetadataFigure(figureId, true).catch(() => {
+            tabularState.metadataDirty.add(figureId);
+            setMetadataSaveStatus(figureId, 'Save failed', true);
+        }), 700));
+}
+
+async function saveMetadataFigure(figureId, quiet = false, retryConflict = true) {
     const edits = collectMetadataFigureEdits(figureId);
     if (!edits) return null;
-    const response = await window.PyPotteryUtils.apiRequest(
+    setMetadataSaveStatus(figureId, 'Saving…');
+    const raw = await fetch(
         `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}`, {
-            method: 'PATCH', body: JSON.stringify(edits)
+            method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(edits)
         });
-    if (!response.success) throw new Error(response.error || 'Could not save figure');
+    const response = await raw.json();
+    if (raw.status === 409 && response.conflict && retryConflict) {
+        const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+        if (figureEl) figureEl.dataset.reviewerRevision = response.reviewer_revision;
+        return saveMetadataFigure(figureId, quiet, false);
+    }
+    if (!raw.ok || !response.success) {
+        tabularState.metadataDirty.add(figureId);
+        setMetadataSaveStatus(figureId, 'Save failed', true);
+        if (!quiet) throw new Error(response.error || 'Could not save figure');
+        return null;
+    }
+    const index = tabularState.metadataLinkState.figures.findIndex(figure => figure.figure_id === figureId);
+    if (index >= 0) tabularState.metadataLinkState.figures[index] = response.figure;
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    if (figureEl) figureEl.dataset.reviewerRevision = response.reviewer_revision;
+    tabularState.metadataSnapshots.set(figureId, structuredClone(response.figure));
+    tabularState.metadataDirty.delete(figureId);
+    setMetadataSaveStatus(figureId, 'Saved');
+    updateMetadataReadinessFromFigure(figureId, response.figure);
     if (!quiet) window.PyPotteryUtils.showToast(`Figure ${figureId} saved`, 'success');
-    await loadMetadataLinkState();
+    validateMetadataFigureDom(figureId);
     return response.figure;
+}
+
+function updateMetadataReadinessFromFigure(figureId, figure) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    if (!figureEl) return;
+    const blockers = (figure.warnings || []).filter(warning => warning.blocking).length;
+    const unmatched = (figure.matches || []).filter(match => match.status !== 'ready').length;
+    const readiness = figureEl.querySelector('.metadata-link-readiness');
+    if (readiness) {
+        readiness.classList.toggle('ready', !blockers && !unmatched);
+        readiness.classList.toggle('blocked', !!blockers || !!unmatched);
+        const text = readiness.querySelector('span');
+        if (text) text.textContent = blockers ? `${blockers} blocking warning(s) remain.`
+            : unmatched ? `${unmatched} drawing/table match(es) remain unresolved.`
+                : 'Unique matches are ready for approval.';
+    }
+    const badge = figureEl.querySelector('.metadata-link-badge');
+    if (badge) {
+        badge.textContent = figure.status;
+        badge.className = `metadata-link-badge ${figure.status}`;
+    }
+    const approve = figureEl.querySelector('[data-link-approve]');
+    if (approve) approve.disabled = figure.status !== 'ready' ||
+        tabularState.metadataLinkState?.status === 'running';
+}
+
+function toggleMetadataWarning(figureId, warningId) {
+    const card = document.querySelector(
+        `[data-link-figure="${CSS.escape(figureId)}"] [data-warning-id="${CSS.escape(warningId)}"]`);
+    if (!card) return;
+    const active = card.dataset.overrideActive === '1';
+    card.dataset.overrideActive = active ? '0' : '1';
+    card.classList.toggle('resolved', !active);
+    card.classList.toggle('blocking', active);
+    const button = card.querySelector('[data-warning-toggle]');
+    if (button) button.textContent = active ? 'Mark reviewed and ignore' : 'Remove override';
+    scheduleMetadataAutosave(figureId);
+}
+
+function focusMetadataWarning(figureId, warningId) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    const card = figureEl?.querySelector(`[data-warning-id="${CSS.escape(warningId)}"]`);
+    if (!figureEl || !card) return;
+    const mask = card.dataset.warningMask;
+    const number = card.dataset.warningRow;
+    let target = mask ? figureEl.querySelector(
+        `[data-link-drawing-number][data-mask-file="${CSS.escape(mask)}"]`) : null;
+    if (!target && number) {
+        target = [...figureEl.querySelectorAll('[data-link-column="table_no"]')]
+            .find(input => input.value.trim() === number);
+    }
+    if (target) {
+        target.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+        target.focus();
+    }
+}
+
+function selectMetadataDrawing(figureId, input) {
+    const figureEl = input.closest('[data-link-figure]');
+    figureEl.querySelectorAll('.metadata-link-drawing').forEach(element =>
+        element.classList.toggle('selected', element.contains(input)));
+    const number = input.value.trim();
+    figureEl.querySelectorAll('.metadata-link-table tbody tr').forEach(row =>
+        row.classList.toggle('metadata-link-row-selected',
+            number && row.querySelector('[data-link-column="table_no"]')?.value.trim() === number));
+    figureEl.querySelectorAll('[data-evidence-kind="drawing"]').forEach(image => {
+        const url = new URL(image.src, window.location.origin);
+        url.searchParams.set('highlight', input.dataset.maskFile || '');
+        image.src = url.toString();
+    });
+}
+
+function validateMetadataFigureDom(figureId) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    if (!figureEl) return;
+    const drawingInputs = [...figureEl.querySelectorAll('[data-link-drawing-number]')];
+    const drawingCounts = new Map();
+    drawingInputs.forEach(input => {
+        const value = input.value.trim();
+        if (value) drawingCounts.set(value, (drawingCounts.get(value) || 0) + 1);
+    });
+    drawingInputs.forEach(input => {
+        const value = input.value.trim();
+        const invalid = !/^[1-9]\d*[a-z]?$/i.test(value) || drawingCounts.get(value) > 1;
+        input.classList.toggle('metadata-link-invalid', invalid);
+        input.setAttribute('aria-invalid', invalid ? 'true' : 'false');
+    });
+    const rowInputs = [...figureEl.querySelectorAll('[data-link-column="table_no"]')];
+    const rowCounts = new Map();
+    rowInputs.forEach(input => {
+        const value = input.value.trim();
+        if (value) rowCounts.set(value, (rowCounts.get(value) || 0) + 1);
+    });
+    rowInputs.forEach(input => {
+        const value = input.value.trim();
+        const row = input.closest('tr');
+        const invalid = !/^[1-9]\d*[a-z]?$/i.test(value) || rowCounts.get(value) > 1;
+        const unmatched = value && !drawingCounts.has(value);
+        row.classList.toggle('metadata-link-row-invalid', invalid);
+        row.classList.toggle('metadata-link-row-unmatched', unmatched);
+        input.setAttribute('aria-invalid', invalid ? 'true' : 'false');
+    });
 }
 
 async function approveMetadataFigure(figureId) {

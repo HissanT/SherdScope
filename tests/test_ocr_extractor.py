@@ -88,6 +88,41 @@ def test_hesban_column_template_has_one_band_per_csv_field():
     assert bounds[15][1] - bounds[15][0] < bounds[16][1] - bounds[16][0]
 
 
+def test_columns_follow_this_pages_header_positions():
+    # Deliberately non-uniform centers model the differently stretched tables
+    # in the supplied Hesban examples.
+    centers = [18, 88, 174, 226, 278, 340, 430, 520, 615, 682, 724,
+               772, 818, 865, 910, 950, 985, 1028, 1070, 1118, 1170, 1225]
+    labels = ["No.", "Type", "Sq", "Loc", "Pail", "Reg", "Exterior", "Core",
+              "Interior", "Typ", "Siz", "Shap", "Den", "Ty/Sz", "Den", "Man",
+              "Ext", "Color", "Int", "Color", "Decor", "Fire"]
+    direct = {0, 1, 2, 3, 4, 5, 15, 20, 21}
+    tokens = [OCRToken(label, .99,
+                       (center-10, 20 if index in direct else 105,
+                        center+10, 40 if index in direct else 125))
+              for index, (center, label) in enumerate(zip(centers, labels))]
+    bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        tokens, 1260, upper_rule_y=75)
+    assert source == "header_ocr"
+    assert len(bounds) == 22
+    assert len(evidence) == 22
+    # A boundary approaches the next heading instead of splitting the gap in
+    # half, so long Type values retain the whitespace before Sq.
+    assert bounds[0][1] == 69
+    assert bounds[1] == (69, 152)
+    assert bounds[-1][1] == 1260
+
+
+def test_damaged_header_uses_explicitly_flagged_fallback():
+    tokens = [OCRToken("No.", .99, (5, 10, 20, 30)),
+              OCRToken("Type", .99, (30, 10, 70, 30))]
+    bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        tokens, 1000, upper_rule_y=60)
+    assert source == "fixed_fallback"
+    assert bounds == PaddleOCRStructuredExtractor._column_bounds(1000)
+    assert evidence == []
+
+
 def test_row_anchor_recovers_number_merged_with_type():
     extractor = PaddleOCRStructuredExtractor(TableEngine())
     image = Image.new("RGB", (800, 500), "white")

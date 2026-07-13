@@ -294,3 +294,106 @@ def test_tabular_boxes_use_staged_vessel_number_not_mask_suffix(tmp_path, monkey
                         json={"image_name": "page_0", "table": edited})
     assert saved.status_code == 200
     assert load_linkage_state(project_path)["figures"][0]["drawings"][0]["vessel_number"] == "2"
+
+
+def test_reviewable_figure_autosaves_during_later_ocr_and_rejects_stale_revision(
+        tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Live Review")
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable", "reviewer_revision": 0,
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "OCR value"}],
+    }
+    validate_figure(figure, Hesban11Profile())
+    save_linkage_state(project_path, {
+        "schema_version": 1, "profile": "hesban11", "status": "running",
+        "figures": [figure], "warnings": [],
+    })
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    app_module._metadata_link_jobs[project_id] = True
+    try:
+        client = app_module.app.test_client()
+        saved = client.patch(
+            f"/api/projects/{project_id}/metadata-link/figures/2.1",
+            json={"reviewer_revision": 0,
+                  "table_rows": [{"table_no": "1", "table_type": "Manual value"}]},
+        )
+        assert saved.status_code == 200
+        assert saved.get_json()["reviewer_revision"] == 1
+        stale = client.patch(
+            f"/api/projects/{project_id}/metadata-link/figures/2.1",
+            json={"reviewer_revision": 0,
+                  "table_rows": [{"table_no": "1", "table_type": "Lost value"}]},
+        )
+        assert stale.status_code == 409
+        assert stale.get_json()["conflict"] is True
+        assert stale.get_json()["figure"]["table_rows"][0]["table_type"] == "Manual value"
+    finally:
+        app_module._metadata_link_jobs.pop(project_id, None)
+
+
+def test_processing_figure_cannot_be_edited_during_ocr(tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Processing")
+    save_linkage_state(project_path, {
+        "schema_version": 1, "profile": "hesban11", "status": "running",
+        "figures": [{
+            "figure_id": "2.1", "processing_status": "processing",
+            "drawings": [], "table_rows": [],
+        }],
+    })
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    app_module._metadata_link_jobs[project_id] = True
+    try:
+        response = app_module.app.test_client().patch(
+            f"/api/projects/{project_id}/metadata-link/figures/2.1",
+            json={"reviewer_revision": 0, "figure_caption": "Changed"},
+        )
+        assert response.status_code == 409
+        assert response.get_json()["processing"] is True
+    finally:
+        app_module._metadata_link_jobs.pop(project_id, None)
+
+
+def test_row_operations_and_safe_warning_override_are_audited_in_csv(
+        tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Review Tools")
+    pd.DataFrame([{"file": "page_0", "mask_file": "card_0"}]).to_csv(
+        project_path / "cards" / "mask_info.csv", index=False)
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable", "reviewer_revision": 0,
+        "drawing_pages": [{"printed_page": "19", "source_pdf": "hesban.pdf"}],
+        "table_pages": [{"printed_page": "20", "source_pdf": "hesban.pdf"}],
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        "extraction_warnings": [{"code": "missing_table_end",
+                                 "message": "No closing line was found", "page": "20"}],
+    }
+    validate_figure(figure, Hesban11Profile())
+    warning_id = next(warning["id"] for warning in figure["warnings"]
+                      if warning["code"] == "missing_table_end")
+    save_linkage_state(project_path, {
+        "schema_version": 1, "profile": "hesban11", "status": "complete",
+        "figures": [figure], "warnings": [],
+    })
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+    edited = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1",
+        json={
+            "reviewer_revision": 0,
+            "warning_overrides": {warning_id: {
+                "reason": "visually_confirmed_complete", "note": "Checked the scan",
+            }},
+            "row_operations": [{"action": "sort", "index": -1}],
+        },
+    )
+    assert edited.status_code == 200
+    payload = edited.get_json()["figure"]
+    assert payload["status"] == "ready"
+    assert payload["warning_overrides"][warning_id]["note"] == "Checked the scan"
+    applied = client.post(
+        f"/api/projects/{project_id}/metadata-link/apply", json={"figure_ids": ["2.1"]})
+    assert applied.status_code == 200
+    csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
+                      dtype=str, keep_default_na=False)
+    assert csv.loc[0, "Link Status"] == "approved_with_overrides"

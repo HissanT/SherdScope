@@ -11,6 +11,8 @@
 - Added a Tabular review interface and project-scoped run, state, evidence, edit, and apply endpoints.
 - Added 22 Hesban table fields and stable provenance columns to approved `mask_info.csv` rows.
 - Added 400 DPI PDF rendering by default, a 200-600 DPI upload control, and JPEG quality settings intended to improve small printed text.
+- Added a persistent per-figure review workspace with editable drawing numbers, add/duplicate/delete/sort/undo table-row controls, autosaved drafts, structured warning cards, and an explicit readiness checklist.
+- Added auditable reviewer overrides for safe layout warnings while keeping missing, duplicate, unmatched, conflicting, and cross-PDF identities non-overridable.
 
 ### Changed
 
@@ -40,15 +42,27 @@
 - Recovered table-row anchors when PaddleOCR joins a printed number to its type, including forms such as `14 Jar/Jug` and `20Jar/Jug`.
 - Batched drawing-number OCR and added horizontal proximity scoring to reduce neighboring vessel-number swaps on crowded plates.
 - Enlarged drawing evidence labels and made completed background OCR replace stale `?` box labels without requiring page navigation.
+- Replaced fixed Hesban column proportions with page-specific boundaries derived from the actual main headings and grouped subheadings on every table page.
+- Added visible vertical column overlays and persisted header-anchor evidence so reviewers can inspect exactly which OCR geometry produced each cell.
+- Added an explicit `column_header_fallback` warning when a damaged header cannot safely provide enough anchors for dynamic boundaries.
+- Preserved open figure panels and extracted-table scroll positions during background OCR progress polling, preventing the review UI from closing every 1.5 seconds.
+- Moved header-derived column endings toward the next heading instead of splitting whitespace evenly, preventing long values such as `Cooking pot` and `Base, pedestal` from being cropped.
+- Prevented background OCR progress writes from overwriting newer reviewer corrections by adding stable figure keys and revision-aware state merging.
+- Prevented the 1.5-second progress refresh from erasing focused or unsaved form values while a reviewer edits an already completed figure.
+- Persisted card-geometry invalidation warnings in extraction evidence so a reload cannot accidentally make a changed bounding box approvable.
+- Added `approved_with_overrides` CSV status and retained each override reason, note, and timestamp in `metadata_linkage.json`.
 
 ### Validation
 
 - `python -m pytest -q -rs`: 41 passed; 0 failed and 0 skipped.
 - Major-bug-only follow-up review reran the focused OCR/linker/API/manifest tests: 41 passed; no new major implementation fixes were required.
 - OCR/linker regression suite after the Type, row-anchor, drawing-number, and label-readability fixes: 42 passed.
+- Dynamic header-boundary regression suite: 44 passed; real Test Project #3 pages 1, 6, and 18 each resolved all 22 header anchors with different page-specific bounds.
+- Real Figure 2.3 verification preserved all eight complete Type values, including three `Cooking pot` rows and two `Base, pedestal` rows, with no column warnings.
 - Python compilation passed for the application, linker, OCR adapter, project/PDF utilities, and all four test modules.
 - Import checks passed with application background initialization disabled for testing.
 - JavaScript syntax checks passed for the PDF and Tabular workflows; the Unix launcher passed `bash -n`; `git diff --check` passed with only informational CRLF warnings.
+- Accessible review workflow regression suite: 50 Python tests passed; Python compilation and the updated Tabular JavaScript syntax check passed.
 
 ### Known limitations
 

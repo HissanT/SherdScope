@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
@@ -42,6 +43,15 @@ HESBAN_TABLE_COLUMNS = [
 
 LINKAGE_COLUMNS = IDENTITY_COLUMNS + HESBAN_TABLE_COLUMNS
 NON_BLOCKING_WARNING_CODES = {"low_ocr_confidence"}
+OVERRIDABLE_WARNING_CODES = {
+    "missing_table_end", "missing_required_value", "column_header_fallback",
+}
+REVIEWER_OWNED_FIGURE_FIELDS = {
+    "figure_id", "figure_caption", "table_rows", "table_pages",
+    "warning_overrides", "reviewer_revision", "draft_saved_at",
+    "review_history", "review_status",
+}
+_LINKAGE_STATE_LOCK = threading.RLock()
 
 # JSON and extractor code retain the stable technical names above. CSV files
 # and browser-facing tables use publication-style names through this mapping.
@@ -81,6 +91,14 @@ ALL_LINKAGE_STORAGE_COLUMNS = list(dict.fromkeys(LINKAGE_COLUMNS + PUBLIC_LINKAG
 
 class MetadataLinkError(RuntimeError):
     pass
+
+
+class ReviewerRevisionConflict(MetadataLinkError):
+    """A reviewer tried to save over a newer draft revision."""
+
+    def __init__(self, figure: dict[str, Any]):
+        super().__init__("This figure has a newer saved draft")
+        self.figure = figure
 
 
 class AmbiguousSourceError(MetadataLinkError):
@@ -408,28 +426,108 @@ def _empty_state(profile: str) -> dict[str, Any]:
     }
 
 
-def load_linkage_state(project_path: Path) -> dict[str, Any]:
-    return read_json(Path(project_path) / "cards" / STATE_NAME, _empty_state("hesban11"))
+def _figure_key(figure: dict[str, Any]) -> str:
+    existing = str(figure.get("figure_key", "")).strip()
+    if existing:
+        return existing
+    masks = sorted(mask_stem(drawing.get("mask_file", ""))
+                   for drawing in figure.get("drawings", []) if drawing.get("mask_file"))
+    pages = sorted(str(page.get("image_name", ""))
+                   for page in figure.get("drawing_pages", []) if page.get("image_name"))
+    seed = "|".join(masks or pages or [str(figure.get("figure_id", "unresolved"))])
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
 
 
-def save_linkage_state(project_path: Path, state: dict[str, Any]) -> None:
-    card_index: dict[str, Any] = {}
+def _warning_id(warning: dict[str, Any]) -> str:
+    existing = str(warning.get("id", "")).strip()
+    if existing:
+        return existing
+    seed = "|".join(str(warning.get(key, "")) for key in
+                    ("code", "message", "page", "row", "column", "mask_file"))
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
+    state.setdefault("schema_version", SCHEMA_VERSION)
+    state.setdefault("figures", [])
     for figure in state.get("figures", []):
-        matches = {str(match.get("mask_file")): match for match in figure.get("matches", [])}
-        for drawing in figure.get("drawings", []):
-            mask_file = str(drawing.get("mask_file", ""))
-            if not mask_file:
+        figure["figure_key"] = _figure_key(figure)
+        figure["reviewer_revision"] = int(figure.get("reviewer_revision", 0) or 0)
+        figure.setdefault("warning_overrides", {})
+        figure.setdefault("draft_saved_at", "")
+        figure.setdefault("processing_status", (
+            "reviewable" if figure.get("matches") or state.get("status") == "complete"
+            else "processing"))
+    return state
+
+
+def load_linkage_state(project_path: Path) -> dict[str, Any]:
+    with _LINKAGE_STATE_LOCK:
+        state = read_json(Path(project_path) / "cards" / STATE_NAME, _empty_state("hesban11"))
+    state = _ensure_review_defaults(state)
+    profile = get_profile(str(state.get("profile", "hesban11")))
+    for figure in state.get("figures", []):
+        if figure.get("drawings") or figure.get("table_rows"):
+            validate_figure(figure, profile)
+    return state
+
+
+def save_linkage_state(project_path: Path, state: dict[str, Any],
+                       expected_revisions: Optional[dict[str, int]] = None) -> None:
+    state = _ensure_review_defaults(state)
+    state_path = Path(project_path) / "cards" / STATE_NAME
+    # Background OCR holds an in-memory state while reviewers may autosave a
+    # completed figure. Merge any newer reviewer revision before every write so
+    # later progress updates cannot restore stale OCR values over manual work.
+    with _LINKAGE_STATE_LOCK:
+        current = _ensure_review_defaults(read_json(state_path, _empty_state(
+            str(state.get("profile", "hesban11")))))
+        current_by_key = {figure.get("figure_key"): figure
+                          for figure in current.get("figures", [])}
+        for figure_key, expected in (expected_revisions or {}).items():
+            saved = current_by_key.get(figure_key)
+            saved_revision = int(saved.get("reviewer_revision", 0) or 0) if saved else 0
+            if saved_revision != int(expected):
+                raise ReviewerRevisionConflict(saved or {
+                    "figure_key": figure_key, "reviewer_revision": saved_revision,
+                })
+        profile = get_profile(str(state.get("profile", "hesban11")))
+        for figure in state.get("figures", []):
+            saved = current_by_key.get(figure.get("figure_key"))
+            if not saved or int(saved.get("reviewer_revision", 0) or 0) <= int(
+                    figure.get("reviewer_revision", 0) or 0):
                 continue
-            match = matches.get(mask_file, {})
-            card_index[mask_file] = {
-                "fingerprint": drawing.get("fingerprint", ""),
-                "figure_id": figure.get("figure_id", ""),
-                "vessel_number": drawing.get("vessel_number", ""),
-                "match_status": match.get("status", "needs_review"),
-            }
-    state["card_index"] = card_index
-    state["updated_at"] = utc_now()
-    _atomic_json_write(Path(project_path) / "cards" / STATE_NAME, state)
+            for field in REVIEWER_OWNED_FIGURE_FIELDS:
+                if field in saved:
+                    figure[field] = saved[field]
+            saved_numbers = {str(item.get("mask_file")): item.get("vessel_number", "")
+                             for item in saved.get("drawings", [])}
+            for drawing in figure.get("drawings", []):
+                if str(drawing.get("mask_file")) in saved_numbers:
+                    drawing["vessel_number"] = saved_numbers[str(drawing.get("mask_file"))]
+            validate_figure(figure, profile)
+        card_index: dict[str, Any] = {}
+        for figure in state.get("figures", []):
+            # Keep persisted warnings and matches in step with edits and
+            # invalidations, not only with API reads. This makes the sidecar a
+            # trustworthy recovery source after a crash or page reload.
+            validate_figure(figure, profile)
+            matches = {str(match.get("mask_file")): match
+                       for match in figure.get("matches", [])}
+            for drawing in figure.get("drawings", []):
+                mask_file = str(drawing.get("mask_file", ""))
+                if not mask_file:
+                    continue
+                match = matches.get(mask_file, {})
+                card_index[mask_file] = {
+                    "fingerprint": drawing.get("fingerprint", ""),
+                    "figure_id": figure.get("figure_id", ""),
+                    "vessel_number": drawing.get("vessel_number", ""),
+                    "match_status": match.get("status", "needs_review"),
+                }
+        state["card_index"] = card_index
+        state["updated_at"] = utc_now()
+        _atomic_json_write(state_path, state)
 
 
 def _annotations_by_image(project_path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -451,7 +549,8 @@ def _annotations_by_image(project_path: Path) -> dict[str, list[dict[str, Any]]]
 
 
 def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict[str, Any]:
-    warnings: list[dict[str, str]] = list(figure.get("extraction_warnings", []))
+    warnings: list[dict[str, Any]] = [dict(warning) for warning in
+                                     figure.get("extraction_warnings", [])]
     previous_matches = {
         (str(match.get("mask_file", "")), str(match.get("fingerprint", ""))): match
         for match in figure.get("matches", [])
@@ -467,7 +566,9 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
         if number:
             drawing_map.setdefault(number, []).append(drawing)
         else:
-            warnings.append({"code": "missing_drawing_number", "message": f"No valid positive printed number for {drawing.get('mask_file')}"})
+            warnings.append({"code": "missing_drawing_number",
+                             "mask_file": drawing.get("mask_file", ""),
+                             "message": f"No valid positive printed number for {drawing.get('mask_file')}"})
     for row in rows:
         number = profile.normalize_number(row.get("table_no"))
         number = number if is_positive_vessel_number(number) else ""
@@ -475,19 +576,23 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
         if number:
             row_map.setdefault(number, []).append(row)
         else:
-            warnings.append({"code": "missing_table_number", "message": "A table row has no number"})
+            warnings.append({"code": "missing_table_number", "row": "",
+                             "message": "A table row has no number"})
         for column in profile.required_table_columns:
             if column != "table_no" and not str(row.get(column, "")).strip():
                 warnings.append({
                     "code": "missing_required_value",
+                    "row": number, "column": column,
                     "message": f"Table row {number or '?'} is missing required field {column}",
                 })
     for number, values in drawing_map.items():
         if len(values) > 1:
-            warnings.append({"code": "duplicate_drawing_number", "message": f"Drawing number {number} occurs {len(values)} times"})
+            warnings.append({"code": "duplicate_drawing_number", "row": number,
+                             "message": f"Drawing number {number} occurs {len(values)} times"})
     for number, values in row_map.items():
         if len(values) > 1:
-            warnings.append({"code": "duplicate_table_number", "message": f"Table number {number} occurs {len(values)} times"})
+            warnings.append({"code": "duplicate_table_number", "row": number,
+                             "message": f"Table number {number} occurs {len(values)} times"})
 
     matches: list[dict[str, Any]] = []
     for drawing in drawings:
@@ -495,7 +600,8 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
         candidates = row_map.get(number, []) if number else []
         status = "ready" if len(drawing_map.get(number, [])) == 1 and len(candidates) == 1 else "needs_review"
         if number and not candidates:
-            warnings.append({"code": "missing_table_row", "message": f"No table row for drawing {number}"})
+            warnings.append({"code": "missing_table_row", "row": number,
+                             "message": f"No table row for drawing {number}"})
         match = {
             "mask_file": drawing.get("mask_file"), "fingerprint": drawing.get("fingerprint"),
             "vessel_number": number, "status": status,
@@ -506,18 +612,38 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
             match["applied_values"] = dict(previous["applied_values"])
         matches.append(match)
     for number in sorted(set(row_map) - set(drawing_map), key=natural_key):
-        warnings.append({"code": "unexpected_table_row", "message": f"Table row {number} has no drawing"})
+        warnings.append({"code": "unexpected_table_row", "row": number,
+                         "message": f"Table row {number} has no drawing"})
+
+    overrides = figure.setdefault("warning_overrides", {})
+    unique_warnings: list[dict[str, Any]] = []
+    seen_warning_ids: set[str] = set()
+    for warning in warnings:
+        warning["id"] = _warning_id(warning)
+        if warning["id"] in seen_warning_ids:
+            continue
+        seen_warning_ids.add(warning["id"])
+        warning["overrideable"] = warning.get("code") in OVERRIDABLE_WARNING_CODES
+        warning["overridden"] = bool(
+            warning["overrideable"] and warning["id"] in overrides)
+        warning["blocking"] = bool(
+            warning.get("code") not in NON_BLOCKING_WARNING_CODES and
+            not warning["overridden"])
+        unique_warnings.append(warning)
 
     figure["matches"] = matches
-    figure["warnings"] = warnings
+    figure["warnings"] = unique_warnings
     # Any unmatched/extra/unnumbered data makes the proposed join ambiguous.  Do
     # not present it as approvable merely because every drawing happened to find
     # one row; extra rows are a common sign of a wrong or truncated table page.
-    blocking_warnings = [warning for warning in warnings
-                         if warning.get("code") not in NON_BLOCKING_WARNING_CODES]
+    blocking_warnings = [warning for warning in unique_warnings if warning["blocking"]]
     figure["status"] = ("ready" if matches and
                         all(m["status"] == "ready" for m in matches) and
                         not blocking_warnings else "needs_review")
+    if (figure.get("processing_status") != "processing" and
+            figure.get("review_status") != "approved"):
+        figure["processing_status"] = (
+            "ready" if figure["status"] == "ready" else "reviewable")
     return figure
 
 
@@ -581,6 +707,11 @@ class MetadataLinker:
                 # validate_figure carries applied_values forward only when both
                 # card identity and geometry fingerprint are unchanged.
                 "matches": list(previous_figure.get("matches", [])),
+                "figure_key": previous_figure.get("figure_key", ""),
+                "processing_status": "processing",
+                "reviewer_revision": int(previous_figure.get("reviewer_revision", 0) or 0),
+                "warning_overrides": dict(previous_figure.get("warning_overrides", {})),
+                "draft_saved_at": previous_figure.get("draft_saved_at", ""),
             })
             figure["drawing_pages"].append({
                 "image_name": page["image_name"], "logical_index": page["logical_index"],
@@ -738,6 +869,8 @@ class MetadataLinker:
                         figure["table_rows"].append(clean)
                         missing.remove(normalized_number)
             validate_figure(figure, self.profile)
+            figure["processing_status"] = (
+                "ready" if figure.get("status") == "ready" else "reviewable")
             current = len(drawing_pages) + figure_index
             state["progress"] = {
                 "current": current, "total": total_work,
@@ -813,13 +946,16 @@ def apply_approved_figures(project_path: Path, figure_ids: Iterable[str],
         figure = figures_by_id[figure_id]
         drawing_pages = figure.get("drawing_pages", [])
         table_pages = figure.get("table_pages", [])
+        has_review_overrides = any(warning.get("overridden")
+                                   for warning in figure.get("warnings", []))
         provenance = {
             "figure_id": figure.get("figure_id", ""),
             "figure_caption": figure.get("figure_caption", ""),
             "drawing_printed_page": "; ".join(dict.fromkeys(str(p.get("printed_page", "")) for p in drawing_pages if p.get("printed_page"))),
             "table_printed_pages": "; ".join(dict.fromkeys(str(p.get("printed_page", "")) for p in table_pages if p.get("printed_page"))),
             "source_pdf": "; ".join(dict.fromkeys(str(p.get("source_pdf", "")) for p in drawing_pages + table_pages if p.get("source_pdf"))),
-            "link_status": "approved",
+            "link_status": ("approved_with_overrides" if has_review_overrides
+                            else "approved"),
         }
         for match in figure.get("matches", []):
             target = targets[(figure_id, str(match.get("mask_file")))]
@@ -849,6 +985,7 @@ def apply_approved_figures(project_path: Path, figure_ids: Iterable[str],
             match["applied_values"] = {**previously_imported, **newly_imported}
             applied += int(target.sum())
         figure["review_status"] = "approved"
+        figure["processing_status"] = "approved"
         figure["approved_at"] = utc_now()
         figure.setdefault("review_history", []).append({
             "action": "approved", "at": figure["approved_at"],
@@ -895,8 +1032,12 @@ def invalidate_linkage_for_card_changes(cards_path: Path, old_annots: Optional[p
             figure["status"] = "needs_review"
             figure["review_status"] = "pending"
             figure.pop("approved_at", None)
-            figure.setdefault("warnings", []).append({
+            persistent_warning = {
                 "code": "card_geometry_changed",
                 "message": "Card extraction changed; review this figure again.",
-            })
+            }
+            extraction_warnings = figure.setdefault("extraction_warnings", [])
+            if not any(warning.get("code") == "card_geometry_changed"
+                       for warning in extraction_warnings):
+                extraction_warnings.append(persistent_warning)
     save_linkage_state(cards_path.parent, state)

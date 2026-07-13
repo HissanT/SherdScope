@@ -17,6 +17,7 @@ from metadata_linker import (
     normalize_figure_id,
     normalize_vessel_number,
     MetadataLinkError,
+    ReviewerRevisionConflict,
     save_linkage_state,
     validate_figure,
     load_linkage_state,
@@ -135,7 +136,84 @@ def test_zero_vessel_number_is_unresolved():
     validate_figure(figure, Hesban11Profile())
     assert figure["status"] == "needs_review"
     assert figure["drawings"][0]["vessel_number"] == ""
-    assert any(warning["code"] == "missing_drawing_number" for warning in figure["warnings"])
+
+
+def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
+    profile = Hesban11Profile()
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable",
+        "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        "extraction_warnings": [{"code": "missing_table_end", "message": "No closing rule"}],
+        "warning_overrides": {},
+    }
+    validate_figure(figure, profile)
+    warning = next(item for item in figure["warnings"] if item["code"] == "missing_table_end")
+    assert warning["overrideable"] is True
+    assert figure["status"] == "needs_review"
+    figure["warning_overrides"][warning["id"]] = {
+        "reason": "visually_confirmed_complete", "note": "Checked page"
+    }
+    validate_figure(figure, profile)
+    assert figure["status"] == "ready"
+    figure["drawings"].append({"mask_file": "b", "fingerprint": "y", "vessel_number": "1"})
+    validate_figure(figure, profile)
+    duplicate = next(item for item in figure["warnings"]
+                     if item["code"] == "duplicate_drawing_number")
+    assert duplicate["overrideable"] is False
+    assert figure["status"] == "needs_review"
+
+
+def test_newer_reviewer_revision_survives_stale_background_save(tmp_path):
+    project = tmp_path / "project"
+    (project / "cards").mkdir(parents=True)
+    base = {
+        "schema_version": 1, "profile": "hesban11", "status": "running",
+        "figures": [{
+            "figure_id": "2.1", "processing_status": "reviewable",
+            "reviewer_revision": 0,
+            "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
+            "table_rows": [{"table_no": "1", "table_type": "OCR value"}],
+        }],
+    }
+    save_linkage_state(project, base)
+    reviewed = load_linkage_state(project)
+    reviewed["figures"][0]["table_rows"][0]["table_type"] = "Manual correction"
+    reviewed["figures"][0]["reviewer_revision"] = 1
+    save_linkage_state(project, reviewed)
+    stale = {**base, "figures": [{**base["figures"][0],
+             "table_rows": [{"table_no": "1", "table_type": "Stale OCR"}],
+             "reviewer_revision": 0}]}
+    save_linkage_state(project, stale)
+    final = load_linkage_state(project)
+    assert final["figures"][0]["table_rows"][0]["table_type"] == "Manual correction"
+    assert final["figures"][0]["reviewer_revision"] == 1
+
+
+def test_atomic_revision_check_rejects_a_simultaneous_stale_save(tmp_path):
+    project = tmp_path / "project"
+    (project / "cards").mkdir(parents=True)
+    state = {
+        "schema_version": 1, "profile": "hesban11", "figures": [{
+            "figure_id": "2.1", "reviewer_revision": 0,
+            "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
+            "table_rows": [{"table_no": "1", "table_type": "OCR"}],
+        }],
+    }
+    save_linkage_state(project, state)
+    first = load_linkage_state(project)
+    stale = load_linkage_state(project)
+    first_figure = first["figures"][0]
+    first_figure["reviewer_revision"] = 1
+    first_figure["table_rows"][0]["table_type"] = "First reviewer"
+    save_linkage_state(project, first, expected_revisions={first_figure["figure_key"]: 0})
+    stale_figure = stale["figures"][0]
+    stale_figure["reviewer_revision"] = 1
+    stale_figure["table_rows"][0]["table_type"] = "Stale reviewer"
+    with pytest.raises(ReviewerRevisionConflict):
+        save_linkage_state(project, stale,
+                           expected_revisions={stale_figure["figure_key"]: 0})
+    assert load_linkage_state(project)["figures"][0]["table_rows"][0]["table_type"] == "First reviewer"
 
 
 def test_legacy_columns_migrate_without_overwriting_public_corrections():

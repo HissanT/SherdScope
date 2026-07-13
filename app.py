@@ -57,6 +57,7 @@ from metadata_linker import (
     PUBLIC_LINKAGE_COLUMNS,
     Hesban11Profile,
     MetadataLinkError,
+    ReviewerRevisionConflict,
     MetadataLinker,
     StructuredExtractor,
     apply_approved_figures,
@@ -3006,6 +3007,17 @@ def get_project_metadata_link_evidence(project_id, filename):
                 value = boundary.get(key)
                 if value is not None:
                     draw.line((x1, int(value), x2, int(value)), fill=color, width=line_width)
+            columns = boundary.get('column_bounds', [])
+            for index, column in enumerate(columns):
+                if not isinstance(column, (list, tuple)) or len(column) != 2:
+                    continue
+                column_left, column_right = [int(value) for value in column]
+                color = (14, 165, 233) if index % 2 == 0 else (168, 85, 247)
+                draw.line((column_left, y1, column_left, y2), fill=color,
+                          width=max(2, line_width // 2))
+                if index == len(columns) - 1:
+                    draw.line((column_right, y1, column_right, y2), fill=color,
+                              width=max(2, line_width // 2))
             pad = max(20, round(image.width * .01))
             image = image.crop((max(0, x1-pad), max(0, y1-pad),
                                 min(image.width, x2+pad), min(image.height, y2+pad)))
@@ -3013,6 +3025,7 @@ def get_project_metadata_link_evidence(project_id, filename):
             image = image.crop(tuple(int(value) for value in page['crop']))
     else:
         draw = ImageDraw.Draw(image)
+        highlighted_mask = Path(str(request.args.get('highlight', ''))).stem
         font_size = max(40, min(76, round(image.width / 52)))
         try:
             font = ImageFont.truetype("arialbd.ttf", font_size)
@@ -3027,7 +3040,10 @@ def get_project_metadata_link_evidence(project_id, filename):
                 continue
             x1, y1, x2, y2 = [int(value) for value in drawing['bbox']]
             label = drawing.get('vessel_number') or '?'
-            draw.rectangle((x1, y1, x2, y2), outline=(255, 80, 0), width=line_width)
+            selected = highlighted_mask and Path(str(drawing.get('mask_file', ''))).stem == highlighted_mask
+            box_color = (250, 204, 21) if selected else (255, 80, 0)
+            draw.rectangle((x1, y1, x2, y2), outline=box_color,
+                           width=line_width * 2 if selected else line_width)
             label_text = f"No. {label}"
             text_box = draw.textbbox((0, 0), label_text, font=font, stroke_width=1)
             text_width = text_box[2] - text_box[0]
@@ -3035,7 +3051,7 @@ def get_project_metadata_link_evidence(project_id, filename):
             pad = max(8, font_size // 5)
             tag_top = max(0, y1 - text_height - pad * 2)
             tag_right = min(image.width, x1 + text_width + pad * 2)
-            draw.rectangle((x1, tag_top, tag_right, y1), fill=(255, 80, 0))
+            draw.rectangle((x1, tag_top, tag_right, y1), fill=box_color)
             draw.text((x1 + pad, tag_top + pad // 2), label_text, fill='white',
                       font=font, stroke_width=1, stroke_fill=(120, 35, 0))
     image.thumbnail((1800, 1800), PILImage.Resampling.LANCZOS)
@@ -3047,9 +3063,6 @@ def get_project_metadata_link_evidence(project_id, filename):
 
 @app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>', methods=['PATCH'])
 def update_project_metadata_link_figure(project_id, figure_id):
-    if _metadata_link_jobs.get(project_id):
-        return jsonify({'error': 'Wait for metadata linking to finish before editing',
-                        'success': False}), 409
     project_path = project_manager.get_project_path(project_id)
     if not project_path:
         return jsonify({'error': 'Project not found', 'success': False}), 404
@@ -3062,6 +3075,22 @@ def update_project_metadata_link_figure(project_id, figure_id):
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return jsonify({'error': 'Request body must be a JSON object', 'success': False}), 400
+    if (_metadata_link_jobs.get(project_id) and
+            figure.get('processing_status') not in {'reviewable', 'ready', 'approved'}):
+        return jsonify({'error': 'This figure is still being extracted',
+                        'success': False, 'processing': True}), 409
+    submitted_revision = data.get('reviewer_revision')
+    current_revision = int(figure.get('reviewer_revision', 0) or 0)
+    try:
+        submitted_revision = (None if submitted_revision is None
+                              else int(submitted_revision))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'reviewer_revision must be a whole number',
+                        'success': False}), 400
+    if submitted_revision is not None and submitted_revision != current_revision:
+        return jsonify({'error': 'This figure has a newer saved draft',
+                        'success': False, 'conflict': True,
+                        'figure': figure, 'reviewer_revision': current_revision}), 409
     changed_fields = []
     if 'figure_id' in data:
         corrected_id = get_profile(state.get('profile', 'hesban11')).normalize_figure(data['figure_id'])
@@ -3095,6 +3124,36 @@ def update_project_metadata_link_figure(project_id, figure_id):
             for row in data['table_rows']
         ]
         changed_fields.append('table_rows')
+    elif isinstance(data.get('row_operations'), list):
+        rows = [dict(row) for row in figure.get('table_rows', [])]
+        for operation in data['row_operations']:
+            if not isinstance(operation, dict):
+                return jsonify({'error': 'row_operations must contain objects',
+                                'success': False}), 400
+            action = operation.get('action')
+            try:
+                index = int(operation.get('index', -1))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Row operation index must be a whole number',
+                                'success': False}), 400
+            if action == 'delete' and 0 <= index < len(rows):
+                rows.pop(index)
+            elif action == 'duplicate' and 0 <= index < len(rows):
+                rows.insert(index + 1, dict(rows[index]))
+            elif action == 'add':
+                submitted = operation.get('row', {})
+                rows.append(submitted if isinstance(submitted, dict) else {})
+            elif action == 'sort':
+                rows.sort(key=lambda row: natural_key(str(row.get('table_no', ''))))
+            else:
+                return jsonify({'error': f'Invalid row operation: {action}',
+                                'success': False}), 400
+        figure['table_rows'] = [
+            {column: '' if row.get(column) is None else str(row.get(column, ''))
+             for column in HESBAN_TABLE_COLUMNS}
+            for row in rows
+        ]
+        changed_fields.append('row_operations')
     if 'table_pages' in data:
         if not isinstance(data['table_pages'], list):
             return jsonify({'error': 'table_pages must be a list', 'success': False}), 400
@@ -3126,17 +3185,56 @@ def update_project_metadata_link_figure(project_id, figure_id):
     if data.get('review_status') in {'pending', 'rejected'}:
         figure['review_status'] = data['review_status']
         changed_fields.append('review_status')
+    if isinstance(data.get('warning_overrides'), dict):
+        # Validate against the warnings currently produced by this figure. A
+        # client cannot turn an identity error into an overridable warning.
+        validate_figure(figure, get_profile(state.get('profile', 'hesban11')))
+        allowed = {warning.get('id') for warning in figure.get('warnings', [])
+                   if warning.get('overrideable')}
+        submitted_overrides = {}
+        for warning_id, override in data['warning_overrides'].items():
+            if warning_id not in allowed or not isinstance(override, dict):
+                return jsonify({'error': f'Warning cannot be overridden: {warning_id}',
+                                'success': False}), 400
+            reason = str(override.get('reason', '')).strip()
+            if not reason:
+                return jsonify({'error': 'Every warning override requires a reason',
+                                'success': False}), 400
+            submitted_overrides[warning_id] = {
+                'reason': reason,
+                'note': str(override.get('note', '')).strip(),
+                'at': override.get('at') or __import__('datetime').datetime.now(
+                    __import__('datetime').timezone.utc).isoformat(),
+            }
+        figure['warning_overrides'] = submitted_overrides
+        changed_fields.append('warning_overrides')
     if changed_fields:
+        figure['reviewer_revision'] = current_revision + 1
+        figure['draft_saved_at'] = __import__('datetime').datetime.now(
+            __import__('datetime').timezone.utc).isoformat()
+        if figure.get('review_status') == 'approved':
+            figure['review_status'] = 'pending'
+            figure['processing_status'] = 'reviewable'
+            figure.pop('approved_at', None)
         figure.setdefault('review_history', []).append({
             'action': 'edited', 'at': __import__('datetime').datetime.now(
                 __import__('datetime').timezone.utc).isoformat(),
             'fields': sorted(set(changed_fields)),
         })
     validate_figure(figure, get_profile(state.get('profile', 'hesban11')))
-    save_linkage_state(project_path, state)
+    try:
+        save_linkage_state(project_path, state, expected_revisions={
+            str(figure.get('figure_key', '')): current_revision,
+        })
+    except ReviewerRevisionConflict as conflict:
+        latest = conflict.figure
+        return jsonify({'error': str(conflict), 'success': False, 'conflict': True,
+                        'figure': latest,
+                        'reviewer_revision': int(latest.get('reviewer_revision', 0) or 0)}), 409
     totals = linkage_totals(state)
     project_manager.update_workflow_status(project_id, totals)
-    return jsonify({'success': True, 'figure': figure, 'totals': totals})
+    return jsonify({'success': True, 'figure': figure, 'totals': totals,
+                    'reviewer_revision': figure.get('reviewer_revision', 0)})
 
 
 @app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/rerun', methods=['POST'])
@@ -3243,6 +3341,7 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
             'pages': [page.get('image_name') for page in updated_pages],
         })
         validate_figure(figure, profile)
+        figure['processing_status'] = 'reviewable'
         save_linkage_state(project_path, state)
         totals = linkage_totals(state)
         project_manager.update_workflow_status(project_id, totals)

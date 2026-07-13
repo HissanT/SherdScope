@@ -1,13 +1,14 @@
 """Local OCR extraction for Hesban 11 figure/table linking.
 
-PaddleOCR only reads text and its coordinates.  The deterministic code in this
-module uses the fixed Hesban 11 layout to turn those coordinates into table cells;
+PaddleOCR only reads text and its coordinates. The deterministic code in this
+module uses each printed Hesban 11 header to build page-specific table columns;
 it does not use a generative model to infer or rewrite metadata.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 import json
 from pathlib import Path
 import re
@@ -62,6 +63,9 @@ class TableBoundary:
     data_bottom: int
     closing_rule: Optional[int]
     header_text: str
+    column_bounds: tuple[tuple[int, int], ...]
+    column_source: str
+    header_anchors: tuple[dict[str, Any], ...]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +79,13 @@ class TableBoundary:
             "has_closing_rule": self.closing_rule is not None,
             "continues": self.closing_rule is None,
             "header_text": self.header_text,
+            "column_bounds": [[self.left + left, self.left + right]
+                              for left, right in self.column_bounds],
+            "column_source": self.column_source,
+            "header_anchors": [
+                {**anchor, "bbox": list(anchor.get("bbox", []))}
+                for anchor in self.header_anchors
+            ],
         }
 
 
@@ -230,6 +241,25 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
     )
     PAGE_TABLE_LEFT = .135
     PAGE_TABLE_RIGHT = .860
+    # When two neighboring headings leave whitespace between them, give most
+    # of that gap to the column on the left. Printed values such as
+    # ``Cooking pot`` are often much wider than the short ``Type`` heading,
+    # while the next column begins close to its own heading.
+    HEADER_GAP_SHARE_TO_PREVIOUS = .82
+    DIRECT_HEADER_ALIASES = {
+        0: ("no", "number"), 1: ("type",), 2: ("sq", "square"),
+        3: ("loc", "locus"), 4: ("pail",), 5: ("reg", "registration"),
+        15: ("man", "manufacture"), 20: ("decor", "decoration"),
+        21: ("fire",),
+    }
+    SUBHEADER_SEQUENCE = (
+        (6, ("exterior",)), (7, ("core",)), (8, ("interior",)),
+        (9, ("typ", "type")), (10, ("siz", "size")),
+        (11, ("shap", "shape")), (12, ("den", "density")),
+        (13, ("tysz", "typesize")), (14, ("den", "density")),
+        (16, ("ext", "exterior")), (17, ("color", "colour")),
+        (18, ("int", "interior")), (19, ("color", "colour")),
+    )
 
     def __init__(self, engine: Optional[PaddleOCREngine] = None):
         self.engine = engine or PaddleOCREngine()
@@ -307,6 +337,7 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
 
     @classmethod
     def _column_bounds(cls, width: int) -> list[tuple[int, int]]:
+        """Legacy proportional bounds used only when header anchoring fails."""
         span = cls.PAGE_TABLE_RIGHT - cls.PAGE_TABLE_LEFT
         centers = tuple((center - cls.PAGE_TABLE_LEFT) / span
                         for center in cls.PAGE_COLUMN_CENTERS)
@@ -318,6 +349,148 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         edges[16] = (.655 - cls.PAGE_TABLE_LEFT) / span
         return [(max(0, round(edges[index] * width)), min(width, round(edges[index+1] * width)))
                 for index in range(len(centers))]
+
+    @staticmethod
+    def _normalized_header_word(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+    @classmethod
+    def _header_match_score(cls, text: str, aliases: tuple[str, ...]) -> float:
+        normalized = cls._normalized_header_word(text)
+        if not normalized:
+            return 0.0
+        scores = []
+        for alias in aliases:
+            alias = cls._normalized_header_word(alias)
+            if normalized == alias:
+                scores.append(1.0)
+            elif normalized.startswith(alias) or alias.startswith(normalized):
+                scores.append(.84 if min(len(normalized), len(alias)) >= 3 else .70)
+            else:
+                scores.append(SequenceMatcher(None, normalized, alias).ratio())
+        return max(scores, default=0.0)
+
+    @classmethod
+    def _split_header_tokens(cls, tokens: list[OCRToken]) -> list[OCRToken]:
+        """Split OCR boxes such as ``No Type`` into usable word anchors."""
+        known = {
+            alias for aliases in cls.DIRECT_HEADER_ALIASES.values() for alias in aliases
+        } | {
+            alias for _, aliases in cls.SUBHEADER_SEQUENCE for alias in aliases
+        } | {"fabric", "non", "plastics", "void", "voids", "surface", "treatment"}
+        output: list[OCRToken] = []
+        for token in tokens:
+            parts = re.findall(r"[A-Za-z]+(?:/[A-Za-z]+)?", token.text)
+            normalized_parts = [cls._normalized_header_word(part) for part in parts]
+            if (2 <= len(parts) <= 4 and
+                    sum(part in known for part in normalized_parts) >= 2):
+                total = sum(max(1, len(part)) for part in parts)
+                cursor = token.bbox[0]
+                span = token.bbox[2] - token.bbox[0]
+                for part in parts:
+                    part_width = span * max(1, len(part)) / total
+                    output.append(OCRToken(
+                        part, token.score,
+                        (cursor, token.bbox[1], cursor + part_width, token.bbox[3])))
+                    cursor += part_width
+            else:
+                output.append(token)
+        return output
+
+    @classmethod
+    def _column_bounds_from_header(
+            cls, tokens: list[OCRToken], width: int,
+            upper_rule_y: float) -> tuple[list[tuple[int, int]], str, list[dict[str, Any]]]:
+        """Build this page's 22 columns from its actual two-level header."""
+        tokens = cls._split_header_tokens([token for token in tokens if token.text])
+        tolerance = (max(5.0, median([token.height for token in tokens]) * .45)
+                     if tokens else 5.0)
+        upper_tokens = [token for token in tokens
+                        if token.center_y <= upper_rule_y + tolerance]
+        lower_tokens = sorted(
+            [token for token in tokens if token.center_y > upper_rule_y - tolerance],
+            key=lambda token: token.center_x)
+
+        anchors: dict[int, OCRToken] = {}
+        for column_index, aliases in cls.DIRECT_HEADER_ALIASES.items():
+            candidates = [(cls._header_match_score(token.text, aliases), token)
+                          for token in upper_tokens]
+            score, token = max(
+                candidates, default=(0.0, None),
+                key=lambda item: item[0] * (item[1].score if item[1] else 0))
+            if token is not None and score >= .68:
+                anchors[column_index] = token
+
+        # Repeated Den and Color headings are disambiguated by printed order.
+        cursor = -1.0
+        for column_index, aliases in cls.SUBHEADER_SEQUENCE:
+            candidates = []
+            for token in lower_tokens:
+                if token.center_x <= cursor:
+                    continue
+                score = cls._header_match_score(token.text, aliases)
+                if score >= .68:
+                    candidates.append((token.center_x, -score * token.score, token))
+            if candidates:
+                _, _, token = min(candidates)
+                anchors[column_index] = token
+                cursor = token.center_x
+
+        direct_count = sum(index in anchors for index in cls.DIRECT_HEADER_ALIASES)
+        subgroup_count = sum(index in anchors for index, _ in cls.SUBHEADER_SEQUENCE)
+        if direct_count < 5 or subgroup_count < 7 or len(anchors) < 13:
+            return cls._column_bounds(width), "fixed_fallback", []
+
+        fallback = cls._column_bounds(width)
+        fallback_centers = [(left + right) / 2 for left, right in fallback]
+        observed = {index: token.center_x for index, token in anchors.items()}
+        centers: list[float] = []
+        for index, fallback_center in enumerate(fallback_centers):
+            if index in observed:
+                centers.append(observed[index])
+                continue
+            previous = max((item for item in observed if item < index), default=None)
+            following = min((item for item in observed if item > index), default=None)
+            if previous is not None and following is not None:
+                ratio = ((fallback_center - fallback_centers[previous]) /
+                         max(1.0, fallback_centers[following] - fallback_centers[previous]))
+                center = observed[previous] + ratio * (observed[following] - observed[previous])
+            elif previous is not None:
+                center = observed[previous] + fallback_center - fallback_centers[previous]
+            elif following is not None:
+                center = observed[following] + fallback_center - fallback_centers[following]
+            else:
+                center = fallback_center
+            centers.append(center)
+
+        minimum_gap = max(3.0, width * .0025)
+        for index in range(1, len(centers)):
+            centers[index] = max(centers[index], centers[index-1] + minimum_gap)
+        if centers[-1] >= width:
+            return cls._column_bounds(width), "fixed_fallback", []
+
+        edges = [0.0]
+        for index in range(len(centers)-1):
+            current = anchors.get(index)
+            following = anchors.get(index+1)
+            if current and following and current.bbox[2] <= following.bbox[0]:
+                gap = following.bbox[0] - current.bbox[2]
+                edge = current.bbox[2] + gap * cls.HEADER_GAP_SHARE_TO_PREVIOUS
+            else:
+                edge = (centers[index] + centers[index+1]) / 2
+            edges.append(max(edges[-1] + 1, min(width-1, edge)))
+        edges.append(float(width))
+        bounds = [(round(edges[index]), round(edges[index+1]))
+                  for index in range(len(centers))]
+        if len(bounds) != len(HESBAN_TABLE_COLUMNS) or any(left >= right for left, right in bounds):
+            return cls._column_bounds(width), "fixed_fallback", []
+
+        evidence = [{
+            "column": HESBAN_TABLE_COLUMNS[index],
+            "text": token.text,
+            "bbox": [round(value) for value in token.bbox],
+        } for index, token in sorted(anchors.items())]
+        return bounds, "header_ocr", evidence
 
     @staticmethod
     def _horizontal_rules(image: Image.Image) -> list[tuple[int, int, int, int]]:
@@ -423,7 +596,8 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             header_bottom = min(height, lower[0] + max(3, lower[3]))
             header_crop = image.crop((max(0, min(upper[1], lower[1])), header_top,
                                       min(image.width, max(upper[2], lower[2])), header_bottom))
-            header_text, _ = _tokens_to_text(self.engine.recognize(header_crop), minimum_score=.18)
+            header_tokens = self.engine.recognize(header_crop)
+            header_text, _ = _tokens_to_text(header_tokens, minimum_score=.18)
             if not self._header_is_hesban(header_text):
                 continue
             left = max(0, min(upper[1], lower[1]))
@@ -432,8 +606,15 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             closing = next((rule for rule in rules if rule[0] > data_top + max(8, height*.002)), None)
             closing_y = closing[0] if closing else None
             data_bottom = closing_y if closing_y is not None else height
+            column_bounds, column_source, header_anchors = self._column_bounds_from_header(
+                header_tokens, right-left, upper[0]-header_top)
+            for anchor in header_anchors:
+                anchor["bbox"][1] += header_top
+                anchor["bbox"][3] += header_top
             return TableBoundary(left, right, upper[0], lower[0], data_top,
-                                 data_bottom, closing_y, header_text)
+                                 data_bottom, closing_y, header_text,
+                                 tuple(column_bounds), column_source,
+                                 tuple(header_anchors))
         return None
 
     @staticmethod
@@ -450,7 +631,9 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             return int(candidates[0])
         return min(image.height, round(last_anchor + max(45, default_gap * 1.35)))
 
-    def _number_component_tokens(self, image: Image.Image) -> list[OCRToken]:
+    def _number_component_tokens(
+            self, image: Image.Image,
+            bounds: Optional[list[tuple[int, int]]] = None) -> list[OCRToken]:
         """OCR each small item in the printed No column.
 
         Whole-page detectors occasionally merge ``4`` with ``Pithos`` or miss
@@ -459,7 +642,8 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         the actual printed characters.
         """
         width = image.width
-        left, right = self._column_bounds(width)[0]
+        bounds = bounds or self._column_bounds(width)
+        left, right = bounds[0]
         gray = np.asarray(image.convert("L"))[:, left:right]
         active = np.where((gray < 170).sum(axis=1) >= 2)[0]
         runs: list[tuple[int, int]] = []
@@ -476,7 +660,7 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         # Include Type as context. PaddleOCR often cannot recognize a narrow
         # isolated ``1``, but reliably reads ``1 Pithos``; _row_anchors keeps
         # only the leading printed number.
-        context_right = self._column_bounds(width)[1][1]
+        context_right = bounds[1][1]
         crops = [image.crop((left, max(0, top-10), context_right, min(image.height, bottom+11)))
                  for top, bottom in runs]
         output = []
@@ -490,12 +674,13 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
 
     def _row_anchors(self, image: Image.Image, expected_numbers: list[str],
                      page_tokens: Optional[list[OCRToken]] = None,
-                     restrict_to_expected: bool = False) -> list[tuple[str, OCRToken]]:
+                     restrict_to_expected: bool = False,
+                     bounds: Optional[list[tuple[int, int]]] = None) -> list[tuple[str, OCRToken]]:
         width = image.width
-        bounds = self._column_bounds(width)
+        bounds = bounds or self._column_bounds(width)
         number_left, number_right = bounds[0]
         tokens = page_tokens if page_tokens is not None else self.engine.recognize(image)
-        component_tokens = self._number_component_tokens(image)
+        component_tokens = self._number_component_tokens(image, bounds)
         expected = {normalize_vessel_number(number) for number in expected_numbers}
         candidates: list[tuple[str, OCRToken]] = []
         for token in tokens + component_tokens:
@@ -568,20 +753,25 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         # enters row parsing.
         # per-cell approach could require hundreds of inference calls per page.
         page_tokens = self.engine.recognize(data_image)
+        bounds = list(boundary.column_bounds)
         # The first pass must retain unexpected rows so validation can detect a
         # wrong/extra table. Only the targeted truncation retry may filter to
         # the explicitly missing numbers.
         anchors = self._row_anchors(
             data_image, expected_numbers, page_tokens,
-            restrict_to_expected=bool(page_context.get("retry_missing")))
+            restrict_to_expected=bool(page_context.get("retry_missing")),
+            bounds=bounds)
         if not anchors:
             return {"is_table": False, "rows": [], "boundary": boundary.as_dict()}
         differences = [anchors[index+1][1].bbox[1] - anchors[index][1].bbox[1]
                        for index in range(len(anchors)-1) if anchors[index+1][1].bbox[1] > anchors[index][1].bbox[1]]
         default_gap = median(differences) if differences else data_image.height * .09
-        bounds = self._column_bounds(data_image.width)
         rows = []
-        warnings = []
+        warnings = ([] if boundary.column_source == "header_ocr" else [{
+            "code": "column_header_fallback",
+            "message": (f"Figure {figure_id} used fallback column widths because "
+                        "the printed subheadings were not read reliably."),
+        }])
         refinement_images = []
         refinement_targets: list[tuple[dict[str, str], str]] = []
         for index, (number, token) in enumerate(anchors):
@@ -639,6 +829,17 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             boundary_data[key] += crop_top
         if boundary_data["closing_rule_y"] is not None:
             boundary_data["closing_rule_y"] += crop_top
+        boundary_data["column_bounds"] = [
+            [left + crop_left, right + crop_left]
+            for left, right in boundary_data.get("column_bounds", [])
+        ]
+        for anchor in boundary_data.get("header_anchors", []):
+            anchor["bbox"] = [
+                anchor["bbox"][0] + boundary.left + crop_left,
+                anchor["bbox"][1] + crop_top,
+                anchor["bbox"][2] + boundary.left + crop_left,
+                anchor["bbox"][3] + crop_top,
+            ]
         return {
             "is_table": True,
             "figure_id": page_context.get("figure_id", ""),
