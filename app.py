@@ -55,6 +55,7 @@ from metadata_linker import (
     AmbiguousSourceError,
     HESBAN_TABLE_COLUMNS,
     PUBLIC_LINKAGE_COLUMNS,
+    WARNING_OVERRIDE_REASONS,
     Hesban11Profile,
     MetadataLinkError,
     ReviewerRevisionConflict,
@@ -2986,9 +2987,11 @@ def get_project_metadata_link_evidence(project_id, filename):
     if not image_path.exists():
         return jsonify({'error': 'Image not found', 'success': False}), 404
     state = load_linkage_state(project_path)
-    target_figure = normalize_figure_id(request.args.get('figure', ''))
+    requested_figure = str(request.args.get('figure', ''))
+    target_figure = normalize_figure_id(requested_figure)
     figure = next((f for f in state.get('figures', [])
-                   if normalize_figure_id(f.get('figure_id')) == target_figure), None)
+                   if str(f.get('figure_key', '')) == requested_figure or
+                   normalize_figure_id(f.get('figure_id')) == target_figure), None)
     if not figure:
         return jsonify({'error': 'Figure not found', 'success': False}), 404
     image = PILImage.open(image_path).convert('RGB')
@@ -3069,7 +3072,8 @@ def update_project_metadata_link_figure(project_id, figure_id):
     state = load_linkage_state(project_path)
     target_id = normalize_figure_id(figure_id)
     figure = next((f for f in state.get('figures', [])
-                   if normalize_figure_id(f.get('figure_id')) == target_id), None)
+                   if str(f.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(f.get('figure_id')) == target_id), None)
     if not figure:
         return jsonify({'error': 'Figure not found', 'success': False}), 404
     data = request.get_json(silent=True) or {}
@@ -3189,8 +3193,9 @@ def update_project_metadata_link_figure(project_id, figure_id):
         # Validate against the warnings currently produced by this figure. A
         # client cannot turn an identity error into an overridable warning.
         validate_figure(figure, get_profile(state.get('profile', 'hesban11')))
-        allowed = {warning.get('id') for warning in figure.get('warnings', [])
+        allowed = {warning.get('id'): warning for warning in figure.get('warnings', [])
                    if warning.get('overrideable')}
+        previous_overrides = figure.get('warning_overrides', {})
         submitted_overrides = {}
         for warning_id, override in data['warning_overrides'].items():
             if warning_id not in allowed or not isinstance(override, dict):
@@ -3200,10 +3205,18 @@ def update_project_metadata_link_figure(project_id, figure_id):
             if not reason:
                 return jsonify({'error': 'Every warning override requires a reason',
                                 'success': False}), 400
+            warning_code = str(allowed[warning_id].get('code', ''))
+            if reason not in WARNING_OVERRIDE_REASONS.get(warning_code, set()):
+                return jsonify({'error': f'Invalid review reason for {warning_code}',
+                                'success': False}), 400
+            previous = previous_overrides.get(warning_id, {})
             submitted_overrides[warning_id] = {
                 'reason': reason,
                 'note': str(override.get('note', '')).strip(),
-                'at': override.get('at') or __import__('datetime').datetime.now(
+                # The server owns this audit timestamp. Ordinary autosaves send
+                # the active override again and must not rewrite when the
+                # reviewer originally made the decision.
+                'at': previous.get('at') or __import__('datetime').datetime.now(
                     __import__('datetime').timezone.utc).isoformat(),
             }
         figure['warning_overrides'] = submitted_overrides
@@ -3249,7 +3262,8 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
     state = load_linkage_state(project_path)
     target_id = normalize_figure_id(figure_id)
     figure = next((candidate for candidate in state.get('figures', [])
-                   if normalize_figure_id(candidate.get('figure_id')) == target_id), None)
+                   if str(candidate.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(candidate.get('figure_id')) == target_id), None)
     if not figure:
         return jsonify({'error': 'Figure not found', 'success': False}), 404
     if not figure.get('table_pages'):
@@ -3266,6 +3280,11 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
                             'success': False}), 409
         _metadata_link_jobs[project_id] = True
     try:
+        # Persist this before the synchronous OCR work starts. Other Flask
+        # requests can now display the correct state and must not edit the same
+        # figure while its draft is being replaced by fresh extraction output.
+        figure['processing_status'] = 'processing'
+        save_linkage_state(project_path, state)
         profile = get_profile(state.get('profile', 'hesban11'))
         manifest = ensure_page_manifest(project_path, profile.slug)
         manifest_pages = {page.get('image_name'): page for page in manifest.get('pages', [])}
@@ -3349,15 +3368,22 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
     except MetadataLinkError as exc:
         return jsonify({'error': str(exc), 'success': False}), 409
     finally:
+        try:
+            latest_state = load_linkage_state(project_path)
+            latest_figure = next((candidate for candidate in latest_state.get('figures', [])
+                                  if str(candidate.get('figure_key', '')) ==
+                                  str(figure.get('figure_key', ''))), None)
+            if latest_figure and latest_figure.get('processing_status') == 'processing':
+                latest_figure['processing_status'] = 'reviewable'
+                save_linkage_state(project_path, latest_state)
+        except Exception:
+            app.logger.exception('Could not restore figure review state after OCR rerun')
         with _metadata_link_jobs_lock:
             _metadata_link_jobs[project_id] = False
 
 
 @app.route('/api/projects/<project_id>/metadata-link/apply', methods=['POST'])
 def apply_project_metadata_links(project_id):
-    if _metadata_link_jobs.get(project_id):
-        return jsonify({'error': 'Wait for metadata linking to finish before approval',
-                        'success': False}), 409
     project_path = project_manager.get_project_path(project_id)
     if not project_path:
         return jsonify({'error': 'Project not found', 'success': False}), 404

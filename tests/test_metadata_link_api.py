@@ -221,8 +221,12 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
         "progress": {}, "figures": [figure], "warnings": [],
     })
 
+    observed_processing_states = []
+
     class FakeRerunOCR:
         def extract_table(self, *args, **kwargs):
+            observed_processing_states.append(
+                load_linkage_state(project_path)["figures"][0]["processing_status"])
             return {
                 "is_table": True, "printed_page": "20",
                 "rows": [{"table_no": "1", "table_type": "Pithos"}],
@@ -252,6 +256,7 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
     assert updated["status"] == "ready"
     assert updated["table_rows"][0]["table_type"] == "Pithos"
     assert updated["table_pages"][0]["boundary"]["closing_rule_y"] == 760
+    assert observed_processing_states == ["processing"]
 
     evidence = client.get(
         f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg?figure=2.1&kind=table&overlay=1")
@@ -397,3 +402,141 @@ def test_row_operations_and_safe_warning_override_are_audited_in_csv(
     csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
                       dtype=str, keep_default_na=False)
     assert csv.loc[0, "Link Status"] == "approved_with_overrides"
+
+
+def test_override_timestamp_is_server_owned_and_stable_across_autosaves(
+        tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Override Audit")
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable",
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        "extraction_warnings": [{"code": "missing_table_end", "message": "No end"}],
+    }
+    validate_figure(figure, Hesban11Profile())
+    warning_id = next(w["id"] for w in figure["warnings"]
+                      if w["code"] == "missing_table_end")
+    save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
+                                      "figures": [figure]})
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+    bad = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}",
+        json={"reviewer_revision": 0, "warning_overrides": {warning_id: {
+            "reason": "arbitrary_reason", "at": "1900-01-01T00:00:00Z",
+        }}},
+    )
+    assert bad.status_code == 400
+    first = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}",
+        json={"reviewer_revision": 0, "warning_overrides": {warning_id: {
+            "reason": "visually_confirmed_complete", "at": "1900-01-01T00:00:00Z",
+        }}},
+    )
+    assert first.status_code == 200
+    first_payload = first.get_json()["figure"]
+    first_at = first_payload["warning_overrides"][warning_id]["at"]
+    assert not first_at.startswith("1900-")
+    second = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}",
+        json={"reviewer_revision": 1,
+              "figure_caption": "An unrelated autosave",
+              "warning_overrides": {warning_id: {
+                  "reason": "visually_confirmed_complete", "note": "Still checked",
+              }}},
+    )
+    assert second.status_code == 200
+    assert second.get_json()["figure"]["warning_overrides"][warning_id]["at"] == first_at
+
+
+def test_stable_figure_key_remains_editable_after_figure_id_correction(
+        tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Stable Key")
+    from PIL import Image
+    Image.new("RGB", (100, 100), "white").save(project_path / "images" / "page_0.jpg")
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable",
+        "drawing_pages": [{"image_name": "page_0.jpg", "source_pdf": "hesban.pdf"}],
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1",
+                      "image_name": "page_0.jpg", "bbox": [10, 10, 80, 80]}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+    }
+    validate_figure(figure, Hesban11Profile())
+    save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
+                                      "figures": [figure]})
+    key = figure["figure_key"]
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+    renamed = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{key}",
+        json={"reviewer_revision": 0, "figure_id": "2.2"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.get_json()["figure"]["figure_key"] == key
+    edited = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{key}",
+        json={"reviewer_revision": 1, "figure_caption": "Figure 2.2 corrected"},
+    )
+    assert edited.status_code == 200
+    assert edited.get_json()["figure"]["figure_id"] == "2.2"
+    evidence = client.get(
+        f"/api/projects/{project_id}/metadata-link/evidence/page_0.jpg?figure={key}")
+    assert evidence.status_code == 200
+    assert evidence.mimetype == "image/png"
+
+
+def test_completed_figure_can_be_approved_while_another_figure_is_processing(
+        tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Live Approval")
+    pd.DataFrame([{"file": "page_0", "mask_file": "card_0"}]).to_csv(
+        project_path / "cards" / "mask_info.csv", index=False)
+    complete = {
+        "figure_id": "2.1", "processing_status": "ready", "reviewer_revision": 0,
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+    }
+    processing = {
+        "figure_id": "2.2", "processing_status": "processing", "reviewer_revision": 0,
+        "drawings": [{"mask_file": "card_1", "fingerprint": "y", "vessel_number": "1"}],
+        "table_rows": [],
+    }
+    validate_figure(complete, Hesban11Profile())
+    validate_figure(processing, Hesban11Profile())
+    save_linkage_state(project_path, {
+        "profile": "hesban11", "status": "running", "figures": [complete, processing],
+    })
+    stale_background = load_linkage_state(project_path)
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    app_module._metadata_link_jobs[project_id] = True
+    try:
+        client = app_module.app.test_client()
+        blocked = client.post(
+            f"/api/projects/{project_id}/metadata-link/apply",
+            json={"figure_ids": ["2.2"]},
+        )
+        assert blocked.status_code == 409
+        assert "still being extracted" in blocked.get_json()["error"]
+        response = client.post(
+            f"/api/projects/{project_id}/metadata-link/apply",
+            json={"figure_ids": ["2.1"], "replace_imported": True},
+        )
+        assert response.status_code == 200
+        approved = load_linkage_state(project_path)["figures"][0]
+        assert approved["review_status"] == "approved"
+        assert approved["reviewer_revision"] == 1
+        assert approved["matches"][0]["applied_values"]["Type"] == "Pithos"
+
+        # Simulate the long-running linker saving its pre-approval in-memory
+        # state. The newer reviewer revision must survive this stale progress
+        # write, including approval and feature-owned CSV evidence.
+        save_linkage_state(project_path, stale_background)
+        after_background = load_linkage_state(project_path)["figures"][0]
+        assert after_background["review_status"] == "approved"
+        assert after_background["processing_status"] == "approved"
+        assert after_background["reviewer_revision"] == 1
+        assert after_background["matches"][0]["applied_values"]["Type"] == "Pithos"
+        csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
+                          dtype=str, keep_default_na=False)
+        assert csv.loc[0, "Type"] == "Pithos"
+    finally:
+        app_module._metadata_link_jobs.pop(project_id, None)

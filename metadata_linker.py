@@ -46,10 +46,15 @@ NON_BLOCKING_WARNING_CODES = {"low_ocr_confidence"}
 OVERRIDABLE_WARNING_CODES = {
     "missing_table_end", "missing_required_value", "column_header_fallback",
 }
+WARNING_OVERRIDE_REASONS = {
+    "missing_table_end": {"visually_confirmed_complete"},
+    "missing_required_value": {"publication_field_blank"},
+    "column_header_fallback": {"column_alignment_verified"},
+}
 REVIEWER_OWNED_FIGURE_FIELDS = {
     "figure_id", "figure_caption", "table_rows", "table_pages",
     "warning_overrides", "reviewer_revision", "draft_saved_at",
-    "review_history", "review_status",
+    "review_history", "review_status", "processing_status", "matches",
 }
 _LINKAGE_STATE_LOCK = threading.RLock()
 
@@ -452,7 +457,11 @@ def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("figures", [])
     for figure in state.get("figures", []):
         figure["figure_key"] = _figure_key(figure)
-        figure["reviewer_revision"] = int(figure.get("reviewer_revision", 0) or 0)
+        try:
+            figure["reviewer_revision"] = max(
+                0, int(figure.get("reviewer_revision", 0) or 0))
+        except (TypeError, ValueError):
+            figure["reviewer_revision"] = 0
         figure.setdefault("warning_overrides", {})
         figure.setdefault("draft_saved_at", "")
         figure.setdefault("processing_status", (
@@ -551,6 +560,17 @@ def _annotations_by_image(project_path: Path) -> dict[str, list[dict[str, Any]]]
 def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = [dict(warning) for warning in
                                      figure.get("extraction_warnings", [])]
+    drawing_sources = {str(page.get("source_pdf", "")).strip()
+                       for page in figure.get("drawing_pages", [])
+                       if str(page.get("source_pdf", "")).strip()}
+    table_sources = {str(page.get("source_pdf", "")).strip()
+                     for page in figure.get("table_pages", [])
+                     if str(page.get("source_pdf", "")).strip()}
+    if drawing_sources and table_sources and not table_sources.issubset(drawing_sources):
+        warnings.append({
+            "code": "cross_pdf_assignment",
+            "message": "Drawing and table pages come from different source PDFs.",
+        })
     previous_matches = {
         (str(match.get("mask_file", "")), str(match.get("fingerprint", ""))): match
         for match in figure.get("matches", [])
@@ -624,8 +644,11 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
             continue
         seen_warning_ids.add(warning["id"])
         warning["overrideable"] = warning.get("code") in OVERRIDABLE_WARNING_CODES
+        override = overrides.get(warning["id"])
         warning["overridden"] = bool(
-            warning["overrideable"] and warning["id"] in overrides)
+            warning["overrideable"] and isinstance(override, dict) and
+            override.get("reason") in WARNING_OVERRIDE_REASONS.get(
+                str(warning.get("code", "")), set()))
         warning["blocking"] = bool(
             warning.get("code") not in NON_BLOCKING_WARNING_CODES and
             not warning["overridden"])
@@ -901,6 +924,16 @@ def linkage_totals(state: dict[str, Any]) -> dict[str, int]:
 
 def apply_approved_figures(project_path: Path, figure_ids: Iterable[str],
                            replace_imported: bool = False) -> dict[str, Any]:
+    # Approval changes both the CSV and the review sidecar. Hold the same
+    # in-process lock used by autosaves so a reviewer edit cannot land between
+    # validation, CSV materialization, and the approval revision update.
+    with _LINKAGE_STATE_LOCK:
+        return _apply_approved_figures_locked(
+            project_path, figure_ids, replace_imported)
+
+
+def _apply_approved_figures_locked(project_path: Path, figure_ids: Iterable[str],
+                                   replace_imported: bool = False) -> dict[str, Any]:
     project_path = Path(project_path)
     state = load_linkage_state(project_path)
     requested = {normalize_figure_id(value) for value in figure_ids if normalize_figure_id(value)}
@@ -922,12 +955,20 @@ def apply_approved_figures(project_path: Path, figure_ids: Iterable[str],
     unknown = sorted(requested - set(figures_by_id), key=natural_key)
     if unknown:
         raise MetadataLinkError(f"Unknown figure(s): {', '.join(unknown)}")
+    expected_revisions = {
+        str(figures_by_id[figure_id].get("figure_key", "")):
+        int(figures_by_id[figure_id].get("reviewer_revision", 0) or 0)
+        for figure_id in requested
+    }
 
     # Validate every requested figure and target before changing either the CSV
     # or review state, so a bad later figure cannot create a partial approval.
     targets: dict[tuple[str, str], pd.Series] = {}
     for figure_id in requested:
         figure = figures_by_id[figure_id]
+        if figure.get("processing_status") == "processing":
+            raise MetadataLinkError(
+                f"Figure {figure.get('figure_id')} is still being extracted")
         if figure.get("status") != "ready":
             raise MetadataLinkError(f"Figure {figure.get('figure_id')} still requires review")
         validate_figure(figure, get_profile(state.get("profile", "hesban11")))
@@ -986,6 +1027,9 @@ def apply_approved_figures(project_path: Path, figure_ids: Iterable[str],
             applied += int(target.sum())
         figure["review_status"] = "approved"
         figure["processing_status"] = "approved"
+        figure["reviewer_revision"] = (
+            int(figure.get("reviewer_revision", 0) or 0) + 1)
+        figure["draft_saved_at"] = utc_now()
         figure["approved_at"] = utc_now()
         figure.setdefault("review_history", []).append({
             "action": "approved", "at": figure["approved_at"],
@@ -996,7 +1040,7 @@ def apply_approved_figures(project_path: Path, figure_ids: Iterable[str],
         "applied_rows": applied, "replace_imported": bool(replace_imported),
     })
     _atomic_csv_write(info_path, frame)
-    save_linkage_state(project_path, state)
+    save_linkage_state(project_path, state, expected_revisions=expected_revisions)
     return {"applied_rows": applied, "totals": linkage_totals(state)}
 
 

@@ -151,6 +151,9 @@ def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
     warning = next(item for item in figure["warnings"] if item["code"] == "missing_table_end")
     assert warning["overrideable"] is True
     assert figure["status"] == "needs_review"
+    figure["warning_overrides"][warning["id"]] = {"reason": "tampered_reason"}
+    validate_figure(figure, profile)
+    assert figure["status"] == "needs_review"
     figure["warning_overrides"][warning["id"]] = {
         "reason": "visually_confirmed_complete", "note": "Checked page"
     }
@@ -161,6 +164,23 @@ def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
     duplicate = next(item for item in figure["warnings"]
                      if item["code"] == "duplicate_drawing_number")
     assert duplicate["overrideable"] is False
+    assert figure["status"] == "needs_review"
+
+
+def test_cross_pdf_assignment_in_loaded_sidecar_is_always_blocking():
+    figure = {
+        "figure_id": "2.1",
+        "drawing_pages": [{"source_pdf": "drawings.pdf"}],
+        "table_pages": [{"source_pdf": "different.pdf"}],
+        "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        "warning_overrides": {},
+    }
+    validate_figure(figure, Hesban11Profile())
+    warning = next(item for item in figure["warnings"]
+                   if item["code"] == "cross_pdf_assignment")
+    assert warning["overrideable"] is False
+    assert warning["blocking"] is True
     assert figure["status"] == "needs_review"
 
 
@@ -188,6 +208,27 @@ def test_newer_reviewer_revision_survives_stale_background_save(tmp_path):
     final = load_linkage_state(project)
     assert final["figures"][0]["table_rows"][0]["table_type"] == "Manual correction"
     assert final["figures"][0]["reviewer_revision"] == 1
+
+
+def test_legacy_sidecar_receives_stable_review_defaults(tmp_path):
+    project = tmp_path / "project"
+    cards = project / "cards"
+    cards.mkdir(parents=True)
+    legacy = {
+        "profile": "hesban11", "status": "complete",
+        "figures": [{
+            "figure_id": "2.1",
+            "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
+            "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        }],
+    }
+    (cards / "metadata_linkage.json").write_text(json.dumps(legacy), encoding="utf-8")
+    first = load_linkage_state(project)["figures"][0]
+    second = load_linkage_state(project)["figures"][0]
+    assert first["figure_key"] == second["figure_key"]
+    assert first["reviewer_revision"] == 0
+    assert first["warning_overrides"] == {}
+    assert first["processing_status"] == "ready"
 
 
 def test_atomic_revision_check_rejects_a_simultaneous_stale_save(tmp_path):
@@ -319,6 +360,15 @@ def test_approval_is_idempotent_and_preserves_manual_columns(tmp_path):
     assert frame["Type"].tolist() == ["Pithos", "Bowl"]
     assert frame["Non-Plastics - Siz"].iloc[1] == "7A\n6A"
     assert frame["Link Status"].tolist() == ["approved", "approved"]
+
+
+def test_processing_figure_cannot_be_applied_by_core_approval(tmp_path):
+    project = make_project(tmp_path)
+    state = MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+    state["figures"][0]["processing_status"] = "processing"
+    save_linkage_state(project, state)
+    with pytest.raises(MetadataLinkError, match="still being extracted"):
+        apply_approved_figures(project, ["2.1"])
 
 
 def test_geometry_change_invalidates_only_affected_figure(tmp_path):

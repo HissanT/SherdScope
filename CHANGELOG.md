@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-07-12
+
+### Reviewed
+
+- Completed an independent implementation review of the accessible figure-review and CSV-correction workflow against its agreed specification.
+- Confirmed that completed figures remain editable during later OCR work, reviewer drafts use stable figure keys and revisions, and CSV approval remains a separate validation step.
+
+### Fixed
+
+- Serialized browser autosaves and guarded them with edit versions so an older response cannot mark newer typing as saved or allow polling to erase it.
+- Added conflict-aware three-way draft merging: disjoint server changes are merged automatically, while overlapping changes keep the local draft visible and report a save conflict for review.
+- Switched review controls, save/rerun routes, and evidence previews to stable figure keys so correcting a printed Figure ID does not break later editing or image evidence.
+- Persisted per-figure OCR rerun processing state before extraction and restored the figure to a reviewable state after success or failure, blocking same-figure edits and approval during extraction.
+- Allowed a completed ready figure to be approved while a different figure is processing; selected processing figures are still rejected, and approval is protected by the linkage lock, reviewer revisions, and stale-background merging.
+- Restricted warning overrides to the three approved warning codes and their preset reasons, with server-owned timestamps that remain stable across later autosaves.
+- Added non-overridable validation for cross-PDF assignments and a core approval guard for figures that are still processing.
+- Added direct warning actions for editing drawing numbers, opening affected rows, and creating missing rows; drawing-number changes now immediately update row highlighting and refresh evidence.
+- Corrected the sticky drawing-number workspace and table-toolbar positioning, including focus visibility and narrow-screen fallbacks.
+- Reapproval now replaces only values still owned by the linker, allowing corrected extracted data to update CSV while preserving later manual researcher corrections.
+
+### Validation
+
+- Focused linkage and API suite: 39 tests passed.
+- Full Python suite: 56 tests passed in 13.58 seconds.
+- Python compilation passed for `app.py`, `metadata_linker.py`, and `ocr_extractor.py`.
+- JavaScript syntax validation passed for `static/js/tabular-tab.js`.
+- `git diff --check` passed; only informational Windows LF/CRLF conversion notices were reported.
+- Interactive browser acceptance was not run, so sticky positioning, narrow-screen layout, and full keyboard behavior still require a short manual UI check.
+
 ## 2026-07-11
 
 ### Added
