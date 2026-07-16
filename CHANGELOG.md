@@ -1,5 +1,120 @@
 # Changelog
 
+## 2026-07-16
+
+### Added
+
+- Added a SherdScope pottery-profile and magnifying-lens logo for the browser tab, splash screen, application header, and information panel.
+- Added a compact categorical-cell OCR preparation path that trims, pads, and enlarges isolated printed glyphs before local PaddleOCR recognition.
+- Added saved Non-Plastics Type OCR diagnostics showing the exact first-line crop, raw retry token, confidence, overlapping whole-page tokens, and accepted value inside the figure review workspace.
+
+### Changed
+
+- Rebranded the active application interface, browser title, startup message, help link, and information panel from PyPotteryLens to SherdScope while retaining clear PyPotteryLens attribution and GPL licensing information.
+- Simplified the researcher CSV to 25 analysis fields by removing Figure Caption, Diameter Source, Drawing Page, Table Pages, Source PDF, and Link Status from final exports. The working linkage sidecar and CSV still retain provenance internally.
+
+### Fixed
+
+- Preserved the document, publication viewer, figure list, and editable-table vertical and horizontal scroll positions across the 1.5-second background linkage refresh.
+- Corrected table group jumps to calculate their destination from the first actual data cell in each group rather than a grouped heading, eliminating the rightward overshoot.
+- Corrected the Non-Plastics Type retry to inspect only the first printed line of each row. The previous whole-row crop included lower-line fragments from neighboring multiline cells and produced blanks or values such as `I`, `T`, `L+h`, and `L+7`.
+- Removed a verified compact Type code from a preceding Fabric Interior token only when the original token geometrically crossed the column boundary.
+- Kept Actions, No., and Type headings visible during vertical table scrolling while allowing their body cells to scroll horizontally with the rest of each row.
+- Removed a global textarea minimum width that made the No. editor overflow its cell and visually touch the Type editor.
+
+### Tests
+
+- Full Python suite: 77 tests passed.
+- JavaScript syntax checks passed for the Review & Link, Export, and main application scripts.
+- Python compilation and diff validation passed.
+- Live browser checks confirmed exact group-jump alignment, sticky identity headers after 520 pixels of vertical scrolling, separated No./Type editors, SherdScope branding, and the reduced 25-column Export preview.
+- Real PP-OCRv5 mobile-model acceptance on Figure 2.1 read all 19 Non-Plastics Type cells correctly across both table pages; all 19 diagnostics were accepted.
+
+## 2026-07-15
+
+### Changed
+
+- Replaced the active Tabular and Post Processing workflow with two focused steps: **Review & Link** and **Export**.
+- Simplified figure review to a narrow figure list, one large publication-page viewer, a selected-figure table, compact controls, and a light publication-style interface.
+- Made structurally valid automatic scale and rim-diameter results immediately usable as `verified_automatic`; researcher corrections are retained separately as `verified_manual`.
+- Removed model/backend terminology and repeated diameter-verification buttons from the normal review workflow. Local PaddleOCR now runs behind one **Read and Link Tables** action.
+- Replaced the Post Processing navigation with a dedicated export page where researchers can include or exclude approved vessel masks and preview the final dataset.
+- Made figure-table extraction visibly sequential: figures that have not started are now labelled **Waiting**, only the current figure is labelled **Processing**, and completed figures become available for review one at a time.
+- Simplified the extracted table to one horizontal scrolling area. Actions, vessel number, and vessel type now move with the rest of the row, the unnecessary **Sort by No.** control is gone, and group-jump buttons move the same table viewport.
+
+### Added
+
+- Added clean research export endpoints for preview, saved mask selection, CSV download, and dataset ZIP download.
+- Added project-level `export_settings.json`, including one-time migration of older Post Processing exclusion choices.
+- Added a fixed researcher-facing 31-column schema, UTF-8 BOM output, correct multiline CSV quoting, readable diameter-source labels, and stable figure/number-based image filenames.
+- Added dataset packages containing `metadata.csv`, an `images/` folder, `data_dictionary.csv`, and `export_summary.txt`.
+- Added persistent publication-viewer state so the selected evidence page, zoom level, and box visibility survive the background OCR refresh cycle.
+- Added plain-language explanations for unresolved diameter measurements, including missing scale, missing top rim, missing centreline, invalid drawing crop, and disagreement between the two diameter estimates.
+
+### Fixed
+
+- Stopped final exports from depending on `cards_modified`, image flips, ENT/FRAG classifications, or legacy merged-classification CSVs.
+- Prevented bounding boxes, OCR evidence, fingerprints, internal mask keys, classifier fields, and other implementation details from leaking into the final research CSV.
+- Prevented `nan`, `None`, mojibake, and alphabetically scrambled headings from appearing in exported metadata.
+- Fixed a startup regression found during browser acceptance after replacing the Post Processing tab.
+- Fixed publication previous/next, zoom, reset, and box-visibility controls being undone or visually ignored while linkage progress refreshed the page.
+- Fixed a legacy CSS cascade that overrode publication zoom and allowed older dark-theme styles to leak into the redesigned light workspace.
+- Fixed queued figures being silently changed to ready or reviewable before their OCR work had started. Editing, measurement, and approval endpoints now reject unfinished figures.
+- Fixed the CSV group-jump buttons so each button moves directly to its named column group in the single table viewport.
+- Hid the missing-table-closing-line warning from normal review and approval while retaining it in the saved OCR evidence for auditing.
+- Fixed export settings so changing visible mask choices cannot erase older hidden exclusions imported from Post Processing.
+- Fixed a download race where CSV or ZIP export could begin before a pending include/exclude autosave finished; downloads now wait for the save and stop if it fails.
+- Corrected the upstream PyPotteryLens attribution from Leonardo Cardarelli to Lorenzo Cardarelli in SherdScope documentation.
+
+### Tests
+
+- Full Python suite: 75 tests passed.
+- Python compilation passed for the application, linker, measurement detector, and research-export modules through `compileall`.
+- JavaScript syntax validation passed for the Review & Link, Export, and main navigation scripts.
+- Diff validation passed with no whitespace errors.
+
+## 2026-07-14
+
+### Added
+
+- Added deterministic automatic detection of the standard Hesban `0-10 CM` graphic ruler, including structural validation, split-page sibling reuse, same-PDF median checks, evidence bounds, fingerprints, and reviewer-correctable manual calibration.
+- Added rim-diameter suggestions derived from the detected illustrated rim span and an independent centreline-to-profile radius. Suggestions are withheld when the two estimates differ by more than five percent and are never calculated from the card bounding-box width.
+- Added reviewer measurement controls, draggable scale and rim endpoints, evidence overlays, per-drawing verification, and revision-protected persistence in `metadata_linkage.json` and existing scale sidecars.
+- Added `Rim Diameter (cm)` and `Diameter Status` to the review table and CSV integration. Only reviewer-verified values are exported; unresolved measurements remain blank without blocking otherwise valid table metadata.
+- Added a figure-scoped measurement endpoint, full-screen table mode, grouped column-jump controls, and synchronized upper and lower horizontal scrollbars.
+
+### Fixed
+
+- Removed the lower-45%-of-page assumption from Hesban ruler detection. The detector now searches the complete rendered page and identifies the scale from its segmented alternating-block structure, allowing short diagram plates whose ruler appears higher on the page.
+- Replaced whole-span rim selection with the Hesban drawing convention used by the corpus: inspect only the top 10% of the card, identify the highest credible rim stroke, measure its connected left edge to the central reconstruction axis, and mirror that radius across the axis. Small publication gaps before the separate right profile no longer shorten the estimated diameter.
+- Grouped the first few scan rows of the same top stroke so slightly uneven printed lines are measured as one rim while longer lower vessel lines remain excluded.
+- Changed scale and rim evidence overlays to thin lines with small hollow handles, and made the editor open on a close evidence crop with Zoom in, Zoom out, and Fit evidence controls so handles no longer cover the ruler or lip.
+- Prevented ambiguous, median-rejected, or otherwise unresolved ruler candidates from supplying `px_per_cm`, generating diameter suggestions, or becoming usable legacy scale records.
+- Preserved existing zoned manual scales when the linker updates the page-wide ruler instead of replacing the complete legacy scale-sidecar list.
+- Added locked scale/CSV persistence and cleared stale card ratios when calibration becomes unusable, preventing concurrent reviewer saves or rejected scales from leaving trusted-looking values behind.
+- Added true local deskewing for mildly rotated rulers, stronger broken/faint/noisy ruler handling, same-PDF/render-DPI median filtering, and safer split-page sibling reuse.
+- Corrected centreline selection to prefer the vertical reconstruction axis nearest the rim midpoint instead of a longer outer vessel wall.
+- Rejected non-finite scale coordinates, drawing boxes, ratios, and diameter values at the measurement and API boundaries.
+- Preserved full-precision automatic diameter suggestions when a reviewer verifies the displayed rounded value, and added scale/diameter reviewer-history records.
+- Made rejected scales appear unresolved in the review screen and made both horizontal table scrollbars keyboard focusable.
+- Corrected sticky-column sizing and offsets so borders and padding cannot cover the first character of `Type`, `Sq`, `Loc`, or later cells.
+- Invalidated diameter evidence when its page calibration, source page, or card geometry changes while preserving compatible legacy manual calibrations.
+- Protected later researcher-entered CSV diameter corrections from automatic reapproval replacement.
+
+### Validation
+
+- Focused measurement and linkage API suite: 24 tests passed during review.
+- Full Python suite: 71 tests passed in SherdScope and 71 tests passed after synchronizing the reviewed files to the working PyPotteryLens fork.
+- Python compilation passed for `app.py`, `metadata_linker.py`, `hesban_measurements.py`, and `utils.py` in both repositories.
+- JavaScript syntax validation passed for `static/js/tabular-tab.js` in both repositories.
+- Synthetic automatic-scale tests passed for clean, faint, broken, mildly skewed, noisy, absent, and competing ruler cases; persistence, split-page reuse, median rejection, rim measurement, revision handling, and verified-only CSV export were also covered.
+- `git diff --check` passed in both repositories; only informational Windows LF/CRLF conversion notices were reported.
+
+### Known limitations
+
+- Live browser acceptance for endpoint dragging, full-screen tables, sticky columns, synchronized scrolling, keyboard behavior, and narrow layouts remains manual because the installed browser-control package is missing its required runtime script.
+- Representative Hesban corpus checks for everted, inverted, thickened, and incomplete rim styles were not run during this review; automatic diameter results remain reviewer suggestions until verified.
+
 ## 2026-07-12
 
 ### Reviewed

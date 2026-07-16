@@ -21,7 +21,9 @@ let tabularState = {
     metadataDirty: new Set(),
     metadataEditVersions: new Map(),
     metadataUndo: new Map(),
-    metadataSnapshots: new Map()
+    metadataSnapshots: new Map(),
+    selectedFigureKey: null,
+    metadataEvidenceState: new Map()
 };
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -36,6 +38,7 @@ document.addEventListener('DOMContentLoaded', () => {
         tabularState.metadataEditVersions.clear();
         tabularState.metadataUndo.clear();
         tabularState.metadataSnapshots.clear();
+        tabularState.metadataEvidenceState.clear();
         tabularState.metadataSaveTimers.forEach(timer => clearTimeout(timer));
         tabularState.metadataSaveTimers.clear();
         tabularState.metadataSaveQueues.clear();
@@ -807,10 +810,11 @@ function hesbanGroupedHeaders() {
         <th rowspan="2" class="sticky-col sticky-actions">Actions</th>
         <th rowspan="2" class="sticky-col sticky-no">No.</th>
         <th rowspan="2" class="sticky-col sticky-type">Type</th>
-        <th rowspan="2">Sq</th><th rowspan="2">Loc</th><th rowspan="2">Pail</th><th rowspan="2">Reg</th>
-        <th colspan="3">Fabric Color</th><th colspan="4">Non-Plastics</th>
-        <th colspan="2">Voids</th><th rowspan="2">Man</th>
-        <th colspan="4">Surface Treatment</th><th rowspan="2">Decor</th><th rowspan="2">Fire</th>
+        <th rowspan="2" class="metadata-diameter-header">Rim Diameter (cm)</th>
+        <th rowspan="2" data-column-group="identity">Sq</th><th rowspan="2">Loc</th><th rowspan="2">Pail</th><th rowspan="2">Reg</th>
+        <th colspan="3" data-column-group="fabric">Fabric Color</th><th colspan="4" data-column-group="nonplastics">Non-Plastics</th>
+        <th colspan="2" data-column-group="voids">Voids</th><th rowspan="2">Man</th>
+        <th colspan="4" data-column-group="surface">Surface Treatment</th><th rowspan="2" data-column-group="finish">Decor</th><th rowspan="2">Fire</th>
     </tr><tr class="metadata-link-sub-header">
         <th>Exterior</th><th>Core</th><th>Interior</th>
         <th>Typ</th><th>Siz</th><th>Shap</th><th>Den</th>
@@ -875,7 +879,7 @@ async function runMetadataLinking() {
     if (!tabularState.currentProject?.project_id) return;
     const button = document.getElementById('metadata-link-run-btn');
     const source = document.getElementById('metadata-link-source')?.value || '';
-    const backend = document.getElementById('metadata-link-backend')?.value || 'ocr';
+    const backend = 'ocr';
     try {
         if (button) button.disabled = true;
         const backendParams = {backend};
@@ -931,10 +935,24 @@ function renderMetadataLinkState(state, active) {
     const hadPreviousRender = figuresContainer.dataset.renderProject === renderProject;
     const editingCurrentFigure = hadPreviousRender && (
         tabularState.metadataDirty.size > 0 || figuresContainer.contains(document.activeElement));
-    if (editingCurrentFigure) return;
-    const openFigures = new Set(
-        [...figuresContainer.querySelectorAll('.metadata-link-figure[open]')]
-            .map(element => element.dataset.linkFigure));
+    const forcedRender = figuresContainer.dataset.forceRender === '1';
+    if (editingCurrentFigure && !forcedRender) return;
+    const preserveViewport = hadPreviousRender && !forcedRender;
+    const pageViewport = preserveViewport ? {left: window.scrollX, top: window.scrollY} : null;
+    const figureListScrollTop = preserveViewport
+        ? figuresContainer.querySelector('.metadata-figure-list')?.scrollTop || 0 : 0;
+    if (preserveViewport) {
+        figuresContainer.querySelectorAll('.metadata-link-figure').forEach(element => {
+            const viewer = element.querySelector('.metadata-link-pages');
+            if (!viewer) return;
+            const key = element.dataset.linkFigure;
+            const stored = tabularState.metadataEvidenceState.get(key) || {};
+            stored.scrollLeft = viewer.scrollLeft;
+            stored.scrollTop = viewer.scrollTop;
+            tabularState.metadataEvidenceState.set(key, stored);
+        });
+    }
+    delete figuresContainer.dataset.forceRender;
     const tableScroll = new Map(
         [...figuresContainer.querySelectorAll('.metadata-link-figure')].map(element => {
             const wrap = element.querySelector('.metadata-link-table-wrap');
@@ -943,21 +961,42 @@ function renderMetadataLinkState(state, active) {
                 top: wrap?.scrollTop || 0
             }];
         }));
-    figuresContainer.innerHTML = figures.map(renderMetadataFigure).join('');
+    const selectedExists = figures.some(figure =>
+        (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey);
+    if (!selectedExists) {
+        const firstAttention = figures.find(figure =>
+            !['processing', 'queued'].includes(figure.processing_status) &&
+            figure.review_status !== 'approved' &&
+            figure.status !== 'ready');
+        const firstReviewable = figures.find(figure =>
+            !['processing', 'queued'].includes(figure.processing_status));
+        const choice = firstAttention || firstReviewable || figures[0];
+        tabularState.selectedFigureKey = choice ? (choice.figure_key || choice.figure_id) : null;
+    }
+    const selectedFigure = figures.find(figure =>
+        (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey) || figures[0];
+    const sidebar = figures.map(figure => {
+        const key = figure.figure_key || figure.figure_id;
+        const label = figure.review_status === 'approved' ? 'Approved'
+            : figure.processing_status === 'processing' ? 'Processing'
+                : figure.processing_status === 'queued' ? 'Waiting'
+                : figure.status === 'ready' ? 'Ready' : 'Needs attention';
+        return `<button type="button" class="metadata-figure-list-item ${key === tabularState.selectedFigureKey ? 'active' : ''}"
+            data-select-figure="${linkEscape(key)}"><strong>Figure ${linkEscape(figure.figure_id || '?')}</strong>
+            <span class="${linkEscape(label.toLowerCase().replace(/\s+/g, '-'))}">${linkEscape(label)}</span></button>`;
+    }).join('');
+    figuresContainer.innerHTML = `<aside class="metadata-figure-list" aria-label="Figures">${sidebar || '<p>No figures found.</p>'}</aside>
+        <div class="metadata-active-figure">${selectedFigure ? renderMetadataFigure(selectedFigure) : ''}</div>`;
     figures.forEach(figure => tabularState.metadataSnapshots.set(
         figure.figure_key || figure.figure_id, structuredClone(figure)));
     figuresContainer.dataset.renderProject = renderProject;
-    if (hadPreviousRender) {
-        figuresContainer.querySelectorAll('.metadata-link-figure').forEach(element => {
-            element.open = openFigures.has(element.dataset.linkFigure);
-            const wrap = element.querySelector('.metadata-link-table-wrap');
-            const saved = tableScroll.get(element.dataset.linkFigure);
-            if (wrap && saved) {
-                wrap.scrollLeft = saved.left;
-                wrap.scrollTop = saved.top;
-            }
-        });
-    }
+    figuresContainer.querySelectorAll('[data-select-figure]').forEach(button =>
+        button.addEventListener('click', () => {
+            tabularState.selectedFigureKey = button.dataset.selectFigure;
+            figuresContainer.dataset.forceRender = '1';
+            button.blur();
+            renderMetadataLinkState(state, active);
+        }));
     figuresContainer.querySelectorAll('[data-link-save]').forEach(button =>
         button.addEventListener('click', () => saveMetadataFigure(button.dataset.linkSave)
             .catch(error => window.PyPotteryUtils.showToast(error.message, 'error'))));
@@ -990,6 +1029,17 @@ function renderMetadataLinkState(state, active) {
             button.dataset.figureId, button.dataset.warningAddRow)));
     figuresContainer.querySelectorAll('[data-link-rerun]').forEach(button =>
         button.addEventListener('click', () => rerunMetadataFigure(button.dataset.linkRerun)));
+    figuresContainer.querySelectorAll('[data-link-measure]').forEach(button =>
+        button.addEventListener('click', () => redetectMetadataMeasurements(button.dataset.linkMeasure)));
+    figuresContainer.querySelectorAll('[data-link-inspect-measurement]').forEach(button =>
+        button.addEventListener('click', () => openMetadataMeasurementEditor(
+            button.closest('[data-link-figure]').dataset.linkFigure,
+            button.dataset.linkInspectMeasurement)));
+    figuresContainer.querySelectorAll('[data-link-inspect-scale]').forEach(button =>
+        button.addEventListener('click', () => openMetadataMeasurementEditor(
+            button.closest('[data-link-figure]').dataset.linkFigure,
+            null, button.dataset.linkInspectScale)));
+    figuresContainer.querySelectorAll('.metadata-link-figure').forEach(setupMetadataEvidenceViewer);
     figuresContainer.querySelectorAll('.metadata-link-table textarea').forEach(textarea => {
         const resize = () => {
             textarea.style.height = 'auto';
@@ -1017,44 +1067,153 @@ function renderMetadataLinkState(state, active) {
         input.addEventListener('input', () => selectMetadataDrawing(
             input.closest('[data-link-figure]').dataset.linkFigure, input));
     });
+    figuresContainer.querySelectorAll('[data-link-diameter]').forEach(input => {
+        input.addEventListener('input', () => synchronizeDiameterInputs(input));
+        input.addEventListener('change', () => synchronizeDiameterInputs(input));
+    });
+    figuresContainer.querySelectorAll('[data-link-verify-diameter]').forEach(button => {
+        button.addEventListener('click', () => verifyMetadataDiameter(button));
+    });
+    figuresContainer.querySelectorAll('[data-link-figure]').forEach(setupMetadataTableNavigation);
     figuresContainer.querySelectorAll('[data-link-figure]').forEach(element =>
         validateMetadataFigureDom(element.dataset.linkFigure));
+    // Textarea auto-sizing and image restoration both change layout after the
+    // markup is replaced. Restore every viewport after two animation frames so
+    // the 1.5-second OCR poll cannot pull the researcher back up the page or to
+    // the top-left of the publication/table panels.
+    if (preserveViewport) {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            const list = figuresContainer.querySelector('.metadata-figure-list');
+            if (list) list.scrollTop = figureListScrollTop;
+            figuresContainer.querySelectorAll('.metadata-link-figure').forEach(element => {
+                const wrap = element.querySelector('.metadata-link-table-wrap');
+                const saved = tableScroll.get(element.dataset.linkFigure);
+                if (wrap && saved) {
+                    wrap.scrollLeft = saved.left;
+                    wrap.scrollTop = saved.top;
+                }
+            });
+            if (pageViewport) window.scrollTo(pageViewport.left, pageViewport.top);
+        }));
+    }
+}
+
+function metadataMeasurementValue(measurement) {
+    return ['verified', 'verified_automatic', 'verified_manual'].includes(measurement?.status)
+        ? measurement.verified_cm : measurement?.suggested_cm;
+}
+
+function metadataMeasurementLabel(status) {
+    if (status === 'verified_automatic') return 'Automatic';
+    if (status === 'verified_manual' || status === 'verified') return 'Manually corrected';
+    return 'Needs attention';
+}
+
+function metadataMeasurementExplanation(measurement) {
+    const reasons = {
+        missing_scale_calibration: 'The page scale could not be measured reliably.',
+        rim_span_not_found: 'The top rim line could not be found reliably.',
+        centreline_not_found: 'The central vertical construction line could not be found.',
+        diameter_estimators_disagree: 'The full rim span and centreline-based estimate differ by more than 5%.',
+        invalid_drawing_bbox: 'The drawing crop is invalid or has changed.',
+        image_not_found: 'The original publication page is unavailable.'
+    };
+    return reasons[measurement?.warning] || (measurement?.status === 'unresolved'
+        ? 'The automatic measurement did not pass its geometry checks.'
+        : 'The automatic scale and two diameter estimates passed their geometry checks.');
 }
 
 function renderMetadataFigure(figure) {
     const projectId = tabularState.currentProject.project_id;
     const reviewKey = figure.figure_key || figure.figure_id;
     const processing = figure.processing_status === 'processing';
-    const status = figure.review_status === 'approved' ? 'approved'
-        : processing ? 'processing' : figure.status;
-    const disabled = processing ? 'disabled' : '';
+    const waiting = figure.processing_status === 'queued';
+    const unavailable = processing || waiting;
+    const status = figure.review_status === 'approved' ? 'Approved'
+        : processing ? 'Processing' : waiting ? 'Waiting'
+            : figure.status === 'ready' ? 'Ready' : 'Needs attention';
+    const disabled = unavailable ? 'disabled' : '';
     const evidencePages = [
         ...(figure.drawing_pages || []).map(page => ({...page, kind: 'drawing'})),
         ...(figure.table_pages || []).map(page => ({...page, kind: 'table'}))
     ];
-    const pageHtml = evidencePages.map(page => {
+    const pageHtml = evidencePages.map((page, pageIndex) => {
         const evidenceUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/${encodeURIComponent(page.image_name)}` +
-            `?figure=${encodeURIComponent(reviewKey)}&kind=${page.kind}&overlay=1&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
-        return `<a href="${evidenceUrl}" target="_blank">
+            `?figure=${encodeURIComponent(reviewKey)}&kind=${page.kind}&overlay=1&measurement=${page.kind === 'drawing' ? '1' : '0'}&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
+        return `<a href="${evidenceUrl}" target="_blank" data-evidence-page="${pageIndex}" ${pageIndex ? 'hidden' : ''}>
             <img src="${evidenceUrl}" data-evidence-kind="${page.kind}" alt="${linkEscape(page.image_name)}"
                  title="${linkEscape(page.kind)}: ${linkEscape(page.image_name)}">
         </a>`;
     }).join('');
-    const drawings = (figure.drawings || []).map(drawing => `
-        <label class="metadata-link-drawing" data-mask-file="${linkEscape(drawing.mask_file)}">
+    const drawingByNumber = new Map((figure.drawings || []).map(drawing =>
+        [String(drawing.vessel_number || '').trim().toLowerCase(), drawing]));
+    const drawings = (figure.drawings || []).map(drawing => {
+        const measurement = drawing.measurement || {};
+        const diameter = metadataMeasurementValue(measurement);
+        const measurementHelp = metadataMeasurementExplanation(measurement);
+        return `<div class="metadata-link-drawing" data-mask-file="${linkEscape(drawing.mask_file)}">
+        <label>
             <span title="${linkEscape(drawing.mask_file)}">Printed No.</span>
             <input class="form-control" data-link-drawing-number data-mask-file="${linkEscape(drawing.mask_file)}"
                    value="${linkEscape(drawing.vessel_number || '')}" aria-label="Printed vessel number" ${disabled}>
-        </label>`).join('');
-    const rows = (figure.table_rows || []).map((row, rowIndex) => `
+        </label><label><span>Rim diameter (cm)</span>
+            <input class="form-control" type="number" min="0.1" step="0.1" data-link-diameter
+                   data-mask-file="${linkEscape(drawing.mask_file)}" data-measurement-status="${linkEscape(measurement.status || 'unresolved')}"
+                   data-measurement-exact="${diameter == null ? '' : linkEscape(diameter)}" data-measurement-edited="0"
+                   value="${diameter == null ? '' : Number(diameter).toFixed(1)}" ${disabled}>
+        </label><div class="metadata-diameter-actions">
+            <span class="metadata-measure-status ${linkEscape(measurement.status || 'unresolved')}" title="${linkEscape(measurementHelp)}">${linkEscape(metadataMeasurementLabel(measurement.status))}</span>
+            ${measurement.status === 'unresolved' ? `<small>${linkEscape(measurementHelp)}</small>` : ''}
+            <button type="button" data-link-inspect-measurement="${linkEscape(drawing.mask_file)}" ${disabled}>Correct</button>
+        </div></div>`;
+    }).join('');
+    const rows = (figure.table_rows || []).map((row, rowIndex) => {
+        const drawing = drawingByNumber.get(String(row.table_no || '').trim().toLowerCase());
+        const measurement = drawing?.measurement || {};
+        const diameter = metadataMeasurementValue(measurement);
+        const diameterCell = `<td class="metadata-diameter-cell"><input class="form-control" type="number" min="0.1" step="0.1"
+            data-link-diameter data-mask-file="${linkEscape(drawing?.mask_file || '')}"
+            data-measurement-status="${linkEscape(measurement.status || 'unresolved')}"
+            data-measurement-exact="${diameter == null ? '' : linkEscape(diameter)}" data-measurement-edited="0"
+            value="${diameter == null ? '' : Number(diameter).toFixed(1)}" ${!drawing || processing ? 'disabled' : ''}>
+            <small>${drawing ? linkEscape(metadataMeasurementLabel(measurement.status)) : 'No matching drawing'}</small></td>`;
+        const dataCells = HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
+            `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}" ${disabled}>${linkEscape(row[column] || '')}</textarea></td>`);
+        dataCells.splice(2, 0, diameterCell);
+        return `
         <tr data-link-row="${rowIndex}">
             <td class="sticky-col sticky-actions metadata-link-row-actions">
                 <button type="button" aria-label="Duplicate row ${rowIndex + 1}" title="Duplicate row"
                         data-link-duplicate-row="${linkEscape(reviewKey)}" data-row-index="${rowIndex}" ${disabled}>⧉</button>
                 <button type="button" aria-label="Delete row ${rowIndex + 1}" title="Delete row"
                         data-link-delete-row="${linkEscape(reviewKey)}" data-row-index="${rowIndex}" ${disabled}>🗑</button>
-            </td>${HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
-            `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}" ${disabled}>${linkEscape(row[column] || '')}</textarea></td>`).join('')}</tr>`).join('');
+            </td>${dataCells.join('')}</tr>`;
+    }).join('');
+    const ocrDiagnostics = (figure.table_pages || []).flatMap(page =>
+        (page.ocr_diagnostics || []).map(item => ({...item, image_name: page.image_name})));
+    const ocrDiagnosticCards = ocrDiagnostics.map(item => {
+        const retryTokens = (item.retry_tokens || []).map(token =>
+            `${token.text || '?'} (${Math.round(Number(token.confidence || 0) * 100)}%)`).join(', ');
+        const overlappingTokens = (item.page_overlap_tokens || []).map(token =>
+            `${token.text || '?'} (${Math.round(Number(token.confidence || 0) * 100)}%)`).join(', ');
+        const cropUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/` +
+            `${encodeURIComponent(item.image_name)}?figure=${encodeURIComponent(reviewKey)}` +
+            `&kind=table&ocr_row=${encodeURIComponent(item.row || '')}` +
+            `&ocr_field=${encodeURIComponent(item.field || '')}` +
+            `&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
+        return `<article class="metadata-ocr-diagnostic-card ${item.status === 'accepted' ? 'accepted' : 'needs-review'}">
+            <img src="${cropUrl}" alt="OCR crop for row ${linkEscape(item.row || '?')}, Non-Plastics Type">
+            <div><strong>Row ${linkEscape(item.row || '?')}</strong>
+                <span>Accepted: ${linkEscape(item.accepted_value || 'blank')}</span>
+                <span>Focused retry: ${linkEscape(retryTokens || 'no token')}</span>
+                <span>Original overlapping OCR: ${linkEscape(overlappingTokens || 'no token')}</span>
+            </div></article>`;
+    }).join('');
+    const ocrDiagnosticPanel = `<details class="metadata-ocr-diagnostics">
+        <summary>Inspect Non-Plastics Typ OCR${ocrDiagnostics.length ? ` (${ocrDiagnostics.length} rows)` : ''}</summary>
+        <p>This shows the first-line crop sent to PaddleOCR, its returned token and confidence, and any larger original token that crossed into this column.</p>
+        ${ocrDiagnosticCards || '<p>No diagnostic evidence is saved yet. Use More → Re-read this figure once to generate it.</p>'}
+    </details>`;
     const overrides = figure.warning_overrides || {};
     const warnings = (figure.warnings || []).map(warning => {
         const active = !!warning.overridden;
@@ -1090,16 +1249,24 @@ function renderMetadataFigure(figure) {
     const open = figure.status === 'needs_review' ? 'open' : '';
     const blockers = (figure.warnings || []).filter(warning => warning.blocking).length;
     const unmatched = (figure.matches || []).filter(match => match.status !== 'ready').length;
+    const calibrations = Object.entries(figure.scale_calibrations || {});
+    const scaleSummary = calibrations.length ? calibrations.map(([imageName, calibration]) =>
+        `<article class="metadata-scale-card"><strong>${linkEscape(imageName)}</strong>
+         <span>${['suggested', 'verified', 'verified_automatic', 'verified_manual'].includes(calibration.status) && calibration.px_per_cm ? Number(calibration.px_per_cm).toFixed(2) + ' px/cm' : 'Scale unresolved'}</span>
+         <span class="metadata-measure-status ${linkEscape(calibration.status || 'unresolved')}">${linkEscape(metadataMeasurementLabel(calibration.status))}</span>
+         ${calibration.warning ? `<small>${linkEscape(calibration.warning)}</small>` : ''}
+         <button type="button" data-link-inspect-scale="${linkEscape(calibration.evidence_image || imageName)}" ${disabled}>Inspect / correct scale</button></article>`).join('')
+        : '<p>No scale has been detected yet.</p>';
     return `<details class="metadata-link-figure" data-link-figure="${linkEscape(reviewKey)}"
-                    data-reviewer-revision="${Number(figure.reviewer_revision || 0)}" ${open}>
+                    data-reviewer-revision="${Number(figure.reviewer_revision || 0)}" open>
         <summary><strong>Figure ${linkEscape(figure.figure_id)}</strong>
-            <span class="metadata-link-badge ${linkEscape(status)}">${linkEscape(status)}</span>
+            <span class="metadata-link-badge ${linkEscape(status.toLowerCase().replace(/\s+/g, '-'))}">${linkEscape(status)}</span>
             <span>${(figure.drawings || []).length} drawings / ${(figure.table_rows || []).length} rows</span>
         </summary>
         <div class="metadata-link-figure-body">
             <div class="metadata-link-save-strip">
                 <strong>Review workspace</strong>
-                <span data-link-save-status aria-live="polite">${processing ? 'OCR processing…' : 'Saved'}</span>
+                <span data-link-save-status aria-live="polite">${processing ? 'OCR processing…' : waiting ? 'Waiting for OCR…' : 'Saved'}</span>
             </div>
             <label>Figure ID <input class="form-control" data-link-figure-id value="${linkEscape(figure.figure_id || '')}" ${disabled}></label>
             <label>Caption <input class="form-control" data-link-caption value="${linkEscape(figure.figure_caption || '')}" ${disabled}></label>
@@ -1107,38 +1274,130 @@ function renderMetadataFigure(figure) {
                 <input class="form-control" data-link-table-pages value="${linkEscape(tablePageNames)}" ${disabled}>
             </label>
             <div class="metadata-link-evidence">
-                <div><h4>Source evidence</h4><div class="metadata-link-pages">${pageHtml}</div></div>
+                <div><div class="metadata-evidence-toolbar"><h4>Publication page</h4>
+                    <span><button type="button" data-evidence-prev aria-label="Previous page">Previous</button>
+                    <button type="button" data-evidence-next aria-label="Next page">Next</button>
+                    <output data-evidence-page-status aria-live="polite"></output>
+                    <button type="button" data-evidence-zoom-out aria-label="Zoom out">Zoom out</button>
+                    <button type="button" data-evidence-zoom-in aria-label="Zoom in">Zoom in</button>
+                    <button type="button" data-evidence-boxes>Hide boxes</button>
+                    <button type="button" data-evidence-reset>Reset</button></span></div>
+                    <div class="metadata-link-pages" data-evidence-index="0" data-evidence-zoom="1">${pageHtml}</div></div>
             </div>
+            <section class="metadata-scale-workspace"><div class="metadata-scale-heading">
+                <div><h4>Scale and rim diameters</h4><p>Valid automatic measurements are already accepted. Correct only the values that look wrong.</p></div>
+                <button type="button" data-link-measure="${linkEscape(reviewKey)}" ${disabled}>Re-read measurements</button>
+            </div><div class="metadata-scale-cards">${scaleSummary}</div></section>
             <div class="metadata-link-number-workspace"><h4>Drawing numbers</h4>
-                <p>Click a number to highlight its linked table row and drawing box.</p>
+                <p>Correct a printed number or diameter only when it does not match the publication.</p>
                 <div class="metadata-link-drawings">${drawings}</div>
             </div>
             <div class="metadata-link-table-section"><div class="metadata-link-table-toolbar">
                 <h4>Extracted table</h4>
                 <button type="button" data-link-add-row="${linkEscape(reviewKey)}" ${disabled}>Add row</button>
-                <button type="button" data-link-sort-rows="${linkEscape(reviewKey)}" ${disabled}>Sort by No.</button>
                 <button type="button" data-link-undo-row="${linkEscape(reviewKey)}" ${disabled}>Undo delete</button>
                 <button type="button" data-link-restore="${linkEscape(reviewKey)}" ${disabled}>Restore last saved</button>
-            </div><div class="metadata-link-table-wrap">
+                <button type="button" data-link-table-expand>Full-screen table</button>
+                <nav class="metadata-column-jumps" aria-label="Jump to column group">
+                    <button type="button" data-column-jump="identity">Identity</button><button type="button" data-column-jump="fabric">Fabric</button>
+                    <button type="button" data-column-jump="nonplastics">Non-Plastics</button><button type="button" data-column-jump="voids">Voids</button>
+                    <button type="button" data-column-jump="surface">Surface</button><button type="button" data-column-jump="finish">Finish</button>
+                </nav>
+            </div><div class="metadata-link-table-wrap" role="region" tabindex="0" aria-label="Editable publication table">
                 <table class="metadata-link-table"><thead>${hesbanGroupedHeaders()}</thead><tbody>${rows}</tbody></table>
             </div></div>
+            ${ocrDiagnosticPanel}
             ${warnings ? `<section class="metadata-link-warnings"><h4>Review warnings</h4>${warnings}</section>` : ''}
             <div class="metadata-link-readiness ${blockers || unmatched ? 'blocked' : 'ready'}">
                 <strong>CSV readiness</strong>
-                <span>${processing ? 'This figure is still processing.' : blockers
+                <span>${processing ? 'This figure is still processing.' : waiting ? 'This figure is waiting for OCR.' : blockers
                     ? `${blockers} blocking warning(s) remain.` : unmatched
                         ? `${unmatched} drawing/table match(es) remain unresolved.`
                         : 'Unique matches are ready for approval.'}</span>
             </div>
             <div class="metadata-link-review-actions">
                 <button class="btn btn-secondary" data-link-save="${linkEscape(reviewKey)}" ${disabled}>Save now</button>
-                <button class="btn btn-secondary" data-link-rerun="${linkEscape(reviewKey)}"
-                        ${processing || tabularState.metadataLinkState?.status === 'running' ? 'disabled' : ''}>Rerun OCR for this figure</button>
                 <button class="btn btn-success" data-link-approve="${linkEscape(reviewKey)}"
-                        ${figure.status !== 'ready' || processing ? 'disabled' : ''}>Approve and apply to CSV</button>
-                <button class="btn btn-danger" data-link-reject="${linkEscape(reviewKey)}" ${disabled}>Reject</button>
+                        ${figure.status !== 'ready' || unavailable ? 'disabled' : ''}>Approve and apply to CSV</button>
+                <details class="metadata-more-actions"><summary>More</summary><div>
+                    <button class="btn btn-secondary" data-link-rerun="${linkEscape(reviewKey)}"
+                        ${unavailable || tabularState.metadataLinkState?.status === 'running' ? 'disabled' : ''}>Re-read this figure</button>
+                    <button class="btn btn-danger" data-link-reject="${linkEscape(reviewKey)}" ${disabled}>Reject figure</button>
+                </div></details>
             </div>
         </div></details>`;
+}
+
+function setupMetadataEvidenceViewer(figureElement) {
+    const viewer = figureElement.querySelector('.metadata-link-pages');
+    if (!viewer) return;
+    const pages = [...viewer.querySelectorAll('[data-evidence-page]')];
+    const figureKey = figureElement.dataset.linkFigure;
+    const stored = tabularState.metadataEvidenceState.get(figureKey) || {
+        index: 0, zoom: 1, overlays: true, scrollLeft: 0, scrollTop: 0
+    };
+    const status = figureElement.querySelector('[data-evidence-page-status]');
+    const overlayButton = figureElement.querySelector('[data-evidence-boxes]');
+    const previousButton = figureElement.querySelector('[data-evidence-prev]');
+    const nextButton = figureElement.querySelector('[data-evidence-next]');
+    const applyOverlays = visible => {
+        pages.forEach(page => {
+            const image = page.querySelector('img');
+            if (!image) return;
+            const url = new URL(image.src, window.location.origin);
+            url.searchParams.set('overlay', visible ? '1' : '0');
+            image.src = url.pathname + url.search;
+            page.href = image.src;
+        });
+        if (overlayButton) {
+            overlayButton.dataset.hidden = visible ? '0' : '1';
+            overlayButton.textContent = visible ? 'Hide boxes' : 'Show boxes';
+        }
+    };
+    const showPage = delta => {
+        let index = Number(viewer.dataset.evidenceIndex || 0) + delta;
+        index = Math.max(0, Math.min(pages.length - 1, index));
+        viewer.dataset.evidenceIndex = String(index);
+        pages.forEach((page, pageIndex) => { page.hidden = pageIndex !== index; });
+        stored.index = index;
+        tabularState.metadataEvidenceState.set(figureKey, stored);
+        if (status) status.textContent = pages.length ? `${index + 1} / ${pages.length}` : 'No pages';
+        if (previousButton) previousButton.disabled = !pages.length || index === 0;
+        if (nextButton) nextButton.disabled = !pages.length || index === pages.length - 1;
+    };
+    const setZoom = value => {
+        const zoom = Math.max(.5, Math.min(2.5, value));
+        viewer.dataset.evidenceZoom = String(zoom);
+        viewer.style.setProperty('--evidence-zoom', zoom);
+        stored.zoom = zoom;
+        tabularState.metadataEvidenceState.set(figureKey, stored);
+    };
+    viewer.dataset.evidenceIndex = String(Math.max(0, Math.min(pages.length - 1, stored.index || 0)));
+    setZoom(Number(stored.zoom || 1));
+    showPage(0);
+    applyOverlays(stored.overlays !== false);
+    requestAnimationFrame(() => {
+        viewer.scrollLeft = Number(stored.scrollLeft || 0);
+        viewer.scrollTop = Number(stored.scrollTop || 0);
+    });
+    viewer.addEventListener('scroll', () => {
+        stored.scrollLeft = viewer.scrollLeft;
+        stored.scrollTop = viewer.scrollTop;
+        tabularState.metadataEvidenceState.set(figureKey, stored);
+    }, {passive: true});
+    previousButton?.addEventListener('click', () => showPage(-1));
+    nextButton?.addEventListener('click', () => showPage(1));
+    figureElement.querySelector('[data-evidence-zoom-out]')?.addEventListener('click', () =>
+        setZoom(Number(viewer.dataset.evidenceZoom || 1) - .15));
+    figureElement.querySelector('[data-evidence-zoom-in]')?.addEventListener('click', () =>
+        setZoom(Number(viewer.dataset.evidenceZoom || 1) + .15));
+    figureElement.querySelector('[data-evidence-reset]')?.addEventListener('click', () => setZoom(1));
+    overlayButton?.addEventListener('click', event => {
+        const currentlyVisible = event.currentTarget.dataset.hidden !== '1';
+        stored.overlays = !currentlyVisible;
+        tabularState.metadataEvidenceState.set(figureKey, stored);
+        applyOverlays(stored.overlays);
+    });
 }
 
 function addMetadataTableRow(figureId, tableNumber = '') {
@@ -1161,8 +1420,10 @@ function metadataDynamicRowCells(figureId, rowIndex, values) {
                 data-link-duplicate-row="${linkEscape(figureId)}" data-row-index="${rowIndex}">⧉</button>
         <button type="button" title="Delete row" aria-label="Delete row ${rowIndex + 1}"
                 data-link-delete-row="${linkEscape(figureId)}" data-row-index="${rowIndex}">🗑</button>
-    </td>` + HESBAN_LINK_COLUMNS.map((column, columnIndex) =>
-        `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}">${linkEscape(values[column] || '')}</textarea></td>`).join('');
+    </td>` + HESBAN_LINK_COLUMNS.map((column, columnIndex) => {
+        const cell = `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}">${linkEscape(values[column] || '')}</textarea></td>`;
+        return columnIndex === 1 ? cell + '<td class="metadata-diameter-cell"><input class="form-control" disabled placeholder="Match a drawing number"><small>no matched drawing</small></td>' : cell;
+    }).join('');
 }
 
 function wireMetadataDynamicRow(row, figureId) {
@@ -1316,6 +1577,20 @@ function collectMetadataFigureEdits(figureId) {
             note: card.querySelector('[data-warning-note]')?.value || ''
         };
     });
+    const measurements = {};
+    const seenMeasurements = new Set();
+    figureEl.querySelectorAll('[data-link-diameter]').forEach(input => {
+        const maskFile = input.dataset.maskFile;
+        if (!maskFile || seenMeasurements.has(maskFile)) return;
+        seenMeasurements.add(maskFile);
+        if (input.dataset.measurementDirty === '1') {
+            const exact = input.dataset.measurementExact;
+            measurements[maskFile] = {
+                verified_cm: input.dataset.measurementEdited === '1' || exact === ''
+                    ? input.value : exact
+            };
+        }
+    });
     return {
         reviewer_revision: Number(figureEl.dataset.reviewerRevision || existing?.reviewer_revision || 0),
         figure_id: figureEl.querySelector('[data-link-figure-id]')?.value || figureId,
@@ -1323,8 +1598,270 @@ function collectMetadataFigureEdits(figureId) {
         drawing_numbers: drawingNumbers,
         table_rows: tableRows,
         table_pages: pageNames.map(name => existingPages.get(name) || {image_name: name}),
-        warning_overrides: warningOverrides
+        warning_overrides: warningOverrides,
+        measurements
     };
+}
+
+function synchronizeDiameterInputs(source, userEdited = true) {
+    const figureEl = source.closest('[data-link-figure]');
+    const maskFile = source.dataset.maskFile;
+    if (!figureEl || !maskFile) return;
+    const edited = userEdited || source.dataset.measurementEdited === '1';
+    figureEl.querySelectorAll('[data-link-diameter]').forEach(input => {
+        if (input.dataset.maskFile !== maskFile) return;
+        if (input !== source) input.value = source.value;
+        input.dataset.measurementDirty = '1';
+        input.dataset.measurementEdited = edited ? '1' : '0';
+        input.dataset.measurementStatus = 'verified_manual';
+    });
+    figureEl.querySelectorAll(`[data-mask-file="${CSS.escape(maskFile)}"] .metadata-measure-status`)
+        .forEach(status => { status.textContent = 'Manually corrected'; status.className = 'metadata-measure-status verified_manual'; });
+    scheduleMetadataAutosave(figureEl.dataset.linkFigure);
+}
+
+function verifyMetadataDiameter(button) {
+    const figureEl = button.closest('[data-link-figure]');
+    const input = figureEl?.querySelector(`[data-link-diameter][data-mask-file="${CSS.escape(button.dataset.maskFile)}"]`);
+    if (!input || !Number.isFinite(Number(input.value)) || Number(input.value) <= 0) {
+        window.PyPotteryUtils.showToast('Enter a positive diameter before verifying it', 'warning');
+        input?.focus();
+        return;
+    }
+    synchronizeDiameterInputs(input, false);
+    figureEl.querySelectorAll(`[data-mask-file="${CSS.escape(button.dataset.maskFile)}"] .metadata-measure-status`)
+        .forEach(status => { status.textContent = 'Manually corrected'; status.className = 'metadata-measure-status verified_manual'; });
+}
+
+function setupMetadataTableNavigation(figureEl) {
+    const section = figureEl.querySelector('.metadata-link-table-section');
+    const wrap = section?.querySelector('.metadata-link-table-wrap');
+    const table = wrap?.querySelector('.metadata-link-table');
+    if (!section || !wrap || !table) return;
+    section.querySelector('[data-link-table-expand]')?.addEventListener('click', event => {
+        section.classList.toggle('metadata-table-fullscreen');
+        event.currentTarget.textContent = section.classList.contains('metadata-table-fullscreen')
+            ? 'Exit full screen' : 'Full-screen table';
+    });
+    section.querySelectorAll('[data-column-jump]').forEach(button => button.addEventListener('click', () => {
+        const group = button.dataset.columnJump;
+        const firstColumn = {
+            fabric: 'fabric_exterior',
+            nonplastics: 'nonplastics_type',
+            voids: 'voids_type_size',
+            surface: 'surface_exterior',
+            finish: 'decor'
+        }[group];
+        const field = firstColumn
+            ? table.querySelector(`[data-link-column="${CSS.escape(firstColumn)}"]`)
+            : null;
+        const cell = field?.closest('td');
+        const target = group === 'identity' || !cell
+            ? 0
+            : Math.max(0, Math.round(cell.getBoundingClientRect().left -
+                table.getBoundingClientRect().left - 8));
+        wrap.scrollTo({left: target, behavior: 'auto'});
+        section.querySelectorAll('[data-column-jump]').forEach(item =>
+            item.classList.toggle('active', item === button));
+    }));
+}
+
+async function redetectMetadataMeasurements(figureId) {
+    try {
+        const figure = await saveMetadataFigure(figureId, true);
+        const response = await window.PyPotteryUtils.apiRequest(
+            `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}/measure`, {
+                method: 'POST', body: JSON.stringify({reviewer_revision: figure?.reviewer_revision || 0})
+            });
+        if (!response.success) throw new Error(response.error || 'Could not detect measurements');
+        window.PyPotteryUtils.showToast('Scale and diameter suggestions updated', 'success');
+        await loadMetadataLinkState();
+    } catch (error) {
+        window.PyPotteryUtils.showToast(error.message, 'error');
+    }
+}
+
+function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = null) {
+    const figure = tabularState.metadataLinkState?.figures.find(item =>
+        (item.figure_key || item.figure_id) === figureId);
+    if (!figure) return;
+    const drawing = maskFile ? (figure.drawings || []).find(item => item.mask_file === maskFile) : null;
+    const imageName = scalePage || drawing?.image_name;
+    if (!imageName) return;
+    const calibrationEntry = Object.entries(figure.scale_calibrations || {}).find(
+        ([name, calibration]) => name === imageName || calibration.evidence_image === imageName);
+    const calibrationName = calibrationEntry?.[0] || imageName;
+    const calibration = structuredClone(calibrationEntry?.[1] || {});
+    const measurement = structuredClone(drawing?.measurement || {});
+    const mode = drawing ? 'rim' : 'scale';
+    const dialog = document.createElement('dialog');
+    dialog.className = 'metadata-measure-dialog';
+    dialog.innerHTML = `<form method="dialog"><header><div><strong>${mode === 'rim' ? 'Correct rim diameter' : 'Correct 10 cm scale'}</strong>
+        <span>${linkEscape(imageName)}</span></div><button value="cancel" aria-label="Close">×</button></header>
+        <p>Drag either endpoint. If no endpoints exist, click twice on the image.</p>
+        <div class="metadata-measure-canvas-wrap"><canvas></canvas></div>
+        <footer><output data-measure-output></output><div class="metadata-measure-zoom-controls">
+            <button type="button" data-measure-zoom-out>Zoom out</button>
+            <button type="button" data-measure-fit>Fit evidence</button>
+            <button type="button" data-measure-zoom-in>Zoom in</button>
+        </div><button type="button" data-measure-save>Save and verify</button></footer></form>`;
+    document.body.appendChild(dialog);
+    const canvas = dialog.querySelector('canvas');
+    const context = canvas.getContext('2d');
+    const image = new Image();
+    const evidenceUrl = `/api/projects/${encodeURIComponent(tabularState.currentProject.project_id)}/metadata-link/evidence/${encodeURIComponent(imageName)}` +
+        `?figure=${encodeURIComponent(figureId)}&kind=drawing&overlay=0&measurement=0&v=${Date.now()}`;
+    let coordinateSize = (mode === 'rim' ? measurement.image_size : calibration.image_size) ||
+        calibration.image_size || measurement.image_size || [1, 1];
+    let points = structuredClone(mode === 'rim' ? measurement.rim_endpoints :
+        (calibration.p1 && calibration.p2 ? [calibration.p1, calibration.p2] : []));
+    let dragIndex = -1;
+    let fitView = null;
+    let view = null;
+    const output = dialog.querySelector('[data-measure-output]');
+    const validBounds = raw => {
+        if (!Array.isArray(raw) || raw.length !== 4 || raw.some(value => !Number.isFinite(Number(value)))) return null;
+        const values = raw.map(Number);
+        return values[2] > values[0] && values[3] > values[1] ? values : null;
+    };
+    const clampView = raw => {
+        const pageWidth = Number(coordinateSize[0]) || 1;
+        const pageHeight = Number(coordinateSize[1]) || 1;
+        const width = Math.min(pageWidth, Math.max(20, raw[2] - raw[0]));
+        const height = Math.min(pageHeight, Math.max(20, raw[3] - raw[1]));
+        const left = Math.max(0, Math.min(pageWidth - width, raw[0]));
+        const top = Math.max(0, Math.min(pageHeight - height, raw[1]));
+        return [left, top, left + width, top + height];
+    };
+    const evidenceView = () => {
+        let bounds = validBounds(mode === 'scale' ? calibration.evidence_bounds :
+            (measurement.crop || drawing?.bbox));
+        if (!bounds && points.length === 2) {
+            bounds = [Math.min(points[0][0], points[1][0]), Math.min(points[0][1], points[1][1]),
+                      Math.max(points[0][0], points[1][0]), Math.max(points[0][1], points[1][1])];
+        }
+        if (!bounds) return [0, 0, coordinateSize[0], coordinateSize[1]];
+        let [left, top, right, bottom] = bounds;
+        if (mode === 'rim') {
+            bottom = Math.min(bottom, top + Math.max(35, (bottom - top) * 0.38));
+        }
+        const width = Math.max(1, right - left);
+        const height = Math.max(1, bottom - top);
+        const padX = mode === 'scale' ? Math.max(30, width * 0.45) : Math.max(20, width * 0.08);
+        const padY = mode === 'scale' ? Math.max(30, height * 5, width * 0.12) : Math.max(20, height * 0.20);
+        return clampView([left - padX, top - padY, right + padX, bottom + padY]);
+    };
+    const resizeCanvas = () => {
+        if (!view) return;
+        const viewWidth = view[2] - view[0], viewHeight = view[3] - view[1];
+        const maxWidth = Math.min(1400, Math.max(180, window.innerWidth - 100));
+        const maxHeight = Math.max(240, window.innerHeight - 260);
+        const ratio = Math.min(3, maxWidth / viewWidth, maxHeight / viewHeight);
+        canvas.width = Math.max(1, Math.round(viewWidth * ratio));
+        canvas.height = Math.max(1, Math.round(viewHeight * ratio));
+    };
+    const updateOutput = () => {
+        if (points.length !== 2) { output.textContent = 'Choose two endpoints'; return; }
+        const pixels = Math.hypot(points[1][0] - points[0][0], points[1][1] - points[0][1]);
+        if (mode === 'scale') output.textContent = `${pixels.toFixed(1)} px = 10 cm`;
+        else {
+            const ratio = Number(calibration.px_per_cm || measurement.scale_px_per_cm || 0);
+            output.textContent = ratio > 0 ? `${(pixels / ratio).toFixed(1)} cm` : 'Verify the page scale first';
+        }
+    };
+    const redraw = () => {
+        if (!image.complete || !canvas.width || !view) return;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        const sourceScaleX = image.naturalWidth / coordinateSize[0];
+        const sourceScaleY = image.naturalHeight / coordinateSize[1];
+        context.drawImage(image,
+            view[0] * sourceScaleX, view[1] * sourceScaleY,
+            (view[2] - view[0]) * sourceScaleX, (view[3] - view[1]) * sourceScaleY,
+            0, 0, canvas.width, canvas.height);
+        if (points.length === 2) {
+            const sx = canvas.width / (view[2] - view[0]);
+            const sy = canvas.height / (view[3] - view[1]);
+            const screenPoint = point => [(point[0] - view[0]) * sx, (point[1] - view[1]) * sy];
+            const rendered = points.map(screenPoint);
+            context.strokeStyle = mode === 'scale'
+                ? 'rgba(22, 163, 74, .78)' : 'rgba(14, 165, 233, .78)';
+            context.lineWidth = 1.5;
+            context.beginPath(); context.moveTo(...rendered[0]);
+            context.lineTo(...rendered[1]); context.stroke();
+            rendered.forEach((point, index) => {
+                context.beginPath();
+                context.arc(point[0], point[1], dragIndex === index ? 6 : 4, 0, Math.PI * 2);
+                context.stroke();
+            });
+        }
+        updateOutput();
+    };
+    image.onload = () => {
+        if (coordinateSize[0] <= 1 || coordinateSize[1] <= 1) {
+            coordinateSize = [image.naturalWidth, image.naturalHeight];
+        }
+        fitView = evidenceView();
+        view = [...fitView];
+        resizeCanvas();
+        redraw();
+    };
+    image.src = evidenceUrl;
+    const eventPoint = event => {
+        const rect = canvas.getBoundingClientRect();
+        return [view[0] + (event.clientX - rect.left) * (view[2] - view[0]) / rect.width,
+                view[1] + (event.clientY - rect.top) * (view[3] - view[1]) / rect.height];
+    };
+    canvas.addEventListener('pointerdown', event => {
+        const point = eventPoint(event);
+        if (points.length < 2) { points.push(point); dragIndex = points.length - 1; }
+        else {
+            const distances = points.map(item => Math.hypot(item[0] - point[0], item[1] - point[1]));
+            dragIndex = distances[0] <= distances[1] ? 0 : 1;
+            points[dragIndex] = point;
+        }
+        canvas.setPointerCapture(event.pointerId); redraw();
+    });
+    canvas.addEventListener('pointermove', event => {
+        if (dragIndex < 0) return;
+        points[dragIndex] = eventPoint(event); redraw();
+    });
+    canvas.addEventListener('pointerup', () => { dragIndex = -1; redraw(); });
+    canvas.addEventListener('pointercancel', () => { dragIndex = -1; redraw(); });
+    const zoom = factor => {
+        if (!view) return;
+        const centreX = (view[0] + view[2]) / 2;
+        const centreY = (view[1] + view[3]) / 2;
+        const halfWidth = (view[2] - view[0]) * factor / 2;
+        const halfHeight = (view[3] - view[1]) * factor / 2;
+        view = clampView([centreX - halfWidth, centreY - halfHeight,
+                          centreX + halfWidth, centreY + halfHeight]);
+        resizeCanvas(); redraw();
+    };
+    dialog.querySelector('[data-measure-zoom-in]').addEventListener('click', () => zoom(0.72));
+    dialog.querySelector('[data-measure-zoom-out]').addEventListener('click', () => zoom(1.4));
+    dialog.querySelector('[data-measure-fit]').addEventListener('click', () => {
+        if (!fitView) return;
+        view = [...fitView]; resizeCanvas(); redraw();
+    });
+    dialog.querySelector('[data-measure-save]').addEventListener('click', async () => {
+        if (points.length !== 2) return;
+        const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+        const body = {reviewer_revision: Number(figureEl?.dataset.reviewerRevision || figure.reviewer_revision || 0)};
+        if (mode === 'scale') body.scale_calibrations = {[calibrationName]: {
+            p1: points[0], p2: points[1], real_cm: 10,
+            evidence_image: imageName !== calibrationName ? imageName : undefined
+        }};
+        else body.measurements = {[maskFile]: {rim_endpoints: points}};
+        try {
+            const response = await window.PyPotteryUtils.apiRequest(
+                `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}`,
+                {method: 'PATCH', body: JSON.stringify(body)});
+            if (!response.success) throw new Error(response.error || 'Could not save measurement');
+            dialog.close(); dialog.remove(); await loadMetadataLinkState();
+        } catch (error) { window.PyPotteryUtils.showToast(error.message, 'error'); }
+    });
+    dialog.addEventListener('close', () => dialog.remove());
+    dialog.showModal();
 }
 
 function setMetadataSaveStatus(figureId, text, failed = false) {
@@ -1406,6 +1943,17 @@ async function performMetadataFigureSave(figureId, quiet = false, retryConflict 
         return performMetadataFigureSave(figureId, quiet, true);
     }
     tabularState.metadataDirty.delete(figureId);
+    const savedMeasurements = new Map((response.figure.drawings || [])
+        .map(drawing => [drawing.mask_file, drawing.measurement || {}]));
+    figureEl?.querySelectorAll('[data-link-diameter]').forEach(input => {
+        const measurement = savedMeasurements.get(input.dataset.maskFile);
+        if (!measurement) return;
+        input.dataset.measurementDirty = '0';
+        input.dataset.measurementStatus = measurement.status || 'unresolved';
+        const value = metadataMeasurementValue(measurement);
+        input.dataset.measurementExact = value == null ? '' : String(value);
+        input.dataset.measurementEdited = '0';
+    });
     setMetadataSaveStatus(figureId, 'Saved');
     updateMetadataReadinessFromFigure(figureId, response.figure);
     refreshMetadataDrawingEvidence(figureId);
@@ -1475,6 +2023,23 @@ function mergeMetadataConflict(figureId, serverFigure) {
         const server = serverNumbers.get(input.dataset.maskFile) || '';
         if (input.value === before) input.value = server;
         else if (server !== before) overlappingChange = true;
+    });
+    const baselineMeasurements = new Map((baseline.drawings || [])
+        .map(drawing => [drawing.mask_file, drawing.measurement || {}]));
+    const serverMeasurements = new Map((serverFigure.drawings || [])
+        .map(drawing => [drawing.mask_file, drawing.measurement || {}]));
+    figureEl.querySelectorAll('[data-link-diameter]').forEach(input => {
+        const before = baselineMeasurements.get(input.dataset.maskFile) || {};
+        const server = serverMeasurements.get(input.dataset.maskFile) || {};
+        if (input.dataset.measurementDirty !== '1') {
+            const value = metadataMeasurementValue(server);
+            input.value = value == null ? '' : Number(value).toFixed(1);
+            input.dataset.measurementStatus = server.status || 'unresolved';
+            input.dataset.measurementExact = value == null ? '' : String(value);
+            input.dataset.measurementEdited = '0';
+        } else if (!sameMetadataValue(server, before)) {
+            overlappingChange = true;
+        }
     });
     const localRows = metadataComparableRows(metadataRowsFromFigureElement(figureEl));
     const baselineRows = metadataComparableRows(baseline.table_rows);

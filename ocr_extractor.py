@@ -98,6 +98,50 @@ def _prepare_image(image: Image.Image, min_height: int = 0) -> Image.Image:
     return gray.convert("RGB")
 
 
+def _prepare_compact_cell(image: Image.Image) -> Image.Image:
+    """Enlarge an isolated categorical glyph without teaching OCR its value.
+
+    Hesban columns such as Non-Plastics ``Typ`` often contain a single narrow
+    letter. Whole-row text detection can legitimately skip that tiny component
+    even when the column boundary is correct. Crop to the actual ink, surround
+    it with clean whitespace, then enlarge it so PaddleOCR still reads the
+    printed character rather than a hard-coded publication-specific default.
+    """
+    gray = ImageOps.autocontrast(image.convert("L"), cutoff=1)
+    pixels = np.asarray(gray)
+    ys, xs = np.where(pixels < 205)
+    if len(xs) and len(ys):
+        pad = max(3, round(min(gray.width, gray.height) * .04))
+        left, right = max(0, int(xs.min()) - pad), min(gray.width, int(xs.max()) + pad + 1)
+        top, bottom = max(0, int(ys.min()) - pad), min(gray.height, int(ys.max()) + pad + 1)
+        gray = gray.crop((left, top, right, bottom))
+    white_pad = max(12, round(max(gray.width, gray.height) * .25))
+    canvas = Image.new("L", (gray.width + white_pad * 2, gray.height + white_pad * 2), 255)
+    canvas.paste(gray, (white_pad, white_pad))
+    prepared = _prepare_image(canvas, min_height=128)
+    if prepared.width < 96:
+        padded = Image.new("RGB", (96, prepared.height), "white")
+        padded.paste(prepared, ((96 - prepared.width) // 2, 0))
+        prepared = padded
+    return prepared
+
+
+def _compact_code(value: str) -> str:
+    """Return a short printed category code, or blank for noisy OCR output."""
+    compact = re.sub(r"\s+", "", value or "")
+    return compact if re.fullmatch(r"[A-Za-z][A-Za-z0-9./-]{0,7}", compact) else ""
+
+
+def _remove_cross_column_code(value: str, code: str) -> str:
+    """Remove a verified next-column code from an OCR token crossing its edge."""
+    lines = (value or "").splitlines()
+    if not lines or not code:
+        return value or ""
+    lines[0] = re.sub(rf"{re.escape(code)}\s*$", "", lines[0],
+                      count=1, flags=re.IGNORECASE).rstrip()
+    return "\n".join(lines).strip()
+
+
 def _poly_bbox(poly: Any) -> tuple[float, float, float, float]:
     points = np.asarray(poly, dtype=float).reshape(-1, 2)
     return (float(points[:, 0].min()), float(points[:, 1].min()),
@@ -160,7 +204,7 @@ class PaddleOCREngine:
             from paddleocr import PaddleOCR
         except ImportError as exc:
             raise OCRUnavailableError(
-                "PaddleOCR is not installed. Install requirements-ocr.txt, then restart PyPotteryLens."
+                "PaddleOCR is not installed. Install requirements-ocr.txt, then restart SherdScope."
             ) from exc
         try:
             self._model = PaddleOCR(
@@ -773,7 +817,9 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
                         "the printed subheadings were not read reliably."),
         }])
         refinement_images = []
-        refinement_targets: list[tuple[dict[str, str], str]] = []
+        refinement_targets: list[tuple[dict[str, str], str, Optional[dict[str, Any]]]] = []
+        interior_overlap_rows: set[int] = set()
+        ocr_diagnostics: list[dict[str, Any]] = []
         for index, (number, token) in enumerate(anchors):
             row_top = max(0, round(token.bbox[1] - 4))
             if index+1 < len(anchors):
@@ -782,12 +828,16 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
                 row_bottom = data_image.height
             row = {column: "" for column in HESBAN_TABLE_COLUMNS}
             row["table_no"] = number
-            for column, (x1, x2) in zip(HESBAN_TABLE_COLUMNS[1:], bounds[1:]):
+            for column_index, (column, (x1, x2)) in enumerate(
+                    zip(HESBAN_TABLE_COLUMNS[1:], bounds[1:]), start=1):
                 cell_tokens = [item for item in page_tokens
                                if x1 <= item.center_x < x2
                                and row_top <= item.center_y < row_bottom]
                 value, confidence = _tokens_to_text(cell_tokens)
                 row[column] = value
+                if (column_index == 8 and
+                        any(item.bbox[2] > bounds[9][0] for item in cell_tokens)):
+                    interior_overlap_rows.add(id(row))
                 if value and confidence < .45:
                     warnings.append({
                         "code": "low_ocr_confidence",
@@ -796,18 +846,81 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             # Whole-page OCR often skips repeated Type words and joins narrow
             # adjacent columns (Pail/Reg and Man/Surface Ext). Re-read those
             # cells independently in one batch.
-            for column_index in (1, 4, 5, 15, 16):
+            for column_index in (1, 4, 5, 9, 15, 16):
                 column = HESBAN_TABLE_COLUMNS[column_index]
                 x1, x2 = bounds[column_index]
-                refinement_images.append(
-                    _prepare_image(data_image.crop((x1, row_top, x2, max(row_top+1, row_bottom))),
-                                   min_height=100))
-                refinement_targets.append((row, column))
+                diagnostic = None
+                if column_index == 9:
+                    # Typ is a short row-level code printed on the first text
+                    # line. The complete row can be hundreds of pixels tall
+                    # because Size/Shape cells wrap over many lines. Restrict
+                    # the retry around the row-number baseline so lower-line
+                    # fragments from neighboring columns cannot become h/1/7.
+                    inset = max(2, round((x2 - x1) * .08))
+                    band_top = max(row_top, round(token.center_y - token.height * .9))
+                    band_bottom = min(
+                        row_bottom,
+                        max(band_top + 8, round(token.center_y + token.height * 1.1)),
+                    )
+                    crop_x1, crop_x2 = x1 + inset, x2 - inset
+                    cell_image = data_image.crop(
+                        (crop_x1, band_top, crop_x2, band_bottom))
+                    overlapping = [
+                        item for item in page_tokens
+                        if item.bbox[2] > x1 and item.bbox[0] < x2
+                        and row_top <= item.center_y < row_bottom
+                    ]
+                    diagnostic = {
+                        "row": number,
+                        "field": column,
+                        "crop": [
+                            boundary.left + crop_x1 + crop_left,
+                            boundary.data_top + band_top + crop_top,
+                            boundary.left + crop_x2 + crop_left,
+                            boundary.data_top + band_bottom + crop_top,
+                        ],
+                        "page_overlap_tokens": [{
+                            "text": item.text, "confidence": round(item.score, 4),
+                            "bbox": [
+                                round(boundary.left + item.bbox[0] + crop_left),
+                                round(boundary.data_top + item.bbox[1] + crop_top),
+                                round(boundary.left + item.bbox[2] + crop_left),
+                                round(boundary.data_top + item.bbox[3] + crop_top),
+                            ],
+                        } for item in overlapping],
+                    }
+                    prepared = _prepare_compact_cell(cell_image)
+                else:
+                    cell_image = data_image.crop(
+                        (x1, row_top, x2, max(row_top + 1, row_bottom)))
+                    prepared = _prepare_image(cell_image, min_height=100)
+                refinement_images.append(prepared)
+                refinement_targets.append((row, column, diagnostic))
             rows.append(row)
-        for (row, column), tokens in zip(
+        for (row, column, diagnostic), tokens in zip(
                 refinement_targets, self.engine.recognize_many(refinement_images)):
-            value, _ = _tokens_to_text(tokens)
-            if value:
+            value, confidence = _tokens_to_text(tokens)
+            if column == "nonplastics_type":
+                accepted = _compact_code(value)
+                if accepted:
+                    row[column] = accepted
+                    if id(row) in interior_overlap_rows:
+                        row["fabric_interior"] = _remove_cross_column_code(
+                            row.get("fabric_interior", ""), accepted)
+                if diagnostic is not None:
+                    diagnostic.update({
+                        "retry_tokens": [{
+                            "text": item.text,
+                            "confidence": round(item.score, 4),
+                            "bbox": [round(value) for value in item.bbox],
+                        } for item in tokens],
+                        "raw_text": value,
+                        "confidence": round(confidence, 4),
+                        "accepted_value": accepted,
+                        "status": "accepted" if accepted else "needs_review",
+                    })
+                    ocr_diagnostics.append(diagnostic)
+            elif value:
                 row[column] = value
         # If the page-level OCR merged No. into Type and the isolated retry was
         # empty, keep the useful type text but remove the duplicated row ID.
@@ -848,4 +961,5 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             "rows": rows,
             "warnings": warnings,
             "boundary": boundary_data,
+            "ocr_diagnostics": ocr_diagnostics,
         }

@@ -15,6 +15,7 @@ os.environ["PYPOTTERYLENS_SKIP_INIT"] = "1"
 import app as app_module
 from metadata_linker import Hesban11Profile, load_linkage_state, save_linkage_state, validate_figure
 from project_manager import ProjectManager
+from research_export import EXPORT_COLUMNS
 
 
 def test_state_edit_and_apply_endpoints(tmp_path, monkeypatch):
@@ -189,11 +190,89 @@ def test_approved_linkage_columns_reach_project_zip_export(tmp_path, monkeypatch
     response = client.post(f"/api/projects/{project_id}/export", json={"acronym": "HSB"})
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
-        exported = archive.read("HSB_metadata.csv").decode("utf-8")
+        exported = archive.read("metadata.csv").decode("utf-8-sig")
+        assert "data_dictionary.csv" in archive.namelist()
+        assert "export_summary.txt" in archive.namelist()
+        assert "images/HSB_Fig2-1_No1.png" in archive.namelist()
     assert "Figure" in exported
-    assert "Non-Plastics - Siz" in exported
+    assert "Non-Plastics - Size" in exported
     assert "2.1" in exported
     assert '"7A\n6A"' in exported
+
+
+def test_clean_export_preview_selection_csv_and_zip(tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Clean Export")
+    from PIL import Image
+    for name in ("page_mask_layer_0.png", "page_mask_layer_1.png"):
+        Image.new("RGB", (24, 24), "white").save(project_path / "cards" / name)
+    pd.DataFrame([
+        {"mask_file": "page_mask_layer_0", "Figure": "2.1", "No.": "1",
+         "Type": "Cooking pot", "Fabric Color - Exterior": "5YR 7/3\nPink",
+         "Decor": "**", "Link Status": "approved", "bbox_x1": "99"},
+        {"mask_file": "page_mask_layer_1", "Figure": "2.1", "No.": "2",
+         "Type": "Bowl", "Link Status": "approved_with_overrides", "bbox_x1": "100"},
+    ]).to_csv(project_path / "cards" / "mask_info.csv", index=False)
+    save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
+        "figures": [
+            {"figure_id": "2.1", "review_status": "approved", "warnings": []},
+            {"figure_id": "2.2", "review_status": "pending", "warnings": [{
+                "message": "A table row is missing", "blocking": True}]},
+        ]})
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+
+    preview = client.get(f"/api/projects/{project_id}/export/preview?acronym=HES")
+    assert preview.status_code == 200
+    payload = preview.get_json()
+    assert payload["columns"] == EXPORT_COLUMNS
+    assert payload["summary"]["approved_vessels"] == 2
+    assert payload["summary"]["unresolved_figures"] == 1
+    assert len(payload["masks"]) == 2
+
+    settings = client.patch(f"/api/projects/{project_id}/export/settings",
+                            json={"excluded_masks": ["page_mask_layer_1"],
+                                  "known_masks": ["page_mask_layer_0", "page_mask_layer_1"]})
+    assert settings.status_code == 200
+    csv_response = client.post(f"/api/projects/{project_id}/export/csv",
+                               json={"acronym": "HES"})
+    assert csv_response.status_code == 200
+    assert csv_response.data.startswith(b"\xef\xbb\xbf")
+    exported = pd.read_csv(io.BytesIO(csv_response.data), dtype=str, keep_default_na=False)
+    assert list(exported.columns) == EXPORT_COLUMNS
+    assert not ({"Figure Caption", "Diameter Source", "Drawing Page", "Table Pages",
+                 "Source PDF", "Link Status"} & set(exported.columns))
+    assert len(exported) == 1
+    assert exported.loc[0, "Image Filename"] == "HES_Fig2-1_No1.png"
+    assert exported.loc[0, "Fabric Color - Exterior"] == "5YR 7/3\nPink"
+    assert "bbox_x1" not in exported.columns
+    assert "mask_file" not in exported.columns
+
+    dataset = client.post(f"/api/projects/{project_id}/export/dataset",
+                          json={"acronym": "HES"})
+    assert dataset.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(dataset.data)) as archive:
+        assert sorted(archive.namelist()) == [
+            "data_dictionary.csv", "export_summary.txt",
+            "images/HES_Fig2-1_No1.png", "metadata.csv"]
+        zipped_csv = archive.read("metadata.csv")
+    assert zipped_csv == csv_response.data
+
+
+def test_export_setting_edit_preserves_hidden_legacy_exclusions(tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Legacy Export")
+    (project_path / "export_settings.json").write_text(json.dumps({
+        "excluded_masks": ["approved_mask", "not_approved_yet"],
+        "legacy_exclusions_imported": True,
+    }), encoding="utf-8")
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+
+    response = client.patch(f"/api/projects/{project_id}/export/settings", json={
+        "excluded_masks": [], "known_masks": ["approved_mask"],
+    })
+
+    assert response.status_code == 200
+    assert response.get_json()["settings"]["excluded_masks"] == ["not_approved_yet"]
 
 
 def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeypatch):
@@ -237,6 +316,14 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
                     "closing_rule_y": 760, "header_confirmed": True,
                     "has_closing_rule": True, "continues": False,
                 },
+                "ocr_diagnostics": [{
+                    "row": "1", "field": "nonplastics_type",
+                    "crop": [400, 300, 460, 350],
+                    "retry_tokens": [{"text": "L", "confidence": .99,
+                                      "bbox": [10, 10, 30, 40]}],
+                    "page_overlap_tokens": [],
+                    "accepted_value": "L", "status": "accepted",
+                }],
                 "warnings": [],
             }
 
@@ -256,12 +343,18 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
     assert updated["status"] == "ready"
     assert updated["table_rows"][0]["table_type"] == "Pithos"
     assert updated["table_pages"][0]["boundary"]["closing_rule_y"] == 760
+    assert updated["table_pages"][0]["ocr_diagnostics"][0]["accepted_value"] == "L"
     assert observed_processing_states == ["processing"]
 
     evidence = client.get(
         f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg?figure=2.1&kind=table&overlay=1")
     assert evidence.status_code == 200
     assert evidence.mimetype == "image/png"
+    diagnostic = client.get(
+        f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg"
+        "?figure=2.1&kind=table&ocr_row=1&ocr_field=nonplastics_type")
+    assert diagnostic.status_code == 200
+    assert diagnostic.mimetype == "image/png"
 
 
 def test_tabular_boxes_use_staged_vessel_number_not_mask_suffix(tmp_path, monkeypatch):
@@ -370,12 +463,12 @@ def test_row_operations_and_safe_warning_override_are_audited_in_csv(
         "table_pages": [{"printed_page": "20", "source_pdf": "hesban.pdf"}],
         "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
         "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
-        "extraction_warnings": [{"code": "missing_table_end",
-                                 "message": "No closing line was found", "page": "20"}],
+        "extraction_warnings": [{"code": "column_header_fallback",
+                                 "message": "Fallback column alignment", "page": "20"}],
     }
     validate_figure(figure, Hesban11Profile())
     warning_id = next(warning["id"] for warning in figure["warnings"]
-                      if warning["code"] == "missing_table_end")
+                      if warning["code"] == "column_header_fallback")
     save_linkage_state(project_path, {
         "schema_version": 1, "profile": "hesban11", "status": "complete",
         "figures": [figure], "warnings": [],
@@ -387,7 +480,7 @@ def test_row_operations_and_safe_warning_override_are_audited_in_csv(
         json={
             "reviewer_revision": 0,
             "warning_overrides": {warning_id: {
-                "reason": "visually_confirmed_complete", "note": "Checked the scan",
+                "reason": "column_alignment_verified", "note": "Checked the scan",
             }},
             "row_operations": [{"action": "sort", "index": -1}],
         },
@@ -411,11 +504,11 @@ def test_override_timestamp_is_server_owned_and_stable_across_autosaves(
         "figure_id": "2.1", "processing_status": "reviewable",
         "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
         "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
-        "extraction_warnings": [{"code": "missing_table_end", "message": "No end"}],
+        "extraction_warnings": [{"code": "column_header_fallback", "message": "Fallback columns"}],
     }
     validate_figure(figure, Hesban11Profile())
     warning_id = next(w["id"] for w in figure["warnings"]
-                      if w["code"] == "missing_table_end")
+                   if w["code"] == "column_header_fallback")
     save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
                                       "figures": [figure]})
     monkeypatch.setattr(app_module, "project_manager", manager)
@@ -430,7 +523,7 @@ def test_override_timestamp_is_server_owned_and_stable_across_autosaves(
     first = client.patch(
         f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}",
         json={"reviewer_revision": 0, "warning_overrides": {warning_id: {
-            "reason": "visually_confirmed_complete", "at": "1900-01-01T00:00:00Z",
+            "reason": "column_alignment_verified", "at": "1900-01-01T00:00:00Z",
         }}},
     )
     assert first.status_code == 200
@@ -442,7 +535,7 @@ def test_override_timestamp_is_server_owned_and_stable_across_autosaves(
         json={"reviewer_revision": 1,
               "figure_caption": "An unrelated autosave",
               "warning_overrides": {warning_id: {
-                  "reason": "visually_confirmed_complete", "note": "Still checked",
+                  "reason": "column_alignment_verified", "note": "Still checked",
               }}},
     )
     assert second.status_code == 200
@@ -540,3 +633,84 @@ def test_completed_figure_can_be_approved_while_another_figure_is_processing(
         assert csv.loc[0, "Type"] == "Pithos"
     finally:
         app_module._metadata_link_jobs.pop(project_id, None)
+
+
+def test_measurement_review_exports_only_verified_diameter(tmp_path, monkeypatch):
+    from PIL import Image, ImageDraw
+
+    manager, project_id, project_path = _make_api_project(tmp_path, "Diameter API")
+    page_name = "page_0.png"
+    image = Image.new("L", (1200, 1600), 255)
+    draw = ImageDraw.Draw(image)
+    draw.line((200, 300, 800, 300), fill=0, width=3)
+    draw.line((500, 300, 500, 600), fill=0, width=3)
+    for index in range(5):
+        left, right = 120 + index * 50, 120 + (index + 1) * 50
+        draw.rectangle((left, 1450, right, 1464), outline=0, width=2)
+        if index % 2 == 0:
+            draw.rectangle((left + 2, 1452, right - 2, 1462), fill=0)
+    draw.line((120, 1445, 120, 1465), fill=0, width=2)
+    draw.line((370, 1445, 370, 1465), fill=0, width=2)
+    image.save(project_path / "images" / page_name)
+    pd.DataFrame([{"file": "page_0", "mask_file": "card_0"}]).to_csv(
+        project_path / "cards" / "mask_info.csv", index=False)
+    (project_path / "page_manifest.json").write_text(json.dumps({"pages": [{
+        "image_name": page_name, "source_pdf": "hesban.pdf", "pdf_page_index": 0,
+        "logical_index": 0, "render_dpi": 400,
+    }]}), encoding="utf-8")
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable",
+        "drawing_pages": [{"image_name": page_name, "source_pdf": "hesban.pdf"}],
+        "drawings": [{"mask_file": "card_0", "fingerprint": "bbox-a",
+                      "image_name": page_name, "bbox": [150, 260, 900, 700],
+                      "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Bowl"}],
+    }
+    validate_figure(figure, Hesban11Profile())
+    save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
+                                      "figures": [figure]})
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+
+    measured = client.post(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}/measure",
+        json={"reviewer_revision": 0})
+    assert measured.status_code == 200
+    payload = measured.get_json()["figure"]
+    assert payload["drawings"][0]["measurement"]["status"] == "verified_automatic"
+
+    # A structurally valid automatic measurement is accepted without an extra click.
+    applied = client.post(f"/api/projects/{project_id}/metadata-link/apply",
+                          json={"figure_ids": ["2.1"]})
+    assert applied.status_code == 200
+    csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
+                      dtype=str, keep_default_na=False)
+    assert float(csv.loc[0, "Rim Diameter (cm)"]) > 0
+    assert csv.loc[0, "Diameter Status"] == "verified_automatic"
+
+    state = client.get(f"/api/projects/{project_id}/metadata-link/state").get_json()["state"]
+    saved = state["figures"][0]
+    corrected = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{saved['figure_key']}",
+        json={"reviewer_revision": saved["reviewer_revision"],
+              "scale_calibrations": {page_name: {
+                  "p1": [120, 1450], "p2": [370, 1450], "real_cm": 10}},
+              "measurements": {"card_0": {
+                  "rim_endpoints": [[200, 300], [800, 300]]}}})
+    assert corrected.status_code == 200
+    corrected_figure = corrected.get_json()["figure"]
+    assert corrected_figure["scale_calibrations"][page_name]["status"] == "verified_manual"
+    assert corrected_figure["drawings"][0]["measurement"]["verified_cm"] == 24
+
+    reapplied = client.post(
+        f"/api/projects/{project_id}/metadata-link/apply",
+        json={"figure_ids": ["2.1"], "replace_imported": True})
+    assert reapplied.status_code == 200
+    csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
+                      dtype=str, keep_default_na=False)
+    assert csv.loc[0, "Rim Diameter (cm)"] == "24.0"
+    assert csv.loc[0, "Diameter Status"] == "verified_manual"
+    evidence = client.get(
+        f"/api/projects/{project_id}/metadata-link/evidence/{page_name}"
+        f"?figure={corrected_figure['figure_key']}&measurement=1")
+    assert evidence.status_code == 200

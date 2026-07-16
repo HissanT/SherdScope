@@ -4,8 +4,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PyPotteryLens - Archaeological Pottery Documentation Tool</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=20260710">
+    <title>SherdScope - Archaeological Pottery Documentation Tool</title>
+    <link rel="icon" href="/static/imgs/sherdscope-logo.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/css/style.css?v=20260716">
     <style>
         /* Splash Screen Styles */
         .splash-screen {
@@ -215,9 +216,9 @@
     <!-- Splash Screen -->
     <div id="splash-screen" class="splash-screen">
         <div class="splash-content">
-            <img src="/static/imgs/LogoLens.png" alt="PyPotteryLens Logo" class="splash-logo">
+            <img src="/static/imgs/sherdscope-logo.svg" alt="SherdScope logo" class="splash-logo">
             <div class="splash-spinner"></div>
-            <h1 class="splash-title">PyPotteryLens</h1>
+            <h1 class="splash-title">SherdScope</h1>
             <p class="splash-message" id="splash-message">Initializing application...</p>
 
             <div class="splash-progress">
@@ -232,15 +233,15 @@
         <!-- Header -->
         <header class="app-header">
             <div class="header-content">
-                <img src="/static/imgs/LogoLens.png" alt="pottery icon" class="header-logo">
+                <img src="/static/imgs/sherdscope-logo.svg" alt="SherdScope pottery profile logo" class="header-logo">
                 <div class="header-text">
-                    <h1>PyPotteryLens</h1>
-                    <span>Archaeological Pottery Documentation Tool
+                    <h1>SherdScope</h1>
+                    <span>Pottery Catalogue Digitisation and Linking
                         <span class="version">v0.4.0</span>
                     </span>
                 </div>
                 <!-- Pixel Assistant -->
-                <a href="https://lrncrd.github.io/PyPottery/pypotterylens/usage.html" target="_blank"
+                <a href="https://github.com/HissanT/SherdScope#readme" target="_blank" rel="noopener"
                     class="pixel-assistant-container" title="Need help?">
                     <div class="pixel-speech-bubble">Need help?</div>
                     <!-- SVG Icon -->
@@ -280,13 +281,13 @@
                 <div class="model-info-popup" id="model-info-popup">
                     <div class="model-info-popup-content">
                         <div class="model-info-popup-header">
-                            <h4>PyPotteryLens</h4>
+                            <h4>SherdScope</h4>
                             <button class="model-info-close" id="model-info-close">&times;</button>
                         </div>
                         <div class="model-info-popup-body">
                             <!-- Logo centrato -->
                             <div style="text-align: center; margin-bottom: 20px;">
-                                <img src="/static/imgs/LogoLens.png" alt="PyPotteryLens Logo"
+                                <img src="/static/imgs/sherdscope-logo.svg" alt="SherdScope logo"
                                     style="width: 100px; height: auto;">
                             </div>
 
@@ -295,7 +296,13 @@
                                 <strong>Version:</strong> v0.4.0
                             </div>
                             <div class="model-info-item">
-                                <strong>Author:</strong> Lorenzo Cardarelli
+                                <strong>Project:</strong> HissanT / SherdScope
+                            </div>
+                            <div class="model-info-item">
+                                <strong>Open-source foundation:</strong> Derived from PyPotteryLens by Lorenzo Cardarelli and contributors
+                            </div>
+                            <div class="model-info-item">
+                                <strong>License:</strong> GNU GPL v3.0
                             </div>
 
                             <!-- System Info -->
@@ -332,8 +339,8 @@
                 <button class="tab-button" data-tab="pdf">1. PDF document processing</button>
                 <button class="tab-button" data-tab="model">2. Apply Model</button>
                 <button class="tab-button" data-tab="annotation">3. Review Annotations and extract masks</button>
-                <button class="tab-button" data-tab="tabular">4. Tabular Information</button>
-                <button class="tab-button" data-tab="postprocess">5. Post Processing</button>
+                <button class="tab-button" data-tab="tabular">4. Review &amp; Link</button>
+                <button class="tab-button" data-tab="export">5. Export</button>
             </div>
 
             <!-- Tab Content -->
@@ -618,8 +625,8 @@
 
                 <!-- Tabular Tab -->
                 <div class="tab-content" id="tabular-tab">
-                    <h2>📊 Tabular Information</h2>
-                    <p class="subtitle">View and edit data associated with extracted cards from current project</p>
+                    <h2>Review &amp; Link</h2>
+                    <p class="subtitle">Compare each drawing with its publication table, correct anything necessary, and approve it.</p>
 
                     <div class="navigation-bar">
                         <div class="button-group">
@@ -768,21 +775,14 @@
                             <section id="metadata-link-panel" class="metadata-link-panel">
                                 <div class="metadata-link-heading">
                                     <div>
-                                        <h3>Link Figure Tables</h3>
-                                        <p>Extract Hesban table rows, validate figure + vessel-number joins, then approve them for CSV export.</p>
+                                        <h3>Figures</h3>
+                                        <p>Select a figure to compare its drawing page and linked table.</p>
                                     </div>
                                     <div class="metadata-link-actions">
-                                        <select id="metadata-link-backend" class="form-control" title="Text-reading backend">
-                                            <option value="ocr" selected>Local PaddleOCR (recommended)</option>
-                                            <option value="local">Local Gemma (optional fallback)</option>
-                                            <option value="openrouter">OpenRouter (optional fallback)</option>
-                                        </select>
                                         <select id="metadata-link-source" class="form-control" title="Source PDF" hidden></select>
-                                        <button class="btn btn-secondary" id="metadata-link-refresh-btn">Refresh</button>
-                                        <button class="btn btn-primary" id="metadata-link-run-btn">Run linking</button>
+                                        <button class="btn btn-primary" id="metadata-link-run-btn">Read and Link Tables</button>
                                     </div>
                                 </div>
-                                <p class="info-text">PaddleOCR uses compact PP-OCRv5 mobile models locally. The first run downloads about 21 MB of pretrained OCR files; PDF pages stay on this computer.</p>
                                 <div id="metadata-link-summary" class="metadata-link-summary">No linkage run yet.</div>
                                 <div id="metadata-link-progress" class="metadata-link-progress" hidden>
                                     <div id="metadata-link-progress-bar"></div>
@@ -842,6 +842,48 @@
                         <img id="postprocess-lightbox-img" alt="Card">
                     </div>
 
+                </div>
+
+                <!-- Research Export Tab -->
+                <div class="tab-content" id="export-tab">
+                    <div class="research-export-heading">
+                        <div>
+                            <h2>Export</h2>
+                            <p class="subtitle">Choose the approved vessel masks to include, then download a clean research dataset.</p>
+                        </div>
+                        <label class="export-acronym-field">Dataset acronym
+                            <input id="research-export-acronym" class="form-control" value="HES" maxlength="30"
+                                   pattern="[A-Za-z0-9_]+" aria-describedby="research-export-acronym-help">
+                            <small id="research-export-acronym-help">Letters, numbers, and underscores only.</small>
+                        </label>
+                    </div>
+                    <div id="research-export-summary" class="research-export-summary" aria-live="polite"></div>
+                    <section class="research-export-panel">
+                        <div class="research-export-toolbar">
+                            <label class="export-search">Search masks
+                                <input id="research-export-search" class="form-control" placeholder="Figure, number, or vessel type">
+                            </label>
+                            <button class="btn btn-secondary" id="research-export-select-all">Include all</button>
+                            <button class="btn btn-secondary" id="research-export-clear-all">Clear selection</button>
+                            <span id="research-export-save-status">Saved</span>
+                        </div>
+                        <div id="research-export-masks" class="research-export-masks"></div>
+                    </section>
+                    <section class="research-export-panel">
+                        <h3>Dataset preview</h3>
+                        <div id="research-export-unresolved" class="research-export-unresolved"></div>
+                        <div class="research-export-table-wrap">
+                            <table class="research-export-table">
+                                <thead id="research-export-table-head"></thead>
+                                <tbody id="research-export-table-body"></tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <div class="research-export-actions">
+                        <button class="btn btn-secondary" id="research-export-csv">Download CSV</button>
+                        <button class="btn btn-primary" id="research-export-dataset">Download Dataset ZIP</button>
+                    </div>
+                    <div id="research-export-status" class="status-message"></div>
                 </div>
 
             </div>
@@ -912,9 +954,9 @@
     <script src="/static/js/pdf-tab.js?v=20251024163500"></script>
     <script src="/static/js/model-tab.js?v=20251024163500"></script>
     <script src="/static/js/annotation-tab.js?v=20251024163500"></script>
-    <script src="/static/js/tabular-tab.js?v=20260710"></script>
-    <script src="/static/js/postprocess-tab.js?v=20251024163500"></script>
-    <script src="/static/js/main.js?v=20251024163500"></script>
+    <script src="/static/js/tabular-tab.js?v=20260716"></script>
+    <script src="/static/js/export-tab.js?v=20260716"></script>
+    <script src="/static/js/main.js?v=20260716"></script>
 </body>
 
 </html>

@@ -2,7 +2,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from ocr_extractor import OCRToken, PaddleOCRStructuredExtractor, _parse_v3_result
+from ocr_extractor import (
+    OCRToken,
+    PaddleOCRStructuredExtractor,
+    _parse_v3_result,
+    _remove_cross_column_code,
+)
 
 
 class DrawingEngine:
@@ -42,6 +47,19 @@ class ExtraRowEngine(TableEngine):
         return result
 
 
+class CompactCategoryEngine(TableEngine):
+    def recognize_many(self, images):
+        images = list(images)
+        # Six independent refinements are requested for each row. The fourth
+        # is the narrow Non-Plastics Type cell, which the page-level pass left
+        # blank. Simulate PaddleOCR recovering its printed single letter only
+        # after the compact-cell enlargement.
+        if len(images) == 12:
+            return [([OCRToken("L", .97, (20, 20, 45, 75))]
+                     if index % 6 == 3 else []) for index in range(len(images))]
+        return super().recognize_many(images)
+
+
 def make_table_image(path, closing=True):
     image = Image.new("RGB", (1000, 900), "white")
     draw = ImageDraw.Draw(image)
@@ -76,6 +94,25 @@ def test_hesban_fixed_layout_builds_rows_from_ocr_coordinates(tmp_path):
     assert result["is_table"] is True
     assert [row["table_no"] for row in result["rows"]] == ["1", "2"]
     assert all(len(row) == 22 for row in result["rows"])
+
+
+def test_isolated_nonplastics_type_is_retried_as_compact_cell(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(CompactCategoryEngine()).extract_table(
+        image_path, None, "2.1", ["1", "2"],
+        {"figure_id": "2.1", "figure_caption": "Figure 2.1", "printed_page": "20"},
+    )
+    assert [row["nonplastics_type"] for row in result["rows"]] == ["L", "L"]
+    assert [item["accepted_value"] for item in result["ocr_diagnostics"]] == ["L", "L"]
+    assert all(item["crop"][3] > item["crop"][1] for item in result["ocr_diagnostics"])
+
+
+def test_verified_compact_code_is_removed_from_crossing_interior_token():
+    assert _remove_cross_column_code("2.5YR6/6 L\nLight red", "L") == (
+        "2.5YR6/6\nLight red")
+    assert _remove_cross_column_code("7.5YRN7/L\nLight gray", "L") == (
+        "7.5YRN7/\nLight gray")
 
 
 def test_hesban_column_template_has_one_band_per_csv_field():

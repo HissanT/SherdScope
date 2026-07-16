@@ -4,6 +4,7 @@ import json
 import pandas as pd
 import pytest
 from PIL import Image
+import metadata_linker as linker_module
 
 from metadata_linker import (
     AmbiguousSourceError,
@@ -144,18 +145,18 @@ def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
         "figure_id": "2.1", "processing_status": "reviewable",
         "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
         "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
-        "extraction_warnings": [{"code": "missing_table_end", "message": "No closing rule"}],
+        "extraction_warnings": [{"code": "column_header_fallback", "message": "Fallback columns"}],
         "warning_overrides": {},
     }
     validate_figure(figure, profile)
-    warning = next(item for item in figure["warnings"] if item["code"] == "missing_table_end")
+    warning = next(item for item in figure["warnings"] if item["code"] == "column_header_fallback")
     assert warning["overrideable"] is True
     assert figure["status"] == "needs_review"
     figure["warning_overrides"][warning["id"]] = {"reason": "tampered_reason"}
     validate_figure(figure, profile)
     assert figure["status"] == "needs_review"
     figure["warning_overrides"][warning["id"]] = {
-        "reason": "visually_confirmed_complete", "note": "Checked page"
+        "reason": "column_alignment_verified", "note": "Checked page"
     }
     validate_figure(figure, profile)
     assert figure["status"] == "ready"
@@ -165,6 +166,19 @@ def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
                      if item["code"] == "duplicate_drawing_number")
     assert duplicate["overrideable"] is False
     assert figure["status"] == "needs_review"
+
+
+def test_missing_table_end_is_kept_as_evidence_but_not_shown_or_blocking():
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable",
+        "drawings": [{"mask_file": "a", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        "extraction_warnings": [{"code": "missing_table_end", "message": "No closing rule"}],
+    }
+    validate_figure(figure, Hesban11Profile())
+    assert figure["status"] == "ready"
+    assert all(warning["code"] != "missing_table_end" for warning in figure["warnings"])
+    assert figure["extraction_warnings"][0]["code"] == "missing_table_end"
 
 
 def test_cross_pdf_assignment_in_loaded_sidecar_is_always_blocking():
@@ -316,6 +330,47 @@ def test_p_plus_one_and_p_plus_two_tables_are_joined(tmp_path):
     assert figure["matches"][1]["values"]["nonplastics_size"] == "7A\n6A"
 
 
+def test_only_the_current_figure_is_marked_processing(tmp_path, monkeypatch):
+    project = make_project(tmp_path)
+    manifest_path = project / "page_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["pages"][1].update(
+        page_text="Figure 2.2", figure_id="2.2", figure_caption="Figure 2.2")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    annotations = pd.read_csv(project / "cards" / "mask_info_annots.csv")
+    annotations.loc[len(annotations)] = {
+        "bbox": "(100, 400, 300, 600)",
+        "mask_file": "Hesban_page_1_mask_layer_0.png",
+    }
+    annotations.to_csv(project / "cards" / "mask_info_annots.csv", index=False)
+    info = pd.read_csv(project / "cards" / "mask_info.csv")
+    info.loc[len(info)] = {
+        "file": "Hesban_page_1",
+        "mask_file": "Hesban_page_1_mask_layer_0",
+        "Notes": "manual C",
+    }
+    info.to_csv(project / "cards" / "mask_info.csv", index=False)
+
+    snapshots = []
+    real_save = linker_module.save_linkage_state
+
+    def capture_save(project_path, state, **kwargs):
+        result = real_save(project_path, state, **kwargs)
+        persisted = json.loads(
+            (project / "cards" / "metadata_linkage.json").read_text(encoding="utf-8"))
+        snapshots.append([
+            figure.get("processing_status") for figure in persisted.get("figures", [])
+        ])
+        return result
+
+    monkeypatch.setattr(linker_module, "save_linkage_state", capture_save)
+    MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+
+    assert any(statuses and all(status == "queued" for status in statuses)
+               for statuses in snapshots)
+    assert all(statuses.count("processing") <= 1 for statuses in snapshots)
+
+
 def test_same_page_table_search_crops_below_lowest_drawing(tmp_path):
     project = make_project(tmp_path)
     extractor = SamePageExtractor()
@@ -368,6 +423,10 @@ def test_processing_figure_cannot_be_applied_by_core_approval(tmp_path):
     state["figures"][0]["processing_status"] = "processing"
     save_linkage_state(project, state)
     with pytest.raises(MetadataLinkError, match="still being extracted"):
+        apply_approved_figures(project, ["2.1"])
+    state["figures"][0]["processing_status"] = "queued"
+    save_linkage_state(project, state)
+    with pytest.raises(MetadataLinkError, match="waiting to start"):
         apply_approved_figures(project, ["2.1"])
 
 

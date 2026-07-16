@@ -1249,6 +1249,11 @@ def _assign_px_per_cm(scales: list, centroid: tuple):
     import math
 
     def px_ratio(s):
+        # New linker calibrations retain rejected candidates as visual
+        # evidence. They must never become a usable card scale merely because
+        # they still contain endpoints.
+        if s.get('status') == 'unresolved':
+            return None
         dx = s['p2'][0] - s['p1'][0]
         dy = s['p2'][1] - s['p1'][1]
         dist_px = math.hypot(dx, dy)
@@ -1257,6 +1262,8 @@ def _assign_px_per_cm(scales: list, centroid: tuple):
 
     cx, cy = centroid
     for s in scales:
+        if s.get('status') == 'unresolved':
+            continue
         z = s.get('zone')
         if z:
             x1, y1, x2, y2 = z
@@ -1265,7 +1272,7 @@ def _assign_px_per_cm(scales: list, centroid: tuple):
                 if r is not None:
                     return r
     for s in scales:
-        if not s.get('zone'):
+        if not s.get('zone') and s.get('status') != 'unresolved':
             return px_ratio(s)
     return None
 

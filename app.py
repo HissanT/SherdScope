@@ -25,6 +25,7 @@ import time
 import shutil
 import tempfile
 import secrets
+from urllib.parse import quote
 
 from utils import (
     PDFProcessor,
@@ -74,6 +75,18 @@ from metadata_linker import (
     validate_figure,
 )
 from ocr_extractor import PaddleOCRStructuredExtractor
+from hesban_measurements import (
+    manual_calibration,
+    measure_figure,
+    persist_figure_measurements,
+    verified_measurement,
+)
+from research_export import (
+    build_export,
+    csv_bytes as research_csv_bytes,
+    dataset_zip_bytes,
+    save_export_settings,
+)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SHERDSCOPE_SECRET_KEY') or secrets.token_hex(32)
@@ -3024,6 +3037,18 @@ def get_project_metadata_link_evidence(project_id, filename):
             pad = max(20, round(image.width * .01))
             image = image.crop((max(0, x1-pad), max(0, y1-pad),
                                 min(image.width, x2+pad), min(image.height, y2+pad)))
+        elif request.args.get('ocr_row') and request.args.get('ocr_field'):
+            diagnostic = next((
+                item for item in (page or {}).get('ocr_diagnostics', [])
+                if str(item.get('row', '')) == str(request.args.get('ocr_row', ''))
+                and str(item.get('field', '')) == str(request.args.get('ocr_field', ''))
+            ), None)
+            if not diagnostic or len(diagnostic.get('crop', [])) != 4:
+                return jsonify({'error': 'OCR diagnostic crop not found',
+                                'success': False}), 404
+            from ocr_extractor import _prepare_compact_cell
+            image = _prepare_compact_cell(image.crop(tuple(
+                int(value) for value in diagnostic['crop'])))
         elif page and page.get('crop'):
             image = image.crop(tuple(int(value) for value in page['crop']))
     else:
@@ -3038,6 +3063,22 @@ def get_project_metadata_link_evidence(project_id, filename):
             except OSError:
                 font = ImageFont.load_default()
         line_width = max(4, min(image.size) // 500)
+        measurement_line_width = max(2, line_width // 2)
+        measurement_handle_radius = max(4, line_width)
+        if request.args.get('measurement') == '1':
+            calibration = figure.get('scale_calibrations', {}).get(Path(filename).name, {})
+            if (calibration.get('p1') and calibration.get('p2') and
+                    Path(str(calibration.get('evidence_image') or filename)).name == Path(filename).name):
+                scale_color = ((22, 163, 74) if calibration.get('status') in
+                               {'verified', 'verified_automatic', 'verified_manual'}
+                               else (234, 179, 8))
+                draw.line((*calibration['p1'], *calibration['p2']), fill=scale_color,
+                          width=measurement_line_width)
+                for point in (calibration['p1'], calibration['p2']):
+                    radius = measurement_handle_radius
+                    draw.ellipse((point[0] - radius, point[1] - radius,
+                                  point[0] + radius, point[1] + radius),
+                                 outline=scale_color, width=measurement_line_width)
         for drawing in figure.get('drawings', []):
             if drawing.get('image_name') != Path(filename).name:
                 continue
@@ -3057,6 +3098,25 @@ def get_project_metadata_link_evidence(project_id, filename):
             draw.rectangle((x1, tag_top, tag_right, y1), fill=box_color)
             draw.text((x1 + pad, tag_top + pad // 2), label_text, fill='white',
                       font=font, stroke_width=1, stroke_fill=(120, 35, 0))
+            if request.args.get('measurement') == '1':
+                measurement = drawing.get('measurement', {})
+                endpoints = measurement.get('rim_endpoints')
+                measurement_color = ((34, 197, 94) if measurement.get('status') in
+                                     {'verified', 'verified_automatic', 'verified_manual'}
+                                     else (14, 165, 233))
+                if endpoints and len(endpoints) == 2:
+                    draw.line((*endpoints[0], *endpoints[1]), fill=measurement_color,
+                              width=measurement_line_width)
+                    for point in endpoints:
+                        radius = measurement_handle_radius
+                        draw.ellipse((point[0] - radius, point[1] - radius,
+                                      point[0] + radius, point[1] + radius),
+                                     outline=measurement_color,
+                                     width=measurement_line_width)
+                centreline = measurement.get('centreline')
+                if centreline:
+                    draw.line(tuple(centreline), fill=(168, 85, 247),
+                              width=measurement_line_width)
     image.thumbnail((1800, 1800), PILImage.Resampling.LANCZOS)
     buffer = BytesIO()
     image.save(buffer, format='PNG')
@@ -3118,6 +3178,97 @@ def update_project_metadata_link_figure(project_id, figure_id):
                 value = data['drawing_numbers'][drawing['mask_file']]
                 drawing['vessel_number'] = '' if value is None else str(value)
         changed_fields.append('drawing_numbers')
+    scale_changed = False
+    if isinstance(data.get('scale_calibrations'), dict) and data['scale_calibrations']:
+        allowed_pages = {str(page.get('image_name', ''))
+                         for page in figure.get('drawing_pages', [])}
+        calibrations = dict(figure.get('scale_calibrations', {}))
+        for image_name, submitted in data['scale_calibrations'].items():
+            image_name = Path(str(image_name)).name
+            if image_name not in allowed_pages or not isinstance(submitted, dict):
+                return jsonify({'error': f'Invalid drawing-page calibration: {image_name}',
+                                'success': False}), 400
+            evidence_name = Path(str(submitted.get('evidence_image') or image_name)).name
+            if evidence_name != image_name:
+                manifest_pages = {page.get('image_name'): page for page in
+                                  ensure_page_manifest(project_path).get('pages', [])}
+                source_page = manifest_pages.get(image_name, {})
+                evidence_page = manifest_pages.get(evidence_name, {})
+                if (not evidence_page or evidence_page.get('source_pdf') != source_page.get('source_pdf') or
+                        evidence_page.get('pdf_page_index') != source_page.get('pdf_page_index')):
+                    return jsonify({'error': 'Scale evidence must come from the same PDF page',
+                                    'success': False}), 400
+            try:
+                previous_calibration = calibrations.get(image_name, {})
+                calibration = manual_calibration(
+                    project_path / 'images' / evidence_name,
+                    submitted.get('p1', []), submitted.get('p2', []),
+                    float(submitted.get('real_cm', 10.0)))
+            except (OSError, TypeError, ValueError) as exc:
+                return jsonify({'error': str(exc), 'success': False}), 400
+            if evidence_name != image_name:
+                calibration['evidence_image'] = evidence_name
+                calibration['applies_to_image'] = image_name
+            calibration['reviewer_history'] = list(
+                previous_calibration.get('reviewer_history', []))
+            calibration['reviewer_history'].append({
+                'action': 'scale_verified', 'at': calibration['verified_at'],
+                'real_cm': calibration['real_cm'],
+            })
+            calibrations[image_name] = calibration
+            for drawing in figure.get('drawings', []):
+                if drawing.get('image_name') == image_name:
+                    drawing['measurement'] = {
+                        'status': 'unresolved', 'warning': 'scale_calibration_changed',
+                        'drawing_fingerprint': drawing.get('fingerprint', ''),
+                    }
+            scale_changed = True
+        figure['scale_calibrations'] = calibrations
+        changed_fields.append('scale_calibrations')
+    if scale_changed:
+        measure_figure(project_path, figure, persist=False)
+    if isinstance(data.get('measurements'), dict) and data['measurements']:
+        drawings_by_mask = {str(drawing.get('mask_file')): drawing
+                            for drawing in figure.get('drawings', [])}
+        for mask_file, submitted in data['measurements'].items():
+            drawing = drawings_by_mask.get(str(mask_file))
+            if not drawing or not isinstance(submitted, dict):
+                return jsonify({'error': f'Invalid drawing measurement: {mask_file}',
+                                'success': False}), 400
+            try:
+                endpoints = submitted.get('rim_endpoints')
+                if endpoints is not None:
+                    from PIL import Image as PILImage
+                    endpoints = [[float(value) for value in point] for point in endpoints]
+                    if (len(endpoints) != 2 or any(len(point) != 2 for point in endpoints) or
+                            any(not __import__('math').isfinite(value)
+                                for point in endpoints for value in point)):
+                        raise ValueError('Rim endpoints must contain two x/y points')
+                    x1, y1, x2, y2 = [float(value) for value in drawing.get('bbox', [])]
+                    with PILImage.open(project_path / 'images' /
+                                       Path(str(drawing.get('image_name', ''))).name) as page_image:
+                        page_width, page_height = page_image.size
+                    margin_x, margin_y = max(10, (x2 - x1) * .08), max(10, (y2 - y1) * .08)
+                    if any(point[0] < 0 or point[0] > page_width or
+                           point[1] < 0 or point[1] > page_height or
+                           point[0] < x1 - margin_x or point[0] > x2 + margin_x or
+                           point[1] < y1 - margin_y or point[1] > y2 + margin_y
+                           for point in endpoints):
+                        raise ValueError('Rim endpoints must remain inside the drawing crop')
+                calibration = figure.get('scale_calibrations', {}).get(
+                    str(drawing.get('image_name', '')), {})
+                value = submitted.get('verified_cm')
+                value = None if value in (None, '') else float(value)
+                drawing['measurement'] = verified_measurement(
+                    drawing.get('measurement', {}), value_cm=value,
+                    rim_endpoints=endpoints,
+                    px_per_cm=float(calibration.get('px_per_cm', 0) or 0) or None)
+                drawing['measurement']['drawing_fingerprint'] = drawing.get('fingerprint', '')
+                drawing['measurement']['scale_page_fingerprint'] = calibration.get(
+                    'page_fingerprint', '')
+            except (TypeError, ValueError) as exc:
+                return jsonify({'error': str(exc), 'success': False}), 400
+        changed_fields.append('measurements')
     if 'table_rows' in data:
         if not isinstance(data['table_rows'], list) or not all(
                 isinstance(row, dict) for row in data['table_rows']):
@@ -3244,9 +3395,81 @@ def update_project_metadata_link_figure(project_id, figure_id):
         return jsonify({'error': str(conflict), 'success': False, 'conflict': True,
                         'figure': latest,
                         'reviewer_revision': int(latest.get('reviewer_revision', 0) or 0)}), 409
+    if scale_changed or 'measurements' in changed_fields:
+        persist_figure_measurements(project_path, figure)
     totals = linkage_totals(state)
     project_manager.update_workflow_status(project_id, totals)
     return jsonify({'success': True, 'figure': figure, 'totals': totals,
+                    'reviewer_revision': figure.get('reviewer_revision', 0)})
+
+
+@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/measure', methods=['POST'])
+def measure_project_metadata_link_figure(project_id, figure_id):
+    """Redetect the page ruler and rim-diameter suggestions for one figure."""
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    state = load_linkage_state(project_path)
+    target_id = normalize_figure_id(figure_id)
+    figure = next((candidate for candidate in state.get('figures', [])
+                   if str(candidate.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(candidate.get('figure_id')) == target_id), None)
+    if not figure:
+        return jsonify({'error': 'Figure not found', 'success': False}), 404
+    if figure.get('processing_status') in {'processing', 'queued'}:
+        return jsonify({'error': 'This figure is still being extracted or waiting to start',
+                        'success': False}), 409
+    data = request.get_json(silent=True) or {}
+    current_revision = int(figure.get('reviewer_revision', 0) or 0)
+    try:
+        submitted_revision = int(data.get('reviewer_revision', current_revision))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'reviewer_revision must be a whole number',
+                        'success': False}), 400
+    if submitted_revision != current_revision:
+        return jsonify({'error': 'This figure has a newer saved draft',
+                        'success': False, 'conflict': True, 'figure': figure,
+                        'reviewer_revision': current_revision}), 409
+    figure_sources = {page.get('source_pdf') for page in figure.get('drawing_pages', [])}
+    figure_dpis = {page.get('render_dpi') for page in figure.get('drawing_pages', [])
+                   if page.get('render_dpi') is not None}
+    ratios = [calibration.get('px_per_cm')
+              for other in state.get('figures', []) if other is not figure
+              if ({page.get('source_pdf') for page in other.get('drawing_pages', [])} &
+                  figure_sources)
+              if ((not figure_dpis and not {page.get('render_dpi') for page in
+                                             other.get('drawing_pages', [])
+                                             if page.get('render_dpi') is not None}) or
+                  {page.get('render_dpi') for page in other.get('drawing_pages', [])
+                   if page.get('render_dpi') is not None} & figure_dpis)
+              for calibration in other.get('scale_calibrations', {}).values()
+              if (calibration.get('status') in {'suggested', 'verified', 'verified_automatic', 'verified_manual'} and
+                  calibration.get('px_per_cm'))]
+    try:
+        # Preserve verified manual measurements; refresh automatic suggestions.
+        for page_name, calibration in list(figure.get('scale_calibrations', {}).items()):
+            if not (calibration.get('method') == 'manual' and
+                    calibration.get('status') in {'verified', 'verified_manual'}):
+                figure['scale_calibrations'].pop(page_name, None)
+        measure_figure(project_path, figure,
+                       project_ratios=ratios, persist=False)
+        figure['reviewer_revision'] = current_revision + 1
+        figure['draft_saved_at'] = __import__('datetime').datetime.now(
+            __import__('datetime').timezone.utc).isoformat()
+        figure.setdefault('review_history', []).append({
+            'action': 'measurements_redetected', 'at': figure['draft_saved_at'],
+        })
+        validate_figure(figure, get_profile(state.get('profile', 'hesban11')))
+        save_linkage_state(project_path, state, expected_revisions={
+            str(figure.get('figure_key', '')): current_revision,
+        })
+        persist_figure_measurements(project_path, figure)
+    except ReviewerRevisionConflict as conflict:
+        return jsonify({'error': str(conflict), 'success': False, 'conflict': True,
+                        'figure': conflict.figure}), 409
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
+    return jsonify({'success': True, 'figure': figure,
                     'reviewer_revision': figure.get('reviewer_revision', 0)})
 
 
@@ -3314,7 +3537,11 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
             boundary = table.get('boundary', {}) if isinstance(table.get('boundary'), dict) else {}
             updated = {**assigned, 'logical_index': page.get('logical_index'),
                        'printed_page': table.get('printed_page') or page.get('printed_page', ''),
-                       'source_pdf': page.get('source_pdf', ''), 'boundary': boundary}
+                       'source_pdf': page.get('source_pdf', ''), 'boundary': boundary,
+                       'ocr_diagnostics': [
+                           item for item in table.get('ocr_diagnostics', [])
+                           if isinstance(item, dict)
+                       ]}
             updated_pages.append(updated)
             if not table.get('is_table'):
                 warnings.extend(warning for warning in table.get('warnings', [])
@@ -4039,8 +4266,108 @@ def merge_project_annotations(project_id):
         return jsonify({'error': str(e), 'success': False}), 500
 
 
+def _research_export_payload(project_id, acronym):
+    project_metadata = project_manager.get_project(project_id)
+    if not project_metadata:
+        raise FileNotFoundError('Project not found')
+    if not acronym or not re.fullmatch(r'[A-Za-z0-9_]+', str(acronym)):
+        raise ValueError('Dataset acronym can only contain letters, numbers, and underscores')
+    project_path = project_manager.get_project_path(project_id)
+    return project_metadata, build_export(project_path, str(acronym))
+
+
+@app.route('/api/projects/<project_id>/export/preview', methods=['GET'])
+def preview_project_research_export(project_id):
+    """Preview approved rows and the masks available for final export."""
+    try:
+        acronym = request.args.get('acronym', 'DATA')
+        _, result = _research_export_payload(project_id, acronym)
+        candidates = []
+        for candidate in result['candidates']:
+            item = dict(candidate)
+            item['thumbnail_url'] = (
+                f"/api/projects/{project_id}/card/" +
+                quote(candidate['mask_file']))
+            candidates.append(item)
+        return jsonify({
+            'success': True,
+            'summary': result['summary'],
+            'masks': candidates,
+            'rows': result['frame'].to_dict(orient='records'),
+            'columns': list(result['frame'].columns),
+            'unresolved': result['unresolved'],
+        })
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/export/settings', methods=['PATCH'])
+def update_project_research_export_settings(project_id):
+    """Persist the masks a researcher has chosen to exclude."""
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    data = request.get_json(silent=True) or {}
+    excluded = data.get('excluded_masks')
+    if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
+        return jsonify({'error': 'excluded_masks must be a list of mask filenames',
+                        'success': False}), 400
+    known = data.get('known_masks')
+    if known is not None and (not isinstance(known, list) or
+                              not all(isinstance(item, str) for item in known)):
+        return jsonify({'error': 'known_masks must be a list of mask filenames',
+                        'success': False}), 400
+    settings = save_export_settings(project_path, excluded, known_masks=known)
+    return jsonify({'success': True, 'settings': settings})
+
+
+@app.route('/api/projects/<project_id>/export/csv', methods=['POST'])
+def download_project_research_csv(project_id):
+    try:
+        data = request.get_json(silent=True) or {}
+        acronym = str(data.get('acronym', '')).strip()
+        _, result = _research_export_payload(project_id, acronym)
+        payload = BytesIO(research_csv_bytes(result['frame']))
+        payload.seek(0)
+        return send_file(payload, as_attachment=True,
+                         download_name=f'{acronym}_metadata.csv',
+                         mimetype='text/csv; charset=utf-8')
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/export/dataset', methods=['POST'])
 @app.route('/api/projects/<project_id>/export', methods=['POST'])
 def export_project_results(project_id):
+    """Download the clean research CSV, masks, dictionary, and summary."""
+    try:
+        data = request.get_json(silent=True) or {}
+        acronym = str(data.get('acronym', '')).strip()
+        project_metadata, result = _research_export_payload(project_id, acronym)
+        payload = BytesIO(dataset_zip_bytes(
+            result, project_metadata.get('project_name', project_id)))
+        payload.seek(0)
+        return send_file(payload, as_attachment=True,
+                         download_name=f'{acronym}.zip',
+                         mimetype='application/zip')
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/export/legacy', methods=['POST'])
+def legacy_export_project_results(project_id):
     """Export final results for a project (with auto-merge if CSV exists)"""
     try:
         # Verify project exists
@@ -4334,7 +4661,7 @@ def serve_project_thumbnail(project_id, filename):
 
 if __name__ == '__main__':
     print("\n" + "="*80)
-    print(" 🏺 PyPotteryLens Flask Application 🔍")
+    print(" 🏺 SherdScope Flask Application 🔍")
     print("="*80)
     print("\n🚀 Starting server...")
     print("📝 Browser will open at: http://localhost:5001")

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -41,13 +42,14 @@ HESBAN_TABLE_COLUMNS = [
     "surface_interior_color", "decor", "fire",
 ]
 
-LINKAGE_COLUMNS = IDENTITY_COLUMNS + HESBAN_TABLE_COLUMNS
+MEASUREMENT_COLUMNS = ["rim_diameter_cm", "diameter_status"]
+LINKAGE_COLUMNS = IDENTITY_COLUMNS + HESBAN_TABLE_COLUMNS + MEASUREMENT_COLUMNS
 NON_BLOCKING_WARNING_CODES = {"low_ocr_confidence"}
+HIDDEN_REVIEW_WARNING_CODES = {"missing_table_end"}
 OVERRIDABLE_WARNING_CODES = {
-    "missing_table_end", "missing_required_value", "column_header_fallback",
+    "missing_required_value", "column_header_fallback",
 }
 WARNING_OVERRIDE_REASONS = {
-    "missing_table_end": {"visually_confirmed_complete"},
     "missing_required_value": {"publication_field_blank"},
     "column_header_fallback": {"column_alignment_verified"},
 }
@@ -55,6 +57,7 @@ REVIEWER_OWNED_FIGURE_FIELDS = {
     "figure_id", "figure_caption", "table_rows", "table_pages",
     "warning_overrides", "reviewer_revision", "draft_saved_at",
     "review_history", "review_status", "processing_status", "matches",
+    "scale_calibrations",
 }
 _LINKAGE_STATE_LOCK = threading.RLock()
 
@@ -69,6 +72,8 @@ PUBLIC_LINKAGE_MAP = {
     "source_pdf": "Source PDF",
     "link_status": "Link Status",
     "table_type": "Type",
+    "rim_diameter_cm": "Rim Diameter (cm)",
+    "diameter_status": "Diameter Status",
     "table_square": "Sq",
     "table_locus": "Loc",
     "table_pail": "Pail",
@@ -463,6 +468,7 @@ def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             figure["reviewer_revision"] = 0
         figure.setdefault("warning_overrides", {})
+        figure.setdefault("scale_calibrations", {})
         figure.setdefault("draft_saved_at", "")
         figure.setdefault("processing_status", (
             "reviewable" if figure.get("matches") or state.get("status") == "complete"
@@ -509,11 +515,14 @@ def save_linkage_state(project_path: Path, state: dict[str, Any],
             for field in REVIEWER_OWNED_FIGURE_FIELDS:
                 if field in saved:
                     figure[field] = saved[field]
-            saved_numbers = {str(item.get("mask_file")): item.get("vessel_number", "")
-                             for item in saved.get("drawings", [])}
+            saved_drawings = {str(item.get("mask_file")): item
+                              for item in saved.get("drawings", [])}
             for drawing in figure.get("drawings", []):
-                if str(drawing.get("mask_file")) in saved_numbers:
-                    drawing["vessel_number"] = saved_numbers[str(drawing.get("mask_file"))]
+                saved_drawing = saved_drawings.get(str(drawing.get("mask_file")))
+                if saved_drawing:
+                    drawing["vessel_number"] = saved_drawing.get("vessel_number", "")
+                    if "measurement" in saved_drawing:
+                        drawing["measurement"] = dict(saved_drawing["measurement"])
             validate_figure(figure, profile)
         card_index: dict[str, Any] = {}
         for figure in state.get("figures", []):
@@ -558,8 +567,10 @@ def _annotations_by_image(project_path: Path) -> dict[str, list[dict[str, Any]]]
 
 
 def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict[str, Any]:
-    warnings: list[dict[str, Any]] = [dict(warning) for warning in
-                                     figure.get("extraction_warnings", [])]
+    warnings: list[dict[str, Any]] = [
+        dict(warning) for warning in figure.get("extraction_warnings", [])
+        if warning.get("code") not in HIDDEN_REVIEW_WARNING_CODES
+    ]
     drawing_sources = {str(page.get("source_pdf", "")).strip()
                        for page in figure.get("drawing_pages", [])
                        if str(page.get("source_pdf", "")).strip()}
@@ -663,7 +674,7 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
     figure["status"] = ("ready" if matches and
                         all(m["status"] == "ready" for m in matches) and
                         not blocking_warnings else "needs_review")
-    if (figure.get("processing_status") != "processing" and
+    if (figure.get("processing_status") not in {"processing", "queued"} and
             figure.get("review_status") != "approved"):
         figure["processing_status"] = (
             "ready" if figure["status"] == "ready" else "reviewable")
@@ -731,24 +742,41 @@ class MetadataLinker:
                 # card identity and geometry fingerprint are unchanged.
                 "matches": list(previous_figure.get("matches", [])),
                 "figure_key": previous_figure.get("figure_key", ""),
-                "processing_status": "processing",
+                # Drawing-page OCR discovers figures before their table pass
+                # begins.  Keep them queued until the loop below actively
+                # extracts that one figure, otherwise every discovered figure
+                # appears to be processing at the same time in the reviewer UI.
+                "processing_status": "queued",
                 "reviewer_revision": int(previous_figure.get("reviewer_revision", 0) or 0),
                 "warning_overrides": dict(previous_figure.get("warning_overrides", {})),
+                "scale_calibrations": dict(previous_figure.get("scale_calibrations", {})),
                 "draft_saved_at": previous_figure.get("draft_saved_at", ""),
             })
             figure["drawing_pages"].append({
                 "image_name": page["image_name"], "logical_index": page["logical_index"],
                 "printed_page": result.get("printed_page") or page.get("printed_page", ""),
                 "source_pdf": page.get("source_pdf", ""),
+                "render_dpi": page.get("render_dpi"),
+                "pdf_page_index": page.get("pdf_page_index"),
+                "split_part": page.get("split_part"),
             })
             returned = result.get("drawings", {})
+            previous_drawings = {
+                (mask_stem(item.get("mask_file", "")), str(item.get("fingerprint", ""))): item
+                for item in previous_figure.get("drawings", [])
+            }
             for card in grouped[image_stem]:
                 value = returned.get(card["mask_file"], {}) if isinstance(returned, dict) else {}
                 number = value.get("number") if isinstance(value, dict) else value
                 normalized_number = self.profile.normalize_number(number)
-                figure["drawings"].append({**card, "image_name": page["image_name"],
-                    "vessel_number": (normalized_number
-                                      if is_positive_vessel_number(normalized_number) else "")})
+                drawing = {**card, "image_name": page["image_name"],
+                           "vessel_number": (normalized_number
+                                             if is_positive_vessel_number(normalized_number) else "")}
+                previous_drawing = previous_drawings.get(
+                    (mask_stem(card.get("mask_file", "")), str(card.get("fingerprint", ""))))
+                if previous_drawing and previous_drawing.get("measurement"):
+                    drawing["measurement"] = dict(previous_drawing["measurement"])
+                figure["drawings"].append(drawing)
 
             state["progress"] = {"current": index, "total": len(drawing_pages),
                                  "message": f"Reading drawing page {index}/{len(drawing_pages)}"}
@@ -760,8 +788,17 @@ class MetadataLinker:
         total_work = len(drawing_pages) + len(figures)
         state["progress"] = {"current": len(drawing_pages), "total": total_work,
                              "message": "Starting table extraction"}
+        for queued_figure in figures.values():
+            queued_figure["processing_status"] = "queued"
         save_linkage_state(self.project_path, {**state, "figures": list(figures.values())})
         for figure_index, figure in enumerate(figures.values(), 1):
+            figure["processing_status"] = "processing"
+            state["progress"] = {
+                "current": len(drawing_pages) + figure_index - 1,
+                "total": total_work,
+                "message": f"Reading figure {figure.get('figure_id')} ({figure_index}/{len(figures)})",
+            }
+            save_linkage_state(self.project_path, {**state, "figures": list(figures.values())})
             expected = sorted({d["vessel_number"] for d in figure["drawings"] if d.get("vessel_number")}, key=natural_key)
             positions = [page_pos.get(Path(p["image_name"]).stem) for p in figure["drawing_pages"]]
             positions = [p for p in positions if p is not None]
@@ -825,6 +862,10 @@ class MetadataLinker:
                         "source_pdf": candidate.get("source_pdf", ""), "crop": list(crop) if crop else None,
                         "figure_caption": raw_table_caption or candidate.get("figure_caption", ""),
                         "boundary": boundary,
+                        "ocr_diagnostics": [
+                            item for item in table.get("ocr_diagnostics", [])
+                            if isinstance(item, dict)
+                        ],
                     })
                     figure["table_rows"].extend(normalized_rows)
                     for warning in table.get("warnings", []):
@@ -891,6 +932,31 @@ class MetadataLinker:
                         clean["source_printed_page"] = retry.get("printed_page") or candidate.get("printed_page", "")
                         figure["table_rows"].append(clean)
                         missing.remove(normalized_number)
+            try:
+                from hesban_measurements import measure_figure
+                figure_sources = {page.get("source_pdf") for page in figure.get("drawing_pages", [])}
+                figure_dpis = {page.get("render_dpi") for page in figure.get("drawing_pages", [])
+                               if page.get("render_dpi") is not None}
+                previous_ratios = [
+                    calibration.get("px_per_cm")
+                    for candidate in figures.values()
+                    if candidate is not figure
+                    if ({page.get("source_pdf") for page in candidate.get("drawing_pages", [])} &
+                        figure_sources)
+                    if ((not figure_dpis and not {page.get("render_dpi") for page in
+                                                  candidate.get("drawing_pages", [])
+                                                  if page.get("render_dpi") is not None}) or
+                        {page.get("render_dpi") for page in candidate.get("drawing_pages", [])
+                         if page.get("render_dpi") is not None} & figure_dpis)
+                    for calibration in candidate.get("scale_calibrations", {}).values()
+                    if (calibration.get("status") in {"suggested", "verified", "verified_automatic", "verified_manual"} and
+                        calibration.get("px_per_cm"))
+                ]
+                measure_figure(self.project_path, figure, project_ratios=previous_ratios)
+            except Exception as exc:
+                figure.setdefault("measurement_warnings", []).append({
+                    "code": "measurement_failed", "message": str(exc),
+                })
             validate_figure(figure, self.profile)
             figure["processing_status"] = (
                 "ready" if figure.get("status") == "ready" else "reviewable")
@@ -966,9 +1032,9 @@ def _apply_approved_figures_locked(project_path: Path, figure_ids: Iterable[str]
     targets: dict[tuple[str, str], pd.Series] = {}
     for figure_id in requested:
         figure = figures_by_id[figure_id]
-        if figure.get("processing_status") == "processing":
+        if figure.get("processing_status") in {"processing", "queued"}:
             raise MetadataLinkError(
-                f"Figure {figure.get('figure_id')} is still being extracted")
+                f"Figure {figure.get('figure_id')} is still being extracted or waiting to start")
         if figure.get("status") != "ready":
             raise MetadataLinkError(f"Figure {figure.get('figure_id')} still requires review")
         validate_figure(figure, get_profile(state.get("profile", "hesban11")))
@@ -1000,8 +1066,26 @@ def _apply_approved_figures_locked(project_path: Path, figure_ids: Iterable[str]
         }
         for match in figure.get("matches", []):
             target = targets[(figure_id, str(match.get("mask_file")))]
+            drawing = next((item for item in figure.get("drawings", [])
+                            if mask_stem(item.get("mask_file")) ==
+                            mask_stem(match.get("mask_file"))), {})
+            measurement = drawing.get("measurement", {})
+            try:
+                verified_number = float(measurement.get("verified_cm"))
+            except (TypeError, ValueError):
+                verified_number = 0.0
+            measurement_status = str(measurement.get("status", ""))
+            verified = (measurement_status in {"verified", "verified_automatic", "verified_manual"} and
+                        math.isfinite(verified_number) and verified_number > 0)
+            verified_value = verified_number if verified else ""
             internal_values = {**provenance, **match.get("values", {}),
-                               "vessel_number": match.get("vessel_number", "")}
+                               "vessel_number": match.get("vessel_number", ""),
+                               "rim_diameter_cm": (
+                                   f"{float(verified_value):.1f}" if verified_value != "" else ""),
+                               "diameter_status": (
+                                   ("verified_automatic" if measurement_status == "verified_automatic"
+                                    else "verified_manual") if verified else "unresolved"),
+                               }
             values = {public: str(internal_values.get(internal, "") or "")
                       for internal, public in PUBLIC_LINKAGE_MAP.items()}
             previously_imported_raw = match.get("applied_values", {})
@@ -1067,6 +1151,10 @@ def invalidate_linkage_for_card_changes(cards_path: Path, old_annots: Optional[p
             bbox = parse_bbox(new_rows[key]["bbox"])
             drawing["bbox"] = list(bbox)
             drawing["fingerprint"] = bbox_fingerprint(drawing.get("image_name", ""), bbox)
+            drawing["measurement"] = {
+                "status": "unresolved", "warning": "card_geometry_changed",
+                "drawing_fingerprint": drawing["fingerprint"],
+            }
         for match in figure.get("matches", []):
             if mask_stem(match.get("mask_file")) in changed:
                 match["status"] = "needs_review"

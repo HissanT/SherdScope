@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">SherdScope</title>
+  <desc id="desc">A pottery profile inside a magnifying lens</desc>
+  <defs>
+    <linearGradient id="lens" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3156a3"/>
+      <stop offset="1" stop-color="#6b4aa1"/>
+    </linearGradient>
+  </defs>
+  <circle cx="56" cy="54" r="39" fill="#f7f9fc" stroke="url(#lens)" stroke-width="8"/>
+  <path d="M84 83l28 28" fill="none" stroke="#263a69" stroke-width="11" stroke-linecap="round"/>
+  <path d="M34 35h43M55.5 35v38M34 35c0 13 5 20 10 27 4 5 7 10 7 18" fill="none" stroke="#172033" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M76 34c7 7 8 15 4 24-3 7-5 14-4 23-7-2-12-7-13-15-1-9 4-16 7-24 1-3 3-6 6-8z" fill="#172033"/>
+</svg>

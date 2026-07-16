@@ -1,4 +1,4 @@
-// Main JavaScript for PyPotteryLens Flask App
+// Main JavaScript for the SherdScope Flask app
 
 // Tab Management
 class TabManager {
@@ -55,8 +55,8 @@ class TabManager {
                 case 'tabular':
                     await refreshTabularTab();
                     break;
-                case 'postprocess':
-                    await refreshPostprocessTab();
+                case 'export':
+                    await refreshExportTab();
                     break;
             }
         } catch (error) {
@@ -143,25 +143,23 @@ async function refreshTabularTab() {
     }
 }
 
-async function refreshPostprocessTab() {
-    console.log('Refreshing postprocess tab...');
+async function refreshExportTab() {
+    console.log('Refreshing export tab...');
     if (!window.PyPotteryUtils) {
         console.error('PyPotteryUtils not available!');
         return;
     }
     
-    // Load postprocess cards if function is available
-    if (window.loadPostprocessCards) {
-        console.log('Loading postprocess cards for current project');
-        await window.loadPostprocessCards();
+    if (window.loadResearchExport) {
+        await window.loadResearchExport();
     } else {
-        console.warn('loadPostprocessCards function not available');
+        console.warn('loadResearchExport function not available');
     }
 }
 
 // Initialize application
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('PyPotteryLens Flask App initialized');
+    console.log('SherdScope Flask app initialized');
 
     // Initialize tab manager
     const tabManager = new TabManager();
@@ -202,7 +200,7 @@ function updateTabsState(project) {
     const modelTab = document.querySelector('[data-tab="model"]');
     const annotationTab = document.querySelector('[data-tab="annotation"]');
     const tabularTab = document.querySelector('[data-tab="tabular"]');
-    const postprocessTab = document.querySelector('[data-tab="postprocess"]');
+    const exportTab = document.querySelector('[data-tab="export"]');
     
     if (!project) {
         // No project selected - show info message
@@ -221,7 +219,7 @@ window.PyPotteryApp = {
     refreshModelTab,
     refreshAnnotationTab,
     refreshTabularTab,
-    refreshPostprocessTab,
+    refreshExportTab,
     updateTabsState
 };
 
