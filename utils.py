@@ -6,183 +6,44 @@ from pathlib import Path
 from dataclasses import dataclass
 import pandas as pd
 from PIL import Image
-#import gradio as gr
-import fitz
 from ultralytics import YOLO
 from skimage.filters import threshold_otsu, median
 from skimage.segmentation import clear_border
 from skimage.measure import label, regionprops
 from skimage.morphology import closing, square, disk
 from scipy.ndimage import binary_dilation, binary_erosion
-from typing import  Dict, List, Optional, Tuple
-import numpy as np
-from dataclasses import dataclass
+from typing import Dict, List, Optional
 import torch
 import torchvision.transforms as transforms
 from models import MultiHeadEfficientNet
 import shutil
 from reportlab.lib import pagesizes
 from reportlab.pdfgen import canvas
-from PIL import Image
 import gc
 
 from metadata_linker import (
     ALL_LINKAGE_STORAGE_COLUMNS, invalidate_linkage_for_card_changes, mask_stem, parse_bbox,
 )
+from processors import (
+    AnnotationConfig,
+    MaskExtractionConfig,
+    ModelConfig,
+    PDFConfig as PDFConfig,
+    PDFProcessor as PDFProcessor,
+    TabularConfig,
+)
+from sidecars import (
+    SCALE_SIDECAR_SUFFIX as SCALE_SIDECAR_SUFFIX,
+    VESSELS_SIDECAR_SUFFIX as VESSELS_SIDECAR_SUFFIX,
+    _assign_px_per_cm,
+    read_scale_sidecar,
+    read_vessels_sidecar,
+    write_scale_sidecar as write_scale_sidecar,
+    write_vessels_sidecar as write_vessels_sidecar,
+)
 
 
 
-@dataclass
-class PDFConfig:
-    """Configuration for PDF processing"""
-    output_dir: Path
-    render_dpi: int = 400
-
-@dataclass
-class ModelConfig:
-    """Configuration for model processing"""
-    models_dir: Path
-    pred_output_dir: Path
-    confidence: float = 0.5
-    kernel_size: int = 2
-    iterations: int = 10
-    diagnostic: bool = False
-    ###
-    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-
-@dataclass
-class MaskExtractionConfig:
-    """Configuration for mask extraction"""
-    pdfimg_output_dir: Path  # Directory containing the original images
-    pred_output_dir: Path    # Directory for predictions and output
-    min_area_ratio: float = 0.0002 # keep small vessels; raise to drop more noise
-    closing_kernel_size: int = 3
-    output_suffix: str = "_card"
-    mask_suffix: str = "_mask"
-
-@dataclass
-class AnnotationConfig:
-    """Configuration for annotation processing"""
-    pred_output_dir: Path
-
-@dataclass
-class TabularConfig:
-    """Configuration for tabular processing"""
-    pdfimg_output_dir: Path
-    pred_output_dir: Path
-    max_workers: int = 4  # For parallel processing
-    cache_size: int = 32  # For LRU cache
-
-class PDFProcessor:
-    """Handles PDF to image conversion using PyMuPDF"""
-    
-    def __init__(self, config):
-        self.config = config
-
-    def process_pdf(self, pdf_path: str, split_pages: bool = False, render_dpi: int = None) -> str:
-        """
-        Convert PDF to images with optional page splitting
-        
-        Args:
-            pdf_path: Path to PDF file
-            split_pages: If True, splits each page into left and right halves
-        """
-        try:
-            pdf_file_name = Path(pdf_path).stem
-            output_folder = self.config.output_dir / pdf_file_name
-            os.makedirs(output_folder, exist_ok=True)
-            
-            dpi = int(render_dpi or self.config.render_dpi)
-            if not 200 <= dpi <= 600:
-                raise ValueError("Render DPI must be between 200 and 600")
-            # Open PDF document
-            doc = fitz.open(pdf_path)
-            
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                
-                # Get the pixel map with a good resolution
-                pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
-
-                
-                # Convert to PIL Image
-                img_data = pix.samples
-                img = Image.frombytes("RGB", [pix.width, pix.height], img_data)
-                
-                if split_pages:
-                    self._process_split_page(img, pdf_file_name, page_num, output_folder)
-                else:
-                    self._process_single_page(img, pdf_file_name, page_num, output_folder)
-            
-            doc.close()
-            return f"PDF file {pdf_file_name} has been converted to JPG"
-            
-        except Exception as e:
-            return f"Error processing PDF: {str(e)}"
-
-    def process_pdf_to_folder(self, pdf_path: str, output_folder: str, split_pages: bool = False,
-                              project_name: str = None, render_dpi: int = None) -> str:
-        """
-        Convert PDF to images with optional page splitting, saving to specified folder
-        
-        Args:
-            pdf_path: Path to PDF file
-            output_folder: Destination folder for images
-            split_pages: If True, splits each page into left and right halves
-            project_name: Optional project name to use for image naming (defaults to PDF filename)
-        """
-        try:
-            # Use project name if provided, otherwise fall back to PDF filename
-            base_name = project_name if project_name else Path(pdf_path).stem
-            output_path = Path(output_folder)
-            os.makedirs(output_path, exist_ok=True)
-            
-            dpi = int(render_dpi or self.config.render_dpi)
-            if not 200 <= dpi <= 600:
-                raise ValueError("Render DPI must be between 200 and 600")
-            # Open PDF document
-            doc = fitz.open(pdf_path)
-            
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                
-                # Get the pixel map with a good resolution
-                pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
-                
-                # Convert to PIL Image
-                img_data = pix.samples
-                img = Image.frombytes("RGB", [pix.width, pix.height], img_data)
-                
-                if split_pages:
-                    self._process_split_page(img, base_name, page_num, output_path)
-                else:
-                    self._process_single_page(img, base_name, page_num, output_path)
-            
-            doc.close()
-            return f"PDF file {base_name} has been converted to JPG"
-            
-        except Exception as e:
-            return f"Error processing PDF: {str(e)}"
-
-    def _process_single_page(self, image: Image.Image, pdf_name: str, page_num: int, output_folder: Path):
-        """Save a single page as one image"""
-        output_image_name = f'{pdf_name}_page_{page_num}.jpg'
-        image.save(output_folder / output_image_name, 'JPEG', quality=90, optimize=True)
-
-    def _process_split_page(self, image: Image.Image, pdf_name: str, page_num: int, output_folder: Path):
-        """Split a page into left and right halves and save separately"""
-        width, height = image.size
-        mid_point = width // 2
-
-        # Split into left and right pages
-        left_page = image.crop((0, 0, mid_point, height))
-        right_page = image.crop((mid_point, 0, width, height))
-
-        # Save both pages with appropriate numbering
-        left_page.save(output_folder / f'{pdf_name}_page_{page_num}a.jpg', 'JPEG', quality=90, optimize=True)
-        right_page.save(output_folder / f'{pdf_name}_page_{page_num}b.jpg', 'JPEG', quality=90, optimize=True)
-
-        
 class ModelProcessor:
     """Handles model application and prediction"""
     
@@ -470,7 +331,7 @@ class MaskExtractor:
 
 
     def _extract_region(self, 
-                    region: 'RegionProperties', 
+                    region,
                     mask_array: np.ndarray, 
                     orig_array: np.ndarray, 
                     total_area: int) -> tuple[np.ndarray, tuple] | None:
@@ -950,7 +811,7 @@ class TabularProcessor:
             folder_img_path = (self.pdfimg_output_dir / context).resolve()
             csv_path = (self.pred_output_dir / folder).resolve()
 
-            print(f"\nProcessing paths:")
+            print("\nProcessing paths:")
             print(f"Mask folder: {folder_mask_path}")
             print(f"Image folder: {folder_img_path}")
             print(f"CSV folder: {csv_path}")
@@ -965,7 +826,7 @@ class TabularProcessor:
                 mask_info_path = csv_path / "mask_info.csv"
                 mask_info_annots_path = csv_path / "mask_info_annots.csv"
 
-                print(f"\nReading CSV files:")
+                print("\nReading CSV files:")
                 print(f"mask_info.csv: {mask_info_path}")
                 print(f"mask_info_annots.csv: {mask_info_annots_path}")
 
@@ -1057,7 +918,7 @@ class TabularProcessor:
                     scaled_annotations.append((scaled_bbox, mask_id))
                 
                 return (
-                    gr.AnnotatedImage(value=[image, scaled_annotations]), 
+                    gr.AnnotatedImage(value=[image, scaled_annotations]),  # noqa: F821
                     img_num, 
                     df_display
                 )
@@ -1156,125 +1017,6 @@ def _export_mask(mask: np.ndarray,
     mask_repeated = np.repeat(np.expand_dims(mask * 128, 2), 4, axis=2)
     mask_rgba = Image.fromarray(mask_repeated.astype(np.uint8), mode="RGBA")
     mask_rgba.save(output_path / f"{img_name}_mask_layer.png")
-
-
-# ---------------------------------------------------------------------------
-# Manually drawn vessels (LabelMe-style polygons)
-#
-# Some draughtsmen draw a vessel INSIDE the section of another vessel. The YOLO
-# model is trained on isolated vessels, so it detects only the outer silhouette
-# and the inner vessel is lost. During review the operator draws a polygon
-# around each missed vessel; on extraction every polygon becomes its own card.
-# Polygons are stored as a JSON sidecar next to the mask, in ORIGINAL-image
-# coordinates: {"image": base, "polygons": [[[x, y], ...], ...]}.
-# ---------------------------------------------------------------------------
-
-VESSELS_SIDECAR_SUFFIX = "_vessels.json"
-
-
-def write_vessels_sidecar(masks_dir, base_filename: str, polygons: list) -> Path:
-    """Persist manually drawn vessel polygons next to the mask as JSON."""
-    import json
-    masks_dir = Path(masks_dir)
-    sidecar = masks_dir / f"{base_filename}{VESSELS_SIDECAR_SUFFIX}"
-    if polygons:
-        with open(sidecar, "w") as f:
-            json.dump({"image": base_filename, "polygons": polygons}, f)
-    elif sidecar.exists():
-        # No polygons left -> remove the sidecar to keep the folder clean
-        sidecar.unlink()
-    return sidecar
-
-
-def read_vessels_sidecar(masks_dir, base_filename: str) -> list:
-    """Load manually drawn vessel polygons for an image (empty list if none)."""
-    import json
-    sidecar = Path(masks_dir) / f"{base_filename}{VESSELS_SIDECAR_SUFFIX}"
-    if not sidecar.exists():
-        return []
-    try:
-        with open(sidecar) as f:
-            return json.load(f).get("polygons", [])
-    except Exception as e:
-        print(f"Error reading vessels sidecar for {base_filename}: {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Scale calibration sidecars
-# Each image may have N scale-bar measurements stored alongside the mask.
-# Schema: {"image": base, "scales": [{"p1":[x,y], "p2":[x,y], "real_cm": 5.0,
-#           "zone": null | [x1,y1,x2,y2]}, ...]}
-# Coordinates are always in ORIGINAL image resolution.
-# At extraction time, each card centroid is matched to the nearest zone; if no
-# zone matches, the first scale without a zone acts as a global fallback.
-# ---------------------------------------------------------------------------
-
-SCALE_SIDECAR_SUFFIX = "_scale.json"
-
-
-def write_scale_sidecar(masks_dir, base_filename: str, scales: list) -> Path:
-    """Persist scale calibration entries for an image next to the mask as JSON."""
-    import json
-    masks_dir = Path(masks_dir)
-    sidecar = masks_dir / f"{base_filename}{SCALE_SIDECAR_SUFFIX}"
-    if scales:
-        with open(sidecar, "w") as f:
-            json.dump({"image": base_filename, "scales": scales}, f)
-    elif sidecar.exists():
-        sidecar.unlink()
-    return sidecar
-
-
-def read_scale_sidecar(masks_dir, base_filename: str) -> list:
-    """Load scale calibration entries for an image (empty list if none)."""
-    import json
-    sidecar = Path(masks_dir) / f"{base_filename}{SCALE_SIDECAR_SUFFIX}"
-    if not sidecar.exists():
-        return []
-    try:
-        with open(sidecar) as f:
-            return json.load(f).get("scales", [])
-    except Exception as e:
-        print(f"Error reading scale sidecar for {base_filename}: {e}")
-        return []
-
-
-def _assign_px_per_cm(scales: list, centroid: tuple):
-    """Return px_per_cm for the card whose bbox centroid is given.
-
-    Zoned scales (zone != None) take priority over the first global
-    (zone == None) fallback. Returns None if no scales are defined.
-    """
-    import math
-
-    def px_ratio(s):
-        # New linker calibrations retain rejected candidates as visual
-        # evidence. They must never become a usable card scale merely because
-        # they still contain endpoints.
-        if s.get('status') == 'unresolved':
-            return None
-        dx = s['p2'][0] - s['p1'][0]
-        dy = s['p2'][1] - s['p1'][1]
-        dist_px = math.hypot(dx, dy)
-        real_cm = s.get('real_cm', 0)
-        return round(dist_px / real_cm, 4) if real_cm > 0 and dist_px > 0 else None
-
-    cx, cy = centroid
-    for s in scales:
-        if s.get('status') == 'unresolved':
-            continue
-        z = s.get('zone')
-        if z:
-            x1, y1, x2, y2 = z
-            if min(x1, x2) <= cx <= max(x1, x2) and min(y1, y2) <= cy <= max(y1, y2):
-                r = px_ratio(s)
-                if r is not None:
-                    return r
-    for s in scales:
-        if not s.get('zone') and s.get('status') != 'unresolved':
-            return px_ratio(s)
-    return None
 
 
 def _whiteout_inner_polygons(cropped: np.ndarray, bbox, region, polygons: list):
@@ -1702,7 +1444,7 @@ class ExportProcessor:
                 export_folder = self.config.pred_output_dir / f"{acronym}"
                 
                 if not source_folder.exists():
-                    return f"Transformed folder not found. Please process images first."
+                    return "Transformed folder not found. Please process images first."
 
                 merged_annotations_path = source_folder / "merged_annotations.csv"
                     
@@ -1766,14 +1508,6 @@ class ExportProcessor:
                 print(f"Export error: {str(e)}")
                 return f"Error during export: {str(e)}"
         
-
-
-from typing import List, Dict, Tuple
-from PIL import Image
-from reportlab.lib import pagesizes
-from reportlab.pdfgen import canvas
-import numpy as np
-
 class LayoutNode:
     """Tree node representing available space in the layout"""
     def __init__(self, x: float, y: float, width: float, height: float):

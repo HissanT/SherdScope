@@ -1,31 +1,21 @@
-"""
-Flask Application for PyPotteryLens
-Migrated from Gradio to Flask with native HTML, CSS, and JavaScript
-"""
+"""SherdScope Flask application and compatibility API routes."""
 
-from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, Response
+from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 from pathlib import Path
 import os
 import re
 import json
-# Module-level aliases so shared helpers can use them (some routes also import
-# these names locally, which harmlessly shadows within those functions).
-_re = re
-_json = json
 import base64
 from io import BytesIO
 import pandas as pd
 import numpy as np
 from werkzeug.utils import secure_filename
 import torch
-import gc
 import hashlib
 import threading
-import time
 import shutil
 import tempfile
 import secrets
-from urllib.parse import quote
 
 from utils import (
     PDFProcessor,
@@ -48,14 +38,11 @@ from utils import (
     VESSELS_SIDECAR_SUFFIX,
     read_scale_sidecar,
     write_scale_sidecar,
-    SCALE_SIDECAR_SUFFIX,
 )
 
 from project_manager import ProjectManager
 from metadata_linker import (
-    AmbiguousSourceError,
     HESBAN_TABLE_COLUMNS,
-    PUBLIC_LINKAGE_COLUMNS,
     WARNING_OVERRIDE_REASONS,
     Hesban11Profile,
     MetadataLinkError,
@@ -81,12 +68,11 @@ from hesban_measurements import (
     persist_figure_measurements,
     verified_measurement,
 )
-from research_export import (
-    build_export,
-    csv_bytes as research_csv_bytes,
-    dataset_zip_bytes,
-    save_export_settings,
-)
+from routes.research_export import register_research_export_routes
+
+# Stable aliases used by the shared JSON-repair helpers below.
+_re = re
+_json = json
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SHERDSCOPE_SECRET_KEY') or secrets.token_hex(32)
@@ -96,6 +82,7 @@ app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 
 # Initialize Project Manager
 project_manager = ProjectManager(projects_root="projects")
+register_research_export_routes(app, lambda: project_manager)
 
 # === Gemma 4 AI model (lazy loaded for bibliographic extraction) ===
 _gemma_model = None
@@ -665,7 +652,7 @@ def get_icons():
         # Sort icons numerically if they are numbered
         try:
             icons.sort(key=lambda x: int(x.replace('.png', '')))
-        except:
+        except Exception:
             icons.sort()
         
         return jsonify({'icons': icons, 'success': True})
@@ -865,7 +852,7 @@ def extract_project_masks(project_id):
                     current = int(parts[idx].split('/')[0])
                     update_operation_progress('extract_masks', current, total_masks, 
                                              f'Extracting mask {current}/{total_masks}')
-                except:
+                except Exception:
                     pass
             original_print(*args, **kwargs)
         
@@ -1670,7 +1657,7 @@ def get_project_cards(project_id):
                 import traceback
                 traceback.print_exc()
         else:
-            print(f"No classifications.csv found in cards or cards_modified")
+            print("No classifications.csv found in cards or cards_modified")
         
         # Modified cards + exclusion list (both live in cards_modified/)
         cards_modified_dir = cards_path.parent / 'cards_modified'
@@ -2176,9 +2163,6 @@ def ai_extract_bibliographic(project_id):
     """Use Gemma 4 E2B-it to extract bibliographic info (tavola, figura, numero)
     from the original page image using bounding box coordinates."""
     try:
-        import json as _json
-        import re as _re
-
         project_metadata = project_manager.get_project(project_id)
         if not project_metadata:
             return jsonify({'error': 'Project not found', 'success': False}), 404
@@ -2444,9 +2428,6 @@ def ai_extract_bibliographic_batch(project_id):
     Progress is streamed via the global operation_progress dict so the frontend
     can poll /api/progress."""
     try:
-        import json as _json
-        import re as _re
-
         project_metadata = project_manager.get_project(project_id)
         if not project_metadata:
             return jsonify({'error': 'Project not found', 'success': False}), 404
@@ -3707,6 +3688,8 @@ def process_folder():
 def load_processed_image():
     """Load processed image for review"""
     try:
+        from PIL import Image
+
         data = request.json
         folder = data.get('folder')
         img_num = int(data.get('img_num', 0))
@@ -3721,7 +3704,6 @@ def load_processed_image():
         row = results.iloc[img_num]
         
         # Load images
-        from PIL import Image
         import io
         
         original_path = second_step_processor.get_original_path(folder, row['filename'])
@@ -3778,7 +3760,6 @@ def flip_image():
             return jsonify({'error': 'Failed to flip image', 'success': False}), 500
         
         # Return updated image
-        from PIL import Image
         import io
         
         buffer = io.BytesIO()
@@ -4266,106 +4247,6 @@ def merge_project_annotations(project_id):
         return jsonify({'error': str(e), 'success': False}), 500
 
 
-def _research_export_payload(project_id, acronym):
-    project_metadata = project_manager.get_project(project_id)
-    if not project_metadata:
-        raise FileNotFoundError('Project not found')
-    if not acronym or not re.fullmatch(r'[A-Za-z0-9_]+', str(acronym)):
-        raise ValueError('Dataset acronym can only contain letters, numbers, and underscores')
-    project_path = project_manager.get_project_path(project_id)
-    return project_metadata, build_export(project_path, str(acronym))
-
-
-@app.route('/api/projects/<project_id>/export/preview', methods=['GET'])
-def preview_project_research_export(project_id):
-    """Preview approved rows and the masks available for final export."""
-    try:
-        acronym = request.args.get('acronym', 'DATA')
-        _, result = _research_export_payload(project_id, acronym)
-        candidates = []
-        for candidate in result['candidates']:
-            item = dict(candidate)
-            item['thumbnail_url'] = (
-                f"/api/projects/{project_id}/card/" +
-                quote(candidate['mask_file']))
-            candidates.append(item)
-        return jsonify({
-            'success': True,
-            'summary': result['summary'],
-            'masks': candidates,
-            'rows': result['frame'].to_dict(orient='records'),
-            'columns': list(result['frame'].columns),
-            'unresolved': result['unresolved'],
-        })
-    except FileNotFoundError as exc:
-        return jsonify({'error': str(exc), 'success': False}), 404
-    except ValueError as exc:
-        return jsonify({'error': str(exc), 'success': False}), 400
-    except Exception as exc:
-        return jsonify({'error': str(exc), 'success': False}), 500
-
-
-@app.route('/api/projects/<project_id>/export/settings', methods=['PATCH'])
-def update_project_research_export_settings(project_id):
-    """Persist the masks a researcher has chosen to exclude."""
-    project_path = project_manager.get_project_path(project_id)
-    if not project_path:
-        return jsonify({'error': 'Project not found', 'success': False}), 404
-    data = request.get_json(silent=True) or {}
-    excluded = data.get('excluded_masks')
-    if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
-        return jsonify({'error': 'excluded_masks must be a list of mask filenames',
-                        'success': False}), 400
-    known = data.get('known_masks')
-    if known is not None and (not isinstance(known, list) or
-                              not all(isinstance(item, str) for item in known)):
-        return jsonify({'error': 'known_masks must be a list of mask filenames',
-                        'success': False}), 400
-    settings = save_export_settings(project_path, excluded, known_masks=known)
-    return jsonify({'success': True, 'settings': settings})
-
-
-@app.route('/api/projects/<project_id>/export/csv', methods=['POST'])
-def download_project_research_csv(project_id):
-    try:
-        data = request.get_json(silent=True) or {}
-        acronym = str(data.get('acronym', '')).strip()
-        _, result = _research_export_payload(project_id, acronym)
-        payload = BytesIO(research_csv_bytes(result['frame']))
-        payload.seek(0)
-        return send_file(payload, as_attachment=True,
-                         download_name=f'{acronym}_metadata.csv',
-                         mimetype='text/csv; charset=utf-8')
-    except FileNotFoundError as exc:
-        return jsonify({'error': str(exc), 'success': False}), 404
-    except ValueError as exc:
-        return jsonify({'error': str(exc), 'success': False}), 400
-    except Exception as exc:
-        return jsonify({'error': str(exc), 'success': False}), 500
-
-
-@app.route('/api/projects/<project_id>/export/dataset', methods=['POST'])
-@app.route('/api/projects/<project_id>/export', methods=['POST'])
-def export_project_results(project_id):
-    """Download the clean research CSV, masks, dictionary, and summary."""
-    try:
-        data = request.get_json(silent=True) or {}
-        acronym = str(data.get('acronym', '')).strip()
-        project_metadata, result = _research_export_payload(project_id, acronym)
-        payload = BytesIO(dataset_zip_bytes(
-            result, project_metadata.get('project_name', project_id)))
-        payload.seek(0)
-        return send_file(payload, as_attachment=True,
-                         download_name=f'{acronym}.zip',
-                         mimetype='application/zip')
-    except FileNotFoundError as exc:
-        return jsonify({'error': str(exc), 'success': False}), 404
-    except ValueError as exc:
-        return jsonify({'error': str(exc), 'success': False}), 400
-    except Exception as exc:
-        return jsonify({'error': str(exc), 'success': False}), 500
-
-
 @app.route('/api/projects/<project_id>/export/legacy', methods=['POST'])
 def legacy_export_project_results(project_id):
     """Export final results for a project (with auto-merge if CSV exists)"""
@@ -4388,15 +4269,13 @@ def legacy_export_project_results(project_id):
         # Get project paths
         cards_path = project_manager.get_project_path(project_id, 'cards')
         cards_modified_path = project_manager.get_project_path(project_id, 'cards_modified')
-        project_path = project_manager.get_project_path(project_id)
-        
         if not cards_path or not cards_path.exists():
             return jsonify({'error': 'No cards folder found', 'success': False}), 404
         
         # Auto-merge: read tabular data directly from cards/mask_info.csv (always up to date)
         combined_csv_path = cards_path / 'mask_info.csv'
         if combined_csv_path.exists():
-            print(f"Found combined CSV, merging with classifications...")
+            print("Found combined CSV, merging with classifications...")
             try:
                 # Merge the CSVs
                 import pandas as pd
@@ -4449,7 +4328,7 @@ def legacy_export_project_results(project_id):
                     cards_modified_path.mkdir(exist_ok=True)
                     merged_path = cards_modified_path / 'merged_annotations.csv'
                     combined_df.to_csv(merged_path, index=False)
-                    print(f"No classifications found, using combined CSV as merged")
+                    print("No classifications found, using combined CSV as merged")
                     
             except Exception as e:
                 print(f"Warning: Auto-merge failed: {e}")
@@ -4519,7 +4398,6 @@ def legacy_export_project_results(project_id):
                 row_data = {'id': new_id_with_ext}
                 
                 # Try to find matching row in metadata
-                matched = False
                 if metadata_df is not None:
                     # Try different column names for matching
                     for col in ['mask_file', 'filename', 'Filename', 'file']:
@@ -4542,7 +4420,6 @@ def legacy_export_project_results(project_id):
                                     if metadata_col not in exclude_cols:
                                         row_data[metadata_col] = row[metadata_col]
                                 
-                                matched = True
                                 print(f"Matched {img_file.name} via column '{col}'")
                                 break
                 
@@ -4590,7 +4467,7 @@ def legacy_export_project_results(project_id):
                 
                 # Add metadata
                 zipf.write(metadata_temp_path, f"{acronym}_metadata.csv")
-                print(f"Added metadata CSV")
+                print("Added metadata CSV")
         
             # Send the ZIP file
             return send_file(

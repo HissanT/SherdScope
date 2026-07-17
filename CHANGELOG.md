@@ -12,6 +12,7 @@
 
 - Rebranded the active application interface, browser title, startup message, help link, and information panel from PyPotteryLens to SherdScope while retaining clear PyPotteryLens attribution and GPL licensing information.
 - Simplified the researcher CSV to 25 analysis fields by removing Figure Caption, Diameter Source, Drawing Page, Table Pages, Source PDF, and Link Status from final exports. The working linkage sidecar and CSV still retain provenance internally.
+- Split PDF rendering, processor configuration, scale/vessel sidecars, and researcher export routes into focused modules while retaining the existing imports, URLs, file formats, and behavior.
 
 ### Fixed
 
@@ -21,6 +22,8 @@
 - Removed a verified compact Type code from a preceding Fabric Interior token only when the original token geometrically crossed the column boundary.
 - Kept Actions, No., and Type headings visible during vertical table scrolling while allowing their body cells to scroll horizontally with the rest of each row.
 - Removed a global textarea minimum width that made the No. editor overflow its cell and visually touch the Type editor.
+- Removed the unreachable Post Processing JavaScript, hidden page markup, and unused Post Processing CSS after confirming that the script was not loaded and the workflow had already been replaced by Export.
+- Removed statically confirmed unused Python imports, local variables, and duplicate late imports without changing application logic.
 
 ### Tests
 

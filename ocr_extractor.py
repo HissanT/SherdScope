@@ -807,9 +807,6 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             bounds=bounds)
         if not anchors:
             return {"is_table": False, "rows": [], "boundary": boundary.as_dict()}
-        differences = [anchors[index+1][1].bbox[1] - anchors[index][1].bbox[1]
-                       for index in range(len(anchors)-1) if anchors[index+1][1].bbox[1] > anchors[index][1].bbox[1]]
-        default_gap = median(differences) if differences else data_image.height * .09
         rows = []
         warnings = ([] if boundary.column_source == "header_ocr" else [{
             "code": "column_header_fallback",

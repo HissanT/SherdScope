@@ -13,7 +13,6 @@ from metadata_linker import (
     MetadataLinker,
     StructuredExtractor,
     apply_approved_figures,
-    bbox_fingerprint,
     invalidate_linkage_for_card_changes,
     normalize_figure_id,
     normalize_vessel_number,

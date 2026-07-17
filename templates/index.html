@@ -801,49 +801,6 @@
                     <div id="tabular-status" class="status-message"></div>
                 </div>
 
-                <!-- Post Processing Tab -->
-                <div class="tab-content" id="postprocess-tab">
-                    <h2>🔍 Post Processing</h2>
-                    <p class="subtitle">Review and classify extracted cards from current project</p>
-
-                    <!-- Toolbar -->
-                    <div class="postprocess-toolbar">
-                        <div class="postprocess-toolbar-left">
-                            <span class="pp-count">🖼️ Cards: <span id="postprocess-image-count">0</span></span>
-                            <label class="switch-toggle">
-                                <input type="checkbox" id="auto-flip-vertical" checked>
-                                <span class="switch-track"><span class="switch-thumb"></span></span>
-                                Auto V-flip
-                            </label>
-                            <label class="switch-toggle">
-                                <input type="checkbox" id="auto-flip-horizontal" checked>
-                                <span class="switch-track"><span class="switch-thumb"></span></span>
-                                Auto H-flip
-                            </label>
-                        </div>
-                        <div class="postprocess-toolbar-right">
-                            <button class="btn btn-primary" id="process-all-btn">🔍 Process All Images</button>
-                            <button class="btn btn-primary" id="export-btn">📦 Export Results</button>
-                        </div>
-                    </div>
-                    <div class="progress-bar-wrapper" id="postprocess-progress-wrapper" style="margin-top: 0.75rem; display: none;">
-                        <div class="progress-bar" id="postprocess-progress-bar">0%</div>
-                    </div>
-                    <div id="postprocess-status" class="status-message"></div>
-
-                    <!-- Grid of pieces at real relative size -->
-                    <div id="postprocess-grid" class="postprocess-grid">
-                        <div class="pp-empty" id="postprocess-empty">Select a project, then click "Process All Images" to review the pieces here.</div>
-                    </div>
-
-                    <!-- Lightbox (zoom on click) -->
-                    <div id="postprocess-lightbox" class="postprocess-lightbox" style="display: none;">
-                        <span class="pp-lightbox-close" id="postprocess-lightbox-close">✕</span>
-                        <img id="postprocess-lightbox-img" alt="Card">
-                    </div>
-
-                </div>
-
                 <!-- Research Export Tab -->
                 <div class="tab-content" id="export-tab">
                     <div class="research-export-heading">
@@ -888,31 +845,6 @@
 
             </div>
         </main>
-
-        <!-- Export Dialog -->
-        <div id="export-dialog" class="dialog-overlay" style="display: none;">
-            <div class="dialog">
-                <div class="dialog-header">
-                    <h2>📦 Export Options</h2>
-                    <p>Configure your export settings</p>
-                </div>
-                <div class="dialog-body">
-                    <div class="form-group">
-                        <h3>🏷️ Basic Settings</h3>
-                        <label>Export Acronym</label>
-                        <input type="text" id="export-acronym" class="form-control"
-                            placeholder="Enter acronym (e.g., OSA_2024)...">
-                        <p class="info-text">Only letters, numbers, and underscores allowed</p>
-                    </div>
-
-                    <div id="export-dialog-status" class="status-message"></div>
-                </div>
-                <div class="dialog-footer">
-                    <button class="btn btn-secondary" id="export-cancel">❌ Cancel</button>
-                    <button class="btn btn-primary" id="export-confirm">📦 Export ZIP</button>
-                </div>
-            </div>
-        </div>
 
         <!-- Extract Masks Confirmation Dialog -->
         <div id="extract-confirm-dialog" class="dialog-overlay" style="display: none;">

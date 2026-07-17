@@ -160,7 +160,6 @@ def detect_hesban_scale(image_path: Path) -> dict[str, Any]:
         pad_y = max(2, int(candidate_height * 0.5))
         x1, x2 = max(0, x - pad_x), min(width, x + candidate_width + pad_x)
         y1, y2 = max(0, y - pad_y), min(height, y + candidate_height + pad_y)
-        crop = binary[y1:y2, x1:x2]
         structural_crop = binary[y:y + candidate_height, x:x + candidate_width]
         structural_crop, local_p1, local_p2 = _straighten_candidate(structural_crop)
         coverage = _long_row_coverage(structural_crop)

@@ -1,4 +1,4 @@
-"""Figure-to-table metadata linking for PyPotteryLens.
+"""Figure-to-table metadata linking for SherdScope.
 
 The module deliberately separates publication-layout rules, matching, persistence,
 and CSV application from the Flask/vision backend.  This keeps the research-data
@@ -9,7 +9,6 @@ source of truth.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
