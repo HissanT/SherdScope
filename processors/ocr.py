@@ -9,17 +9,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from itertools import combinations
 import json
 from pathlib import Path
 import re
 from statistics import median
 from typing import Any, Iterable, Optional
+import unicodedata
 
 import numpy as np
 import cv2
 from PIL import Image, ImageFilter, ImageOps
 
-from metadata_linker import (
+from catalog.linkage import (
     HESBAN_TABLE_COLUMNS,
     Hesban11Profile,
     StructuredExtractor,
@@ -126,20 +128,59 @@ def _prepare_compact_cell(image: Image.Image) -> Image.Image:
     return prepared
 
 
-def _compact_code(value: str) -> str:
-    """Return a short printed category code, or blank for noisy OCR output."""
-    compact = re.sub(r"\s+", "", value or "")
-    return compact if re.fullmatch(r"[A-Za-z][A-Za-z0-9./-]{0,7}", compact) else ""
+def _prepare_table_cell(
+        image: Image.Image,
+        keep_bounds: tuple[int, int, int, int] | list[int] | None = None,
+) -> Image.Image:
+    """Prepare a cell while retaining complete ink groups owned by that cell.
 
-
-def _remove_cross_column_code(value: str, code: str) -> str:
-    """Remove a verified next-column code from an OCR token crossing its edge."""
-    lines = (value or "").splitlines()
-    if not lines or not code:
-        return value or ""
-    lines[0] = re.sub(rf"{re.escape(code)}\s*$", "", lines[0],
-                      count=1, flags=re.IGNORECASE).rstrip()
-    return "\n".join(lines).strip()
+    ``image`` may include a small amount of its horizontal neighbours.  In
+    that case ``keep_bounds`` identifies the actual cell inside the expanded
+    image.  Letters are joined into local word-like ink groups only for the
+    ownership decision.  A group is retained by the cell containing its
+    horizontal centre, so a final letter crossing a calculated boundary is
+    not cut off or independently read by both cells.
+    """
+    gray = ImageOps.autocontrast(image.convert("L"), cutoff=1)
+    pixels = np.asarray(gray)
+    if keep_bounds is not None and len(keep_bounds) == 4:
+        dark = (pixels < 210).astype(np.uint8)
+        count, _, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+        heights = [int(stats[index, cv2.CC_STAT_HEIGHT])
+                   for index in range(1, count)
+                   if stats[index, cv2.CC_STAT_AREA] >= 3
+                   and stats[index, cv2.CC_STAT_HEIGHT] >= 3]
+        character_height = float(np.median(heights)) if heights else 20.0
+        join_width = max(3, min(11, round(character_height * .24)))
+        grouped = cv2.dilate(
+            dark, cv2.getStructuringElement(cv2.MORPH_RECT, (join_width, 1)))
+        group_count, labels, group_stats, _ = cv2.connectedComponentsWithStats(
+            grouped, 8)
+        keep_left, _, keep_right, _ = (int(value) for value in keep_bounds)
+        selected = np.zeros(group_count, dtype=bool)
+        for index in range(1, group_count):
+            left = int(group_stats[index, cv2.CC_STAT_LEFT])
+            width = int(group_stats[index, cv2.CC_STAT_WIDTH])
+            center_x = left + width / 2
+            selected[index] = keep_left <= center_x < keep_right
+        retained = dark.astype(bool) & selected[labels]
+        pixels = np.where(retained, pixels, 255).astype(np.uint8)
+        gray = Image.fromarray(pixels, mode="L")
+    ys, xs = np.where(pixels < 210)
+    if not len(xs) or not len(ys):
+        return Image.new("RGB", (128, 64), "white")
+    pad_x = max(4, round(gray.width * .025))
+    pad_y = max(4, round(gray.height * .025))
+    left = max(0, int(xs.min()) - pad_x)
+    right = min(gray.width, int(xs.max()) + pad_x + 1)
+    top = max(0, int(ys.min()) - pad_y)
+    bottom = min(gray.height, int(ys.max()) + pad_y + 1)
+    ink = gray.crop((left, top, right, bottom))
+    white_pad = max(8, round(min(ink.width, ink.height) * .12))
+    canvas = Image.new("L", (ink.width + white_pad * 2,
+                             ink.height + white_pad * 2), 255)
+    canvas.paste(ink, (white_pad, white_pad))
+    return _prepare_image(canvas, min_height=96)
 
 
 def _poly_bbox(poly: Any) -> tuple[float, float, float, float]:
@@ -248,8 +289,27 @@ class PaddleOCREngine:
         return parsed
 
 
+def _english_ocr_text(text: str) -> str:
+    """Keep printable English/ASCII OCR text without changing raw evidence.
+
+    Paddle's multilingual recognizer can occasionally return CJK or other
+    non-English glyphs for noisy printed symbols. Normalize full-width forms
+    first, then retain English letters, digits, whitespace, and ASCII symbols.
+    Raw OCRToken text remains untouched in diagnostics.
+    """
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return "".join(
+        character for character in normalized
+        if character in "\n\t" or 32 <= ord(character) <= 126
+    ).strip()
+
+
 def _tokens_to_text(tokens: list[OCRToken], minimum_score: float = 0.25) -> tuple[str, float]:
-    usable = [token for token in tokens if token.text and token.score >= minimum_score]
+    usable = [
+        OCRToken(_english_ocr_text(token.text), token.score, token.bbox)
+        for token in tokens
+        if _english_ocr_text(token.text) and token.score >= minimum_score
+    ]
     if not usable:
         return "", 0.0
     heights = [token.height for token in usable]
@@ -387,10 +447,6 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
                         for center in cls.PAGE_COLUMN_CENTERS)
         edges = [0.0] + [(centers[index] + centers[index+1]) / 2
                          for index in range(len(centers)-1)] + [1.0]
-        # Hesban's Man column is extremely narrow. The generic midpoint gave
-        # it too much space and let a merged ``W **`` token steal the Ext
-        # marks. Move only the Man/Ext divider slightly toward Man.
-        edges[16] = (.655 - cls.PAGE_TABLE_LEFT) / span
         return [(max(0, round(edges[index] * width)), min(width, round(edges[index+1] * width)))
                 for index in range(len(centers))]
 
@@ -415,8 +471,10 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         return max(scores, default=0.0)
 
     @classmethod
-    def _split_header_tokens(cls, tokens: list[OCRToken]) -> list[OCRToken]:
-        """Split OCR boxes such as ``No Type`` into usable word anchors."""
+    def _split_header_tokens(
+            cls, tokens: list[OCRToken],
+            header_image: Optional[Image.Image] = None) -> list[OCRToken]:
+        """Split merged headings using printed whitespace when it is clear."""
         known = {
             alias for aliases in cls.DIRECT_HEADER_ALIASES.values() for alias in aliases
         } | {
@@ -428,6 +486,14 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             normalized_parts = [cls._normalized_header_word(part) for part in parts]
             if (2 <= len(parts) <= 4 and
                     sum(part in known for part in normalized_parts) >= 2):
+                visual_boxes = cls._visual_header_word_boxes(
+                    header_image, token, parts) if header_image else None
+                if visual_boxes:
+                    output.extend(OCRToken(
+                        part, token.score,
+                        (left, token.bbox[1], right, token.bbox[3]))
+                        for part, (left, right) in zip(parts, visual_boxes))
+                    continue
                 total = sum(max(1, len(part)) for part in parts)
                 cursor = token.bbox[0]
                 span = token.bbox[2] - token.bbox[0]
@@ -444,9 +510,12 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
     @classmethod
     def _column_bounds_from_header(
             cls, tokens: list[OCRToken], width: int,
-            upper_rule_y: float) -> tuple[list[tuple[int, int]], str, list[dict[str, Any]]]:
+            upper_rule_y: float,
+            header_image: Optional[Image.Image] = None,
+            ) -> tuple[list[tuple[int, int]], str, list[dict[str, Any]]]:
         """Build this page's 22 columns from its actual two-level header."""
-        tokens = cls._split_header_tokens([token for token in tokens if token.text])
+        tokens = cls._split_header_tokens(
+            [token for token in tokens if token.text], header_image)
         tolerance = (max(5.0, median([token.height for token in tokens]) * .45)
                      if tokens else 5.0)
         upper_tokens = [token for token in tokens
@@ -651,7 +720,7 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             closing_y = closing[0] if closing else None
             data_bottom = closing_y if closing_y is not None else height
             column_bounds, column_source, header_anchors = self._column_bounds_from_header(
-                header_tokens, right-left, upper[0]-header_top)
+                header_tokens, right-left, upper[0]-header_top, header_crop)
             for anchor in header_anchors:
                 anchor["bbox"][1] += header_top
                 anchor["bbox"][3] += header_top
@@ -766,6 +835,112 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
                 selected[duplicate] = (number, token)
         return selected
 
+    @staticmethod
+    def _row_bounds(
+            anchors: list[tuple[str, OCRToken]], data_height: int
+            ) -> list[tuple[str, int, int]]:
+        """Partition the verified data area using the next printed No. anchor.
+
+        The first row starts exactly at the data-start rule. Each later row
+        starts at the same boundary where the preceding row ended, a few
+        pixels before the next printed number. The final row ends at the
+        verified closing rule (the bottom of ``data_image``).
+        """
+        if not anchors or data_height <= 0:
+            return []
+        starts = [0]
+        for _, token in anchors[1:]:
+            boundary = max(starts[-1] + 1, round(token.bbox[1] - 3))
+            starts.append(min(data_height, boundary))
+        output = []
+        for index, (number, _) in enumerate(anchors):
+            top = min(starts[index], max(0, data_height - 1))
+            bottom = starts[index + 1] if index + 1 < len(starts) else data_height
+            output.append((number, top, min(data_height, max(top + 1, bottom))))
+        if len(output) > 1:
+            # The final row otherwise consumes every pixel down to the closing
+            # rule. On pages with a large blank tail this can make its crops
+            # several times taller than any printed row. Cap only that final
+            # row, using this page's earlier rows as the scale reference and a
+            # generous floor so legitimate multiline rows are unaffected.
+            previous_heights = [bottom - top for _, top, bottom in output[:-1]]
+            typical_height = float(np.median(previous_heights))
+            height_cap = round(max(
+                300.0,
+                typical_height * 1.5,
+                max(previous_heights) * 1.5,
+            ))
+            number, top, bottom = output[-1]
+            if bottom - top > height_cap:
+                output[-1] = (number, top, min(data_height, top + height_cap))
+        return output
+
+    @staticmethod
+    def _visual_header_word_boxes(
+            image: Image.Image, token: OCRToken,
+            words: list[str]) -> Optional[list[tuple[float, float]]]:
+        """Locate words inside one OCR box from large vertical ink gaps."""
+        word_count = len(words)
+        left = max(0, int(np.floor(token.bbox[0])))
+        right = min(image.width, int(np.ceil(token.bbox[2])))
+        top = max(0, int(np.floor(token.bbox[1])))
+        bottom = min(image.height, int(np.ceil(token.bbox[3])))
+        if word_count < 2 or right - left < word_count * 4 or bottom <= top:
+            return None
+        gray = np.asarray(ImageOps.autocontrast(
+            image.crop((left, top, right, bottom)).convert("L"), cutoff=1))
+        dark = gray < 190
+        # A token box can graze a printed rule. Remove nearly continuous rows
+        # so a rule cannot hide the whitespace between the heading words.
+        dark[dark.mean(axis=1) > .65, :] = False
+        minimum_column_ink = max(1, round(dark.shape[0] * .06))
+        active = np.where(dark.sum(axis=0) >= minimum_column_ink)[0]
+        if not len(active):
+            return None
+        runs: list[tuple[int, int]] = []
+        start = previous = int(active[0])
+        for value in active[1:]:
+            value = int(value)
+            if value > previous + 1:
+                runs.append((start, previous))
+                start = value
+            previous = value
+        runs.append((start, previous))
+        if len(runs) < word_count:
+            return None
+        minimum_word_gap = max(3, round(dark.shape[0] * .12))
+        word_groups: list[tuple[int, int]] = []
+        group_start, group_end = runs[0]
+        for current, following in zip(runs, runs[1:]):
+            gap = following[0] - current[1] - 1
+            if gap >= minimum_word_gap:
+                word_groups.append((group_start, current[1]))
+                group_start = following[0]
+            group_end = following[1]
+        word_groups.append((group_start, group_end))
+        if len(word_groups) < word_count:
+            return None
+        weights = [max(1, len(cls_word)) for cls_word in words]
+        total_weight = sum(weights)
+        cumulative = 0
+        expected_centers = []
+        for weight in weights:
+            expected_centers.append(
+                dark.shape[1] * (cumulative + weight / 2) / total_weight)
+            cumulative += weight
+        candidates = []
+        for indexes in combinations(range(len(word_groups)), word_count):
+            selected = [word_groups[index] for index in indexes]
+            score = sum(abs((group[0] + group[1]) / 2 - expected)
+                        for group, expected in zip(selected, expected_centers))
+            candidates.append((score, selected))
+        score, selected = min(candidates, key=lambda item: item[0])
+        maximum_average_error = max(dark.shape[1] * .15, dark.shape[0] * 1.5)
+        if score / word_count > maximum_average_error:
+            return None
+        return [(left + group_left, left + group_right + 1)
+                for group_left, group_right in selected]
+
     def extract_table(self, image_path: Path, crop: Optional[tuple[int, int, int, int]],
                       figure_id: str, expected_numbers: list[str],
                       page_context: dict[str, Any]) -> dict[str, Any]:
@@ -803,131 +978,185 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         # the explicitly missing numbers.
         anchors = self._row_anchors(
             data_image, expected_numbers, page_tokens,
-            restrict_to_expected=bool(page_context.get("retry_missing")),
-            bounds=bounds)
+            restrict_to_expected=False, bounds=bounds)
         if not anchors:
             return {"is_table": False, "rows": [], "boundary": boundary.as_dict()}
+        row_bounds = self._row_bounds(anchors, data_image.height)
+        requested_numbers = {
+            normalize_vessel_number(number) for number in expected_numbers
+        } if page_context.get("retry_missing") else set()
         rows = []
         warnings = ([] if boundary.column_source == "header_ocr" else [{
             "code": "column_header_fallback",
             "message": (f"Figure {figure_id} used fallback column widths because "
                         "the printed subheadings were not read reliably."),
         }])
-        refinement_images = []
-        refinement_targets: list[tuple[dict[str, str], str, Optional[dict[str, Any]]]] = []
-        interior_overlap_rows: set[int] = set()
+        cell_images: list[Image.Image] = []
+        cell_targets: list[tuple[dict[str, str], str, dict[str, Any]]] = []
         ocr_diagnostics: list[dict[str, Any]] = []
-        for index, (number, token) in enumerate(anchors):
-            row_top = max(0, round(token.bbox[1] - 4))
-            if index+1 < len(anchors):
-                row_bottom = max(row_top+5, round(anchors[index+1][1].bbox[1] - 3))
-            else:
-                row_bottom = data_image.height
+        cell_diagnostics: list[dict[str, Any]] = []
+        for (number, anchor_token), (_, row_top, row_bottom) in zip(
+                anchors, row_bounds):
+            if requested_numbers and number not in requested_numbers:
+                continue
             row = {column: "" for column in HESBAN_TABLE_COLUMNS}
-            row["table_no"] = number
-            for column_index, (column, (x1, x2)) in enumerate(
-                    zip(HESBAN_TABLE_COLUMNS[1:], bounds[1:]), start=1):
+            for column, (x1, x2) in zip(HESBAN_TABLE_COLUMNS, bounds):
                 cell_tokens = [item for item in page_tokens
                                if x1 <= item.center_x < x2
                                and row_top <= item.center_y < row_bottom]
-                value, confidence = _tokens_to_text(cell_tokens)
-                row[column] = value
-                if (column_index == 8 and
-                        any(item.bbox[2] > bounds[9][0] for item in cell_tokens)):
-                    interior_overlap_rows.add(id(row))
-                if value and confidence < .45:
-                    warnings.append({
-                        "code": "low_ocr_confidence",
-                        "message": f"Review figure {figure_id}, row {number}, field {column}.",
-                    })
-            # Whole-page OCR often skips repeated Type words and joins narrow
-            # adjacent columns (Pail/Reg and Man/Surface Ext). Re-read those
-            # cells independently in one batch.
-            for column_index in (1, 4, 5, 9, 15, 16):
-                column = HESBAN_TABLE_COLUMNS[column_index]
-                x1, x2 = bounds[column_index]
-                diagnostic = None
-                if column_index == 9:
-                    # Typ is a short row-level code printed on the first text
-                    # line. The complete row can be hundreds of pixels tall
-                    # because Size/Shape cells wrap over many lines. Restrict
-                    # the retry around the row-number baseline so lower-line
-                    # fragments from neighboring columns cannot become h/1/7.
-                    inset = max(2, round((x2 - x1) * .08))
-                    band_top = max(row_top, round(token.center_y - token.height * .9))
-                    band_bottom = min(
-                        row_bottom,
-                        max(band_top + 8, round(token.center_y + token.height * 1.1)),
-                    )
-                    crop_x1, crop_x2 = x1 + inset, x2 - inset
-                    cell_image = data_image.crop(
-                        (crop_x1, band_top, crop_x2, band_bottom))
-                    overlapping = [
-                        item for item in page_tokens
-                        if item.bbox[2] > x1 and item.bbox[0] < x2
-                        and row_top <= item.center_y < row_bottom
-                    ]
-                    diagnostic = {
-                        "row": number,
-                        "field": column,
-                        "crop": [
-                            boundary.left + crop_x1 + crop_left,
-                            boundary.data_top + band_top + crop_top,
-                            boundary.left + crop_x2 + crop_left,
-                            boundary.data_top + band_bottom + crop_top,
-                        ],
-                        "page_overlap_tokens": [{
-                            "text": item.text, "confidence": round(item.score, 4),
-                            "bbox": [
-                                round(boundary.left + item.bbox[0] + crop_left),
-                                round(boundary.data_top + item.bbox[1] + crop_top),
-                                round(boundary.left + item.bbox[2] + crop_left),
-                                round(boundary.data_top + item.bbox[3] + crop_top),
-                            ],
-                        } for item in overlapping],
-                    }
-                    prepared = _prepare_compact_cell(cell_image)
-                else:
-                    cell_image = data_image.crop(
-                        (x1, row_top, x2, max(row_top + 1, row_bottom)))
-                    prepared = _prepare_image(cell_image, min_height=100)
-                refinement_images.append(prepared)
-                refinement_targets.append((row, column, diagnostic))
+                # The row anchor is already trusted whole-table evidence used
+                # to create this row. Component recovery can find an anchor
+                # that the general page detector omitted, so retain that
+                # evidence in the calculated No. cell instead of later
+                # allowing an empty isolated-cell read to erase the row key.
+                if column == "table_no" and not any(
+                        normalize_vessel_number(item.text) == number
+                        and abs(item.center_y - anchor_token.center_y) < 18
+                        for item in cell_tokens):
+                    cell_tokens.append(anchor_token)
+                interpreted_cell_tokens = []
+                row_prefix_removed = False
+                for item in cell_tokens:
+                    interpreted_text = item.text
+                    leading = _leading_row_number(interpreted_text)
+                    # Whole-table OCR can merge the printed row anchor with
+                    # the first value to its right (for example ``15 Jug``).
+                    # If that raw token physically crosses into this cell and
+                    # begins with this row's established anchor, remove only
+                    # the structural prefix from the interpreted candidate.
+                    # The immutable raw token remains in initial_tokens below.
+                    if (column != "table_no" and item.bbox[0] < x1 and leading
+                            and normalize_vessel_number(leading.group(1)) == number):
+                        interpreted_text = interpreted_text[leading.end():].strip()
+                        row_prefix_removed = True
+                    if interpreted_text:
+                        interpreted_cell_tokens.append(OCRToken(
+                            interpreted_text, item.score, item.bbox))
+                page_value, page_confidence = _tokens_to_text(
+                    interpreted_cell_tokens)
+                safe_page_tokens = []
+                for item in cell_tokens:
+                    token_left, token_top, token_right, token_bottom = item.bbox
+                    token_width = max(1.0, token_right - token_left)
+                    token_height = max(1.0, token_bottom - token_top)
+                    horizontal_overlap = max(
+                        0.0, min(token_right, x2) - max(token_left, x1))
+                    vertical_overlap = max(
+                        0.0, min(token_bottom, row_bottom)
+                        - max(token_top, row_top))
+                    if (horizontal_overlap / token_width >= .8
+                            and vertical_overlap / token_height >= .8):
+                        safe_page_tokens.append(item)
+                safe_interpreted_tokens = []
+                for item in safe_page_tokens:
+                    interpreted = next((candidate for candidate in interpreted_cell_tokens
+                                        if candidate.bbox == item.bbox
+                                        and candidate.score == item.score), None)
+                    if interpreted is not None:
+                        safe_interpreted_tokens.append(interpreted)
+                safe_page_value, safe_page_confidence = _tokens_to_text(
+                    safe_interpreted_tokens)
+                expansion = max(8, min(48, round((x2 - x1) * .3)))
+                expanded_left = max(0, x1 - expansion)
+                expanded_right = min(data_image.width, x2 + expansion)
+                cell_image = data_image.crop(
+                    (expanded_left, row_top, expanded_right, row_bottom))
+                keep_bounds = [
+                    x1 - expanded_left, 0, x2 - expanded_left,
+                    row_bottom - row_top,
+                ]
+                cell_debug = {
+                    "row": number,
+                    "field": column,
+                    "crop": [x1, row_top, x2, row_bottom],
+                    "initial_text": page_value,
+                    "initial_confidence": round(page_confidence, 4),
+                    "initial_tokens": [{
+                        "text": item.text,
+                        "confidence": round(item.score, 4),
+                        "bbox": [round(value) for value in item.bbox],
+                    } for item in cell_tokens],
+                    "focused_crop": [expanded_left, row_top,
+                                     expanded_right, row_bottom],
+                    "focused_keep_bounds": keep_bounds,
+                    "focused_preparation": "generic_cell",
+                    "safe_initial_text": safe_page_value,
+                    "safe_initial_confidence": round(safe_page_confidence, 4),
+                    "initial_row_prefix_removed": row_prefix_removed,
+                    "accepted_text": "",
+                    "accepted_source": "cell_pass",
+                }
+                cell_diagnostics.append(cell_debug)
+                cell_images.append(_prepare_table_cell(cell_image, keep_bounds))
+                cell_targets.append((row, column, cell_debug))
             rows.append(row)
-        for (row, column, diagnostic), tokens in zip(
-                refinement_targets, self.engine.recognize_many(refinement_images)):
+        for (row, column, cell_debug), tokens in zip(
+                cell_targets, self.engine.recognize_many(cell_images)):
             value, confidence = _tokens_to_text(tokens)
-            if column == "nonplastics_type":
-                accepted = _compact_code(value)
-                if accepted:
-                    row[column] = accepted
-                    if id(row) in interior_overlap_rows:
-                        row["fabric_interior"] = _remove_cross_column_code(
-                            row.get("fabric_interior", ""), accepted)
-                if diagnostic is not None:
-                    diagnostic.update({
-                        "retry_tokens": [{
-                            "text": item.text,
-                            "confidence": round(item.score, 4),
-                            "bbox": [round(value) for value in item.bbox],
-                        } for item in tokens],
-                        "raw_text": value,
-                        "confidence": round(confidence, 4),
-                        "accepted_value": accepted,
-                        "status": "accepted" if accepted else "needs_review",
-                    })
-                    ocr_diagnostics.append(diagnostic)
-            elif value:
-                row[column] = value
-        # If the page-level OCR merged No. into Type and the isolated retry was
-        # empty, keep the useful type text but remove the duplicated row ID.
-        for row in rows:
-            value = row.get("table_type", "")
-            number = re.escape(row.get("table_no", ""))
-            if value and number:
-                row["table_type"] = re.sub(
-                    rf"^\s*{number}\s*[.)]?\s*", "", value, count=1,
-                    flags=re.IGNORECASE).strip()
+            accepted = value
+            accepted_source = "cell_pass"
+            page_value = cell_debug["initial_text"]
+            page_confidence = cell_debug["initial_confidence"]
+            normalized_page = re.sub(r"\s+", " ", page_value).strip().casefold()
+            normalized_cell = re.sub(r"\s+", " ", value).strip().casefold()
+            normalized_safe_page = re.sub(
+                r"\s+", " ", cell_debug["safe_initial_text"]).strip().casefold()
+            page_geometry_is_reliable = (
+                normalized_page == normalized_safe_page
+                or cell_debug["initial_row_prefix_removed"])
+            # Once the whole-table pass has assigned a token to this cell by
+            # centre and reads it above 75%, geometry uncertainty alone must
+            # not let a noisy isolated-cell result win. A disagreement can
+            # override this page candidate only when the cell pass itself is
+            # at least 90% confident.
+            page_is_strong = bool(page_value) and page_confidence > .75
+            cell_is_strong = bool(value) and confidence >= .90
+            if not value and page_value and page_confidence > .75:
+                # A blank isolated-cell result carries no competing reading.
+                # Prefer the strong whole-table token even when its box
+                # touches a calculated boundary; otherwise repeated symbols
+                # such as ** disappear solely because the small-crop detector
+                # did not emit a token.
+                accepted = page_value
+                accepted_source = "page_pass_blank_cell"
+            elif page_is_strong and (not cell_is_strong
+                                     or normalized_page == normalized_cell):
+                accepted = page_value
+                accepted_source = "page_pass"
+            elif (not accepted and page_value and page_confidence >= .5
+                  and page_geometry_is_reliable):
+                accepted = page_value
+                accepted_source = "page_pass_fallback"
+            if column == "table_no":
+                # This value is the page-level row anchor that created the
+                # row and its boundaries. Re-reading the same printed digit in
+                # a tiny isolated crop must not be allowed to erase or rename
+                # that already established row identity.
+                accepted = cell_debug["row"]
+                accepted_source = "row_anchor"
+            normalizations = []
+            if column == "fire" and "0" in accepted:
+                accepted = accepted.replace("0", "O")
+                normalizations.append("fire_zero_to_letter_o")
+            row[column] = accepted
+            cell_debug.update({
+                "focused_text": value,
+                "focused_confidence": round(confidence, 4),
+                "focused_token_space": "prepared_crop",
+                "focused_tokens": [{
+                    "text": item.text,
+                    "confidence": round(item.score, 4),
+                    "bbox": [round(coordinate) for coordinate in item.bbox],
+                } for item in tokens],
+                "accepted_text": accepted,
+                "accepted_source": accepted_source,
+                "normalizations": normalizations,
+            })
+            if value and confidence < .45:
+                warnings.append({
+                    "code": "low_ocr_confidence",
+                    "message": f"Review figure {figure_id}, row {cell_debug['row']}, field {column}.",
+                })
         boundary_data = boundary.as_dict()
         # Evidence coordinates are stored in original-page space even when the
         # linker supplied a same-page crop below the drawings.
@@ -950,6 +1179,45 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
                 anchor["bbox"][2] + boundary.left + crop_left,
                 anchor["bbox"][3] + crop_top,
             ]
+        boundary_data["row_bounds"] = [{
+            "row": number,
+            "top": boundary.data_top + top + crop_top,
+            "bottom": boundary.data_top + bottom + crop_top,
+        } for number, top, bottom in row_bounds]
+        if row_bounds:
+            natural_last_bottom = boundary.data_top + data_image.height + crop_top
+            capped_last_bottom = boundary.data_top + row_bounds[-1][2] + crop_top
+            boundary_data["last_row_cap"] = {
+                "applied": capped_last_bottom < natural_last_bottom,
+                "uncapped_bottom": natural_last_bottom,
+                "accepted_bottom": capped_last_bottom,
+                "accepted_height": row_bounds[-1][2] - row_bounds[-1][1],
+            }
+        page_x = boundary.left + crop_left
+        page_y = boundary.data_top + crop_top
+        for cell in cell_diagnostics:
+            for crop_key in ("crop", "focused_crop"):
+                crop_box = cell.get(crop_key, [])
+                if len(crop_box) == 4:
+                    cell[crop_key] = [
+                        crop_box[0] + page_x,
+                        crop_box[1] + page_y,
+                        crop_box[2] + page_x,
+                        crop_box[3] + page_y,
+                    ]
+            for token_data in cell.get("initial_tokens", []):
+                token_bbox = token_data.get("bbox", [])
+                if len(token_bbox) == 4:
+                    token_data["bbox"] = [
+                        token_bbox[0] + page_x,
+                        token_bbox[1] + page_y,
+                        token_bbox[2] + page_x,
+                        token_bbox[3] + page_y,
+                    ]
+        # Temporary development evidence used by the cell-grid inspector.
+        # It intentionally stays inside boundary metadata and is not exported
+        # to the researcher-facing CSV.
+        boundary_data["cell_diagnostics"] = cell_diagnostics
         return {
             "is_table": True,
             "figure_id": page_context.get("figure_id", ""),

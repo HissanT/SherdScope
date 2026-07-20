@@ -5,8 +5,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SherdScope - Archaeological Pottery Documentation Tool</title>
+    <script>window.SHERDSCOPE_OCR_CELL_DEBUG = {{ ocr_cell_debug|default(false)|tojson }};</script>
     <link rel="icon" href="/static/imgs/sherdscope-logo.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/static/css/style.css?v=20260716">
+    <link rel="stylesheet" href="/static/css/style.css?v=20260716-2">
     <style>
         /* Splash Screen Styles */
         .splash-screen {
@@ -413,12 +414,7 @@
                         <p class="info-text">Enable if each PDF page contains two actual pages (left and right).</p>
                     </div>
 
-                    <div class="form-group">
-                        <label for="pdf-render-dpi">PDF rendering quality (DPI)</label>
-                        <input type="number" id="pdf-render-dpi" class="form-control"
-                               min="200" max="600" step="25" value="400">
-                        <p class="info-text">400 DPI is recommended for Hesban's small numbers and dense tables. Higher values use more memory, disk space, and processing time.</p>
-                    </div>
+                    <p class="info-text">PDF pages are rendered at 400 DPI for consistent masks, OCR coordinates, and measurements.</p>
 
                     <div class="result-section">
                         <label>Upload Info</label>
@@ -883,11 +879,11 @@
     <!-- Scripts -->
     <script src="/static/js/utils.js?v=20251024163500"></script>
     <script src="/static/js/project-tab.js?v=20251024163500"></script>
-    <script src="/static/js/pdf-tab.js?v=20251024163500"></script>
+    <script src="/static/js/pdf-tab.js?v=20260719"></script>
     <script src="/static/js/model-tab.js?v=20251024163500"></script>
     <script src="/static/js/annotation-tab.js?v=20251024163500"></script>
-    <script src="/static/js/tabular-tab.js?v=20260716"></script>
-    <script src="/static/js/export-tab.js?v=20260716"></script>
+    <script src="/static/js/tabular-tab.js?v=20260719"></script>
+    <script src="/static/js/export-tab.js?v=20260719"></script>
     <script src="/static/js/main.js?v=20260716"></script>
 </body>
 

@@ -2249,7 +2249,7 @@ body {
 .metadata-link-pages { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: .65rem; }
 .metadata-link-pages img { width: 100%; max-height: 260px; object-fit: contain; background: white; border-radius: 6px; border: 1px solid #475569; }
 .metadata-link-drawings { margin-top: .7rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: .55rem; }
-.metadata-link-number-workspace { position: sticky; top: 48px; max-height: 230px; overflow: auto; margin-top: .75rem; padding: .7rem; border: 1px solid #475569; border-radius: 7px; background: #101827; z-index: 6; }
+.metadata-link-number-workspace { position: sticky; top: 48px; max-height: 440px; overflow: auto; margin-top: .75rem; padding: .7rem; border: 1px solid #475569; border-radius: 7px; background: #101827; z-index: 6; }
 .metadata-link-number-workspace p { margin: .2rem 0 .5rem; color: #94a3b8; font-size: .76rem; }
 .metadata-link-drawing { display: grid; grid-template-columns: minmax(92px, .8fr) minmax(150px, 1.2fr); gap: .45rem; align-items: end; padding: .55rem; font-size: .76rem; color: #cbd5e1; border: 1px solid #334155; border-radius: 6px; }
 .metadata-link-drawing label { display: grid; gap: .25rem; }
@@ -2279,11 +2279,14 @@ body {
 .metadata-link-table-scroll-top { border-top: 1px solid #475569; }
 .metadata-link-table-scroll-bottom { border-bottom: 1px solid #475569; border-radius: 0 0 7px 7px; }
 .metadata-link-table-wrap { overflow: auto; max-height: 620px; border-inline: 1px solid #475569; background: #0b1220; }
-.metadata-link-table { --actions-width: 84px; --no-width: 78px; --type-width: 160px; border-collapse: separate; border-spacing: 0; min-width: 3020px; width: 100%; font-size: .82rem; table-layout: fixed; }
+.metadata-link-table { --actions-width: 84px; --no-width: 78px; --type-width: 160px; --group-header-height: 42px; --sub-header-height: 48px; border-collapse: separate; border-spacing: 0; min-width: 3020px; width: 100%; font-size: .82rem; table-layout: fixed; }
 .metadata-link-table th, .metadata-link-table td { box-sizing: border-box; border-right: 1px solid #475569; border-bottom: 1px solid #475569; padding: .4rem; vertical-align: top; min-width: 105px; }
 .metadata-link-table th { position: sticky; z-index: 3; background: #243247; color: #f1f5f9; text-align: center; font-weight: 650; }
-.metadata-link-table .metadata-link-group-header th { top: 0; height: 34px; }
-.metadata-link-table .metadata-link-sub-header th { top: 34px; background: #1e293b; }
+.metadata-link-table .metadata-link-group-header { height: var(--group-header-height); }
+.metadata-link-table .metadata-link-sub-header { height: var(--sub-header-height); }
+.metadata-link-table .metadata-link-group-header th { top: 0; height: var(--group-header-height); min-height: var(--group-header-height); vertical-align: middle; }
+.metadata-link-table .metadata-link-group-header th[rowspan="2"] { height: calc(var(--group-header-height) + var(--sub-header-height)); min-height: calc(var(--group-header-height) + var(--sub-header-height)); vertical-align: middle; }
+.metadata-link-table .metadata-link-sub-header th { top: var(--group-header-height); height: var(--sub-header-height); min-height: var(--sub-header-height); vertical-align: middle; background: #1e293b; }
 .metadata-link-table tbody tr:nth-child(even) td { background: #162033; }
 .metadata-link-table tbody tr:nth-child(odd) td { background: #101827; }
 .metadata-link-table textarea { width: 100%; min-width: 92px; min-height: 48px; resize: vertical; overflow: hidden; box-sizing: border-box; padding: .42rem; line-height: 1.35; background: #0f172a; color: #f1f5f9; border: 1px solid transparent; border-radius: 4px; }
@@ -2404,6 +2407,8 @@ body {
 #tabular-tab .metadata-link-table th {
     color: #172033 !important;
     background-color: #eef2f6 !important;
+    line-height: 1.2;
+    white-space: nowrap;
 }
 #tabular-tab .metadata-link-table thead .sticky-col {
     position: sticky !important;
@@ -2492,8 +2497,51 @@ body {
     overflow-wrap: anywhere;
     font-size: .8rem;
 }
+.metadata-cell-debug {
+    margin: 1rem 0;
+    padding: .8rem;
+    color: #344054;
+    background: #fff7ed;
+    border: 1px dashed #f97316;
+    border-radius: 8px;
+}
+.metadata-cell-debug > summary { cursor: pointer; color: #9a3412; font-weight: 750; }
+.metadata-cell-debug > p { margin: .65rem 0; color: #7c2d12; font-size: .84rem; }
+.metadata-cell-debug-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(125px, 1fr));
+    gap: .4rem;
+    max-height: 420px;
+    overflow: auto;
+}
+.metadata-cell-debug-button {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: .15rem .4rem;
+    min-width: 0;
+    padding: .45rem;
+    text-align: left;
+    background: #fff;
+    border: 1px solid #fed7aa;
+    border-radius: 5px;
+}
+.metadata-cell-debug-button span,
+.metadata-cell-debug-button small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metadata-cell-debug-button small { grid-column: 1 / -1; color: #667085; }
+.metadata-cell-debug-dialog { width: min(920px, 92vw); max-height: 88vh; padding: 1rem; border: 1px solid #d0d5dd; border-radius: 9px; }
+.metadata-cell-debug-dialog::backdrop { background: rgba(15, 23, 42, .65); }
+.metadata-cell-debug-dialog form { display: flex; justify-content: flex-end; }
+.metadata-cell-debug-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; }
+.metadata-cell-debug-images figure { margin: 0; min-width: 0; }
+.metadata-cell-debug-images figcaption { margin-bottom: .3rem; font-weight: 650; }
+.metadata-cell-debug-images img { width: 100%; min-height: 90px; max-height: 300px; object-fit: contain; background: #fff; border: 1px solid #d0d5dd; }
+.metadata-cell-debug-dialog dl { display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: .35rem .7rem; }
+.metadata-cell-debug-dialog dt { font-weight: 700; }
+.metadata-cell-debug-dialog dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 @media (max-width: 700px) {
     .metadata-ocr-diagnostic-card { grid-template-columns: 1fr; }
+    .metadata-cell-debug-images { grid-template-columns: 1fr; }
+    .metadata-cell-debug-dialog dl { grid-template-columns: 1fr; }
 }
 @media (max-width: 900px) {
     #tabular-tab .metadata-link-figures { grid-template-columns: 1fr !important; }

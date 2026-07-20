@@ -12,7 +12,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const uploadInput = document.getElementById('pdf-upload');
     const uploadBtn = document.getElementById('pdf-upload-btn');
     const splitPagesCheckbox = document.getElementById('split-pages');
-    const renderDpiInput = document.getElementById('pdf-render-dpi');
     const pdfSelectedInfo = document.getElementById('pdf-selected-info');
     const pdfStatus = 'pdf-status';
 
@@ -92,10 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
             window.PyPotteryUtils.showLoading('Uploading and processing PDF...');
 
             const splitPages = splitPagesCheckbox ? splitPagesCheckbox.checked : false;
-            const renderDpi = renderDpiInput ? Number.parseInt(renderDpiInput.value, 10) : 400;
-            if (!Number.isInteger(renderDpi) || renderDpi < 200 || renderDpi > 600) {
-                throw new Error('PDF rendering DPI must be a whole number between 200 and 600.');
-            }
+            const renderDpi = 400;
 
             // Use uploadFile helper: it will append fields to FormData
             const data = await window.PyPotteryUtils.uploadFile(file, '/api/pdf/upload', {

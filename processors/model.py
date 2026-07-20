@@ -1,3 +1,5 @@
+"""Neural-network architecture used by the classification processor."""
+
 import timm
 import torch
 import torch.nn as nn

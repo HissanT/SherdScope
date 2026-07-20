@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 from flask import jsonify, request, send_file
 
-from research_export import (
+from catalog.export import (
     build_export,
     csv_bytes,
     dataset_zip_bytes,

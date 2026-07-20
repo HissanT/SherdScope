@@ -1,4 +1,4 @@
-# utils.py
+"""Image detection, extraction, annotation, classification, and export stages."""
 
 import numpy as np
 import os
@@ -15,31 +15,25 @@ from scipy.ndimage import binary_dilation, binary_erosion
 from typing import Dict, List, Optional
 import torch
 import torchvision.transforms as transforms
-from models import MultiHeadEfficientNet
+from processors.model import MultiHeadEfficientNet
 import shutil
 from reportlab.lib import pagesizes
 from reportlab.pdfgen import canvas
 import gc
 
-from metadata_linker import (
+from catalog.linkage import (
     ALL_LINKAGE_STORAGE_COLUMNS, invalidate_linkage_for_card_changes, mask_stem, parse_bbox,
 )
 from processors import (
     AnnotationConfig,
     MaskExtractionConfig,
     ModelConfig,
-    PDFConfig as PDFConfig,
-    PDFProcessor as PDFProcessor,
     TabularConfig,
 )
-from sidecars import (
-    SCALE_SIDECAR_SUFFIX as SCALE_SIDECAR_SUFFIX,
-    VESSELS_SIDECAR_SUFFIX as VESSELS_SIDECAR_SUFFIX,
-    _assign_px_per_cm,
+from catalog.sidecars import (
+    assign_px_per_cm,
     read_scale_sidecar,
     read_vessels_sidecar,
-    write_scale_sidecar as write_scale_sidecar,
-    write_vessels_sidecar as write_vessels_sidecar,
 )
 
 
@@ -591,7 +585,7 @@ class MaskExtractor:
                     metadata.append((base_filename, mask_stem))
                     annotations.append((bbox, output_filename))
                     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                    ratio = _assign_px_per_cm(scales, (cx, cy))
+                    ratio = assign_px_per_cm(scales, (cx, cy))
                     if ratio is not None:
                         px_per_cm_map[mask_stem] = ratio
 
@@ -610,7 +604,7 @@ class MaskExtractor:
                     metadata.append((base_filename, mask_stem))
                     annotations.append((bbox, output_filename))
                     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                    ratio = _assign_px_per_cm(scales, (cx, cy))
+                    ratio = assign_px_per_cm(scales, (cx, cy))
                     if ratio is not None:
                         px_per_cm_map[mask_stem] = ratio
                     next_index += 1
@@ -1377,45 +1371,6 @@ class SecondStepProcessor:
             print(f"Error updating results: {str(e)}")
             raise e
         
-
-def download_model(url: str = 'https://huggingface.co/lrncrd/PyPotteryLens/resolve/main/BasicModelv8_v01.pt', 
-                  dest_path: str = 'models_vision/BasicModelv8_v01.pt') -> bool:
-    """Download model file from url to specified path"""
-    try:
-        import os
-        import requests
-        from pathlib import Path
-
-        dest_path = Path(dest_path)
-        os.makedirs(dest_path.parent, exist_ok=True)
-        
-        if dest_path.exists():
-            print('[✓] Model already exists in models_vision directory')
-            return True
-            
-        print(f'[*] Downloading model from {url}...')
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024
-        downloaded = 0
-        
-        with open(dest_path, 'wb') as f:
-            for data in response.iter_content(block_size):
-                downloaded += len(data)
-                f.write(data)
-                if total_size > 0:
-                    percent = int((downloaded / total_size) * 100)
-                    print(f'\r[*] Download progress: {percent}% ({downloaded}/{total_size} bytes)', end='')
-                    
-        print('\n[✓] Model downloaded successfully')
-        return True
-        
-    except Exception as e:
-        print(f'\n[!] Error downloading model: {str(e)}')
-        return False
-    
 
 @dataclass
 class ExportConfig:

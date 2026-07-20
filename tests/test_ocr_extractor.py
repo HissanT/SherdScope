@@ -1,10 +1,15 @@
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw
 
-from ocr_extractor import (
+from catalog.linkage import HESBAN_TABLE_COLUMNS
+from processors.ocr import (
     OCRToken,
     PaddleOCRStructuredExtractor,
+    _english_ocr_text,
     _parse_v3_result,
-    _remove_cross_column_code,
+    _prepare_table_cell,
+    _tokens_to_text,
 )
 
 
@@ -17,6 +22,13 @@ class DrawingEngine:
 
 
 class TableEngine:
+    cell_rows = [
+        {"table_no": "1", "table_type": "Pithos", "table_locus": "143",
+         "nonplastics_type": "L"},
+        {"table_no": "2", "table_type": "Bowl", "table_locus": "144",
+         "nonplastics_type": "L"},
+    ]
+
     def recognize(self, image):
         if image.height < 220:
             headings = ["No.", "Type", "Sq", "Loc", "Fabric Color", "Non-Plastics",
@@ -33,10 +45,27 @@ class TableEngine:
         return []
 
     def recognize_many(self, images):
+        images = list(images)
+        if images and len(images) % 22 == 0:
+            row_count = len(images) // 22
+            selected_rows = (self.cell_rows if row_count == len(self.cell_rows)
+                             else self.cell_rows[-row_count:])
+            output = []
+            columns = list(HESBAN_TABLE_COLUMNS)
+            for row in selected_rows:
+                for column in columns:
+                    value = row.get(column, "")
+                    output.append([OCRToken(value, .97, (10, 10, 80, 35))]
+                                  if value else [])
+            return output
         return [[] for _ in images]
 
 
 class ExtraRowEngine(TableEngine):
+    cell_rows = TableEngine.cell_rows + [
+        {"table_no": "99", "table_type": "Footer-like row"},
+    ]
+
     def recognize(self, image):
         result = super().recognize(image)
         if image.height >= 220:
@@ -45,17 +74,93 @@ class ExtraRowEngine(TableEngine):
         return result
 
 
-class CompactCategoryEngine(TableEngine):
+class RetryRowEngine(ExtraRowEngine):
+    cell_rows = [TableEngine.cell_rows[1]]
+
+
+class WeakNumberCellEngine(TableEngine):
+    """Model the blank and sub-threshold isolated-number failures."""
+
     def recognize_many(self, images):
-        images = list(images)
-        # Six independent refinements are requested for each row. The fourth
-        # is the narrow Non-Plastics Type cell, which the page-level pass left
-        # blank. Simulate PaddleOCR recovering its printed single letter only
-        # after the compact-cell enlargement.
-        if len(images) == 12:
-            return [([OCRToken("L", .97, (20, 20, 45, 75))]
-                     if index % 6 == 3 else []) for index in range(len(images))]
-        return super().recognize_many(images)
+        output = super().recognize_many(images)
+        if len(output) >= 23:
+            output[0] = []
+            output[22] = [OCRToken("7", .13, (10, 10, 30, 35))]
+        return output
+
+
+class BoundaryTouchingNumberEngine(WeakNumberCellEngine):
+    """Return narrow digits whose OCR boxes touch the No. cell boundary."""
+
+    def recognize(self, image):
+        result = super().recognize(image)
+        if image.height >= 220 and image.width > 500:
+            result[0] = OCRToken("1", .998, (-20, 60, 50, 82))
+        return result
+
+
+class PageAuthorityEngine(TableEngine):
+    cell_rows = [dict(TableEngine.cell_rows[0], surface_exterior_color="**")]
+
+    def recognize(self, image):
+        result = super().recognize(image)
+        if image.height >= 220 and image.width > 500:
+            index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
+            left, right = PaddleOCRStructuredExtractor._column_bounds(image.width)[index]
+            result.append(OCRToken("**", .95, (left + 2, 60, right - 2, 82)))
+        return result
+
+    def recognize_many(self, images):
+        output = super().recognize_many(images)
+        if len(output) == 22:
+            index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
+            output[index] = [OCRToken("术", .38, (10, 10, 35, 35))]
+        return output
+
+
+class MergedRowTypeEngine(TableEngine):
+    cell_rows = [TableEngine.cell_rows[0]]
+
+    def recognize(self, image):
+        result = super().recognize(image)
+        if image.height >= 220 and image.width > 500:
+            bounds = PaddleOCRStructuredExtractor._column_bounds(image.width)
+            result = [item for item in result if item.text not in {"1", "Pithos"}]
+            result.append(OCRToken(
+                "1 Pithos", .98,
+                (bounds[0][0], 60, bounds[1][1] - 2, 82)))
+        return result
+
+    def recognize_many(self, images):
+        output = super().recognize_many(images)
+        if len(output) == 22:
+            output[1] = []
+        return output
+
+
+class BlankCellPageEngine(TableEngine):
+    cell_rows = [TableEngine.cell_rows[0]]
+
+    def recognize(self, image):
+        result = super().recognize(image)
+        if image.height >= 220 and image.width > 500:
+            index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
+            left, right = PaddleOCRStructuredExtractor._column_bounds(image.width)[index]
+            result.append(OCRToken("**", .95, (left - 10, 60, right + 10, 82)))
+        return result
+
+
+class BoundaryNoisyCellEngine(BlankCellPageEngine):
+    def recognize_many(self, images):
+        output = super().recognize_many(images)
+        if len(output) == 22:
+            index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
+            output[index] = [OCRToken("noise*", .45, (10, 10, 60, 35))]
+        return output
+
+
+class FiringZeroEngine(TableEngine):
+    cell_rows = [dict(TableEngine.cell_rows[0], fire="0")]
 
 
 def make_table_image(path, closing=True):
@@ -66,6 +171,13 @@ def make_table_image(path, closing=True):
     if closing:
         draw.line((100, 760, 900, 760), fill="black", width=4)
     image.save(path)
+
+
+def _dark_component_count(image):
+    dark = (np.asarray(image.convert("L")) < 210).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    return sum(1 for index in range(1, count)
+               if stats[index, cv2.CC_STAT_AREA] >= 10)
 
 
 def test_local_ocr_reads_drawing_number_without_generative_model(tmp_path):
@@ -92,25 +204,169 @@ def test_hesban_fixed_layout_builds_rows_from_ocr_coordinates(tmp_path):
     assert result["is_table"] is True
     assert [row["table_no"] for row in result["rows"]] == ["1", "2"]
     assert all(len(row) == 22 for row in result["rows"])
+    row_bounds = result["boundary"]["row_bounds"]
+    assert [item["row"] for item in row_bounds] == ["1", "2"]
+    assert row_bounds[0]["top"] == result["boundary"]["data_start_y"]
+    assert row_bounds[0]["bottom"] == row_bounds[1]["top"]
+    assert row_bounds[-1]["bottom"] <= result["boundary"]["data_end_y"]
+    cells = result["boundary"]["cell_diagnostics"]
+    assert len(cells) == 44
+    assert cells[0]["field"] == "table_no"
+    assert cells[0]["crop"][1] == row_bounds[0]["top"]
+    assert cells[-1]["crop"][3] == row_bounds[-1]["bottom"]
 
 
-def test_isolated_nonplastics_type_is_retried_as_compact_cell(tmp_path):
+def test_every_cell_uses_the_same_cell_ocr_pass(tmp_path):
     image_path = tmp_path / "table.jpg"
     make_table_image(image_path)
-    result = PaddleOCRStructuredExtractor(CompactCategoryEngine()).extract_table(
+    result = PaddleOCRStructuredExtractor(TableEngine()).extract_table(
         image_path, None, "2.1", ["1", "2"],
         {"figure_id": "2.1", "figure_caption": "Figure 2.1", "printed_page": "20"},
     )
     assert [row["nonplastics_type"] for row in result["rows"]] == ["L", "L"]
-    assert [item["accepted_value"] for item in result["ocr_diagnostics"]] == ["L", "L"]
-    assert all(item["crop"][3] > item["crop"][1] for item in result["ocr_diagnostics"])
+    assert [row["table_locus"] for row in result["rows"]] == ["143", "144"]
+    cells = result["boundary"]["cell_diagnostics"]
+    assert len(cells) == 44
+    assert all(cell["accepted_source"] == "row_anchor"
+               for cell in cells if cell["field"] == "table_no")
+    assert all(cell["accepted_source"] == "cell_pass"
+               for cell in cells
+               if cell["field"] != "table_no" and cell["focused_text"])
+    assert all("focused_text" in cell for cell in cells)
+    assert result["ocr_diagnostics"] == []
 
 
-def test_verified_compact_code_is_removed_from_crossing_interior_token():
-    assert _remove_cross_column_code("2.5YR6/6 L\nLight red", "L") == (
-        "2.5YR6/6\nLight red")
-    assert _remove_cross_column_code("7.5YRN7/L\nLight gray", "L") == (
-        "7.5YRN7/\nLight gray")
+def test_safe_page_token_survives_blank_or_weak_cell_detection(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(WeakNumberCellEngine()).extract_table(
+        image_path, None, "2.1", ["1", "2"],
+        {"figure_id": "2.1", "figure_caption": "Figure 2.1",
+         "printed_page": "20"},
+    )
+    assert [row["table_no"] for row in result["rows"]] == ["1", "2"]
+    number_cells = [cell for cell in result["boundary"]["cell_diagnostics"]
+                    if cell["field"] == "table_no"]
+    assert [cell["accepted_source"] for cell in number_cells] == [
+        "row_anchor", "row_anchor"]
+    assert number_cells[1]["focused_text"] == ""
+    assert number_cells[1]["focused_tokens"][0]["text"] == "7"
+
+
+def test_boundary_touching_page_number_is_not_erased_by_blank_cell(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(
+        BoundaryTouchingNumberEngine()).extract_table(
+            image_path, None, "2.1", ["1", "2"],
+            {"figure_id": "2.1", "figure_caption": "Figure 2.1",
+             "printed_page": "20"},
+        )
+    first_number = next(
+        cell for cell in result["boundary"]["cell_diagnostics"]
+        if cell["row"] == "1" and cell["field"] == "table_no")
+    assert first_number["safe_initial_text"] == ""
+    assert first_number["initial_text"] == "1"
+    assert first_number["accepted_text"] == "1"
+    assert first_number["accepted_source"] == "row_anchor"
+
+
+def test_strong_page_value_beats_noisy_low_confidence_cell_value(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(PageAuthorityEngine()).extract_table(
+        image_path, None, "2.1", ["1"], {"figure_id": "2.1"})
+    cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                if item["field"] == "surface_exterior_color")
+    assert cell["initial_text"] == "**"
+    assert cell["focused_text"] == ""
+    assert cell["focused_tokens"][0]["text"] == "术"
+    assert cell["accepted_text"] == "**"
+    assert cell["accepted_source"] == "page_pass_blank_cell"
+
+
+def test_non_english_glyphs_are_removed_from_values_but_raw_tokens_survive():
+    tokens = [OCRToken("\u6c34*", .93, (10, 10, 40, 35))]
+    text, confidence = _tokens_to_text(tokens)
+    assert text == "*"
+    assert confidence == .93
+    assert tokens[0].text == "\u6c34*"
+    assert _english_ocr_text("\uff21\uff11\uff0a") == "A1*"
+
+
+def test_merged_row_anchor_is_removed_from_page_cell_candidate(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(MergedRowTypeEngine()).extract_table(
+        image_path, None, "2.1", ["1"], {"figure_id": "2.1"})
+    cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                if item["field"] == "table_type")
+    assert cell["initial_tokens"][0]["text"] == "1 Pithos"
+    assert cell["initial_text"] == "Pithos"
+    assert cell["focused_text"] == ""
+    assert cell["accepted_text"] == "Pithos"
+    assert cell["accepted_source"] == "page_pass_blank_cell"
+
+
+def test_strong_page_value_fills_blank_cell_despite_boundary_contact(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(BlankCellPageEngine()).extract_table(
+        image_path, None, "2.1", ["1"], {"figure_id": "2.1"})
+    cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                if item["field"] == "surface_exterior_color")
+    assert cell["focused_text"] == ""
+    assert cell["safe_initial_text"] == ""
+    assert cell["initial_text"] == "**"
+    assert cell["accepted_text"] == "**"
+    assert cell["accepted_source"] == "page_pass_blank_cell"
+
+
+def test_boundary_uncertainty_does_not_let_weak_cell_beat_strong_page(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(BoundaryNoisyCellEngine()).extract_table(
+        image_path, None, "2.1", ["1"], {"figure_id": "2.1"})
+    cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                if item["field"] == "surface_exterior_color")
+    assert cell["safe_initial_text"] == ""
+    assert cell["initial_text"] == "**"
+    assert cell["initial_confidence"] == .95
+    assert cell["focused_text"] == "noise*"
+    assert cell["focused_confidence"] == .45
+    assert cell["accepted_text"] == "**"
+    assert cell["accepted_source"] == "page_pass"
+
+
+def test_firing_zero_is_strictly_normalized_to_letter_o(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(FiringZeroEngine()).extract_table(
+        image_path, None, "2.1", ["1"], {"figure_id": "2.1"})
+    cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                if item["field"] == "fire")
+    assert cell["focused_text"] == "0"
+    assert cell["accepted_text"] == "O"
+    assert cell["normalizations"] == ["fire_zero_to_letter_o"]
+
+
+def test_cell_input_expands_but_assigns_crossing_ink_group_only_once():
+    image = Image.new("L", (220, 70), 255)
+    draw = ImageDraw.Draw(image)
+    # Six close marks form one word-like group. Its final mark crosses the
+    # calculated boundary at x=150. The separate mark at x=190 belongs to the
+    # following cell.
+    for left in (90, 102, 114, 126, 138, 150):
+        draw.rectangle((left, 20, left + 7, 49), fill=0)
+    draw.rectangle((190, 20, 199, 49), fill=0)
+
+    left_cell = _prepare_table_cell(image, [40, 0, 150, 70])
+    right_cell = _prepare_table_cell(image, [150, 0, 210, 70])
+
+    left_components = _dark_component_count(left_cell)
+    right_components = _dark_component_count(right_cell)
+    assert left_components == 6
+    assert right_components == 1
 
 
 def test_hesban_column_template_has_one_band_per_csv_field():
@@ -118,9 +374,53 @@ def test_hesban_column_template_has_one_band_per_csv_field():
     assert len(bounds) == 22
     assert all(left < right for left, right in bounds)
     assert all(bounds[index][1] == bounds[index+1][0] for index in range(21))
-    # Manufacture is deliberately narrower than Surface Ext so merged Ext
-    # marks are not assigned to Man.
-    assert bounds[15][1] - bounds[15][0] < bounds[16][1] - bounds[16][0]
+
+
+def test_merged_header_words_follow_visible_ink_valleys():
+    image = Image.new("L", (380, 70), 255)
+    draw = ImageDraw.Draw(image)
+    word_starts = (12, 92, 180, 292)
+    letter_counts = (3, 3, 4, 3)
+    expected = []
+    for word_start, letter_count in zip(word_starts, letter_counts):
+        for index in range(letter_count):
+            left = word_start + index * 10
+            draw.rectangle((left, 18, left + 6, 49), fill=0)
+        expected.append((word_start, word_start + (letter_count - 1) * 10 + 7))
+    merged = OCRToken("Typ Siz Shap Den", .99, (5, 10, 330, 58))
+
+    split = PaddleOCRStructuredExtractor._split_header_tokens([merged], image)
+
+    assert [token.text for token in split] == ["Typ", "Siz", "Shap", "Den"]
+    assert [(token.bbox[0], token.bbox[2]) for token in split] == expected
+
+
+def test_single_header_token_is_not_changed_by_visual_splitter():
+    image = Image.new("L", (120, 50), 255)
+    token = OCRToken("Typ", .99, (10, 10, 60, 35))
+    assert PaddleOCRStructuredExtractor._split_header_tokens(
+        [token], image) == [token]
+
+
+def test_only_an_abnormally_tall_final_row_is_capped():
+    anchors = [
+        ("1", OCRToken("1", .99, (0, 60, 10, 80))),
+        ("2", OCRToken("2", .99, (0, 160, 10, 180))),
+        ("3", OCRToken("3", .99, (0, 260, 10, 280))),
+    ]
+    bounds = PaddleOCRStructuredExtractor._row_bounds(anchors, 1000)
+    assert bounds[0] == ("1", 0, 157)
+    assert bounds[1] == ("2", 157, 257)
+    assert bounds[2] == ("3", 257, 557)
+
+
+def test_normal_final_row_keeps_the_verified_table_ending():
+    anchors = [
+        ("1", OCRToken("1", .99, (0, 60, 10, 80))),
+        ("2", OCRToken("2", .99, (0, 220, 10, 240))),
+    ]
+    bounds = PaddleOCRStructuredExtractor._row_bounds(anchors, 600)
+    assert bounds[-1] == ("2", 217, 543)
 
 
 def test_columns_follow_this_pages_header_positions():
@@ -168,6 +468,17 @@ def test_row_anchor_recovers_number_merged_with_type():
     assert [number for number, _ in anchors] == ["14"]
 
 
+def test_row_bounds_start_at_data_rule_and_split_before_next_number():
+    anchors = [
+        ("1", OCRToken("1", .99, (0, 40, 12, 60))),
+        ("2", OCRToken("2", .99, (0, 150, 12, 170))),
+        ("3", OCRToken("3", .99, (0, 310, 12, 330))),
+    ]
+    assert PaddleOCRStructuredExtractor._row_bounds(anchors, 500) == [
+        ("1", 0, 147), ("2", 147, 307), ("3", 307, 500),
+    ]
+
+
 def test_initial_ocr_pass_keeps_unexpected_rows_for_validation(tmp_path):
     image_path = tmp_path / "table.jpg"
     make_table_image(image_path)
@@ -179,9 +490,14 @@ def test_initial_ocr_pass_keeps_unexpected_rows_for_validation(tmp_path):
 def test_retry_pass_limits_rows_to_requested_missing_numbers(tmp_path):
     image_path = tmp_path / "table.jpg"
     make_table_image(image_path)
-    result = PaddleOCRStructuredExtractor(ExtraRowEngine()).extract_table(
+    result = PaddleOCRStructuredExtractor(RetryRowEngine()).extract_table(
         image_path, None, "2.1", ["2"], {"figure_id": "2.1", "retry_missing": True})
     assert [row["table_no"] for row in result["rows"]] == ["2"]
+    rows = {item["row"]: item for item in result["boundary"]["row_bounds"]}
+    number_cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                       if item["field"] == "table_no")
+    assert number_cell["row"] == "2"
+    assert number_cell["crop"][1] == rows["2"]["top"]
 
 
 def test_malformed_paddle_result_is_withheld_instead_of_crashing():

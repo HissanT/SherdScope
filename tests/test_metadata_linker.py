@@ -4,9 +4,9 @@ import json
 import pandas as pd
 import pytest
 from PIL import Image
-import metadata_linker as linker_module
+import catalog.linkage as linker_module
 
-from metadata_linker import (
+from catalog.linkage import (
     AmbiguousSourceError,
     HESBAN_TABLE_COLUMNS,
     Hesban11Profile,

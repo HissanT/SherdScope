@@ -13,9 +13,9 @@ pytest.importorskip("fitz")
 os.environ["PYPOTTERYLENS_SKIP_INIT"] = "1"
 
 import app as app_module
-from metadata_linker import Hesban11Profile, load_linkage_state, save_linkage_state, validate_figure
-from project_manager import ProjectManager
-from research_export import EXPORT_COLUMNS
+from catalog.linkage import Hesban11Profile, load_linkage_state, save_linkage_state, validate_figure
+from services.projects import ProjectManager
+from catalog.export import EXPORT_COLUMNS
 
 
 def test_state_edit_and_apply_endpoints(tmp_path, monkeypatch):
@@ -154,6 +154,37 @@ def test_failed_renderer_does_not_overwrite_existing_pdf_or_images(tmp_path, mon
     assert response.status_code == 500
     assert source.read_bytes() == b"original pdf"
     assert image.read_bytes() == b"original image"
+
+
+def test_pdf_upload_always_uses_400_dpi_even_if_form_requests_another_value(
+        tmp_path, monkeypatch):
+    manager, project_id, _ = _make_api_project(tmp_path, "Fixed DPI")
+    observed = {}
+
+    class RecordingProcessor:
+        def process_pdf_to_folder(
+                self, _pdf, output, _split, project_name=None, render_dpi=None):
+            from PIL import Image
+            observed["processor_dpi"] = render_dpi
+            Image.new("RGB", (20, 20), "white").save(
+                os.path.join(output, f"{project_name}_page_0.jpg"))
+            return "PDF processed successfully"
+
+    def fake_record(_project, _pdf, base, _split, profile_slug=None, render_dpi=None):
+        observed["manifest_dpi"] = render_dpi
+        return {"pages": [{"image_name": f"{base}_page_0.jpg", "render_dpi": render_dpi}]}
+
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    monkeypatch.setattr(app_module, "pdf_processor", RecordingProcessor())
+    monkeypatch.setattr(app_module, "record_pdf_pages", fake_record)
+    response = app_module.app.test_client().post("/api/pdf/upload", data={
+        "project_id": project_id, "render_dpi": "600", "split_pages": "false",
+        "file": (io.BytesIO(b"pdf content"), "book.pdf"),
+    }, content_type="multipart/form-data")
+
+    assert response.status_code == 200
+    assert response.get_json()["render_dpi"] == 400
+    assert observed == {"processor_dpi": 400, "manifest_dpi": 400}
 
 
 def test_same_dpi_reupload_with_changed_content_is_blocked_when_cards_exist(tmp_path, monkeypatch):
@@ -315,6 +346,20 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
                     "data_start_y": 150, "data_end_y": 760,
                     "closing_rule_y": 760, "header_confirmed": True,
                     "has_closing_rule": True, "continues": False,
+                    "column_bounds": [[100, 200], [200, 900]],
+                    "row_bounds": [{"row": "1", "top": 150, "bottom": 760}],
+                    "cell_diagnostics": [{
+                        "row": "1", "field": "table_type",
+                        "crop": [200, 150, 900, 760],
+                        "initial_text": "Pithos", "initial_confidence": .98,
+                        "initial_tokens": [{"text": "Pithos", "confidence": .98,
+                                            "bbox": [240, 180, 330, 220]}],
+                        "focused_crop": [200, 150, 900, 760],
+                        "focused_preparation": "standard",
+                        "focused_text": "Pithos", "focused_confidence": .99,
+                        "focused_tokens": [], "accepted_text": "Pithos",
+                        "accepted_source": "focused_cell",
+                    }],
                 },
                 "ocr_diagnostics": [{
                     "row": "1", "field": "nonplastics_type",
@@ -355,6 +400,16 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
         "?figure=2.1&kind=table&ocr_row=1&ocr_field=nonplastics_type")
     assert diagnostic.status_code == 200
     assert diagnostic.mimetype == "image/png"
+    cell = client.get(
+        f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg"
+        "?figure=2.1&kind=table&cell_row=1&cell_field=table_type")
+    assert cell.status_code == 200
+    assert cell.mimetype == "image/png"
+    focused_cell = client.get(
+        f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg"
+        "?figure=2.1&kind=table&cell_row=1&cell_field=table_type&cell_view=focused")
+    assert focused_cell.status_code == 200
+    assert focused_cell.mimetype == "image/png"
 
 
 def test_tabular_boxes_use_staged_vessel_number_not_mask_suffix(tmp_path, monkeypatch):

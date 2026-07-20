@@ -7,14 +7,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-from hesban_measurements import (
+from catalog.measurements import (
     detect_hesban_scale,
     detect_rim_diameter,
     manual_calibration,
     measure_figure,
     verified_measurement,
 )
-from utils import _assign_px_per_cm
+from catalog.sidecars import assign_px_per_cm
 
 
 def draw_scale(draw: ImageDraw.ImageDraw, x: int, y: int, segment: int = 50) -> None:
@@ -203,8 +203,44 @@ def test_diameter_is_withheld_when_axis_radius_disagrees_with_rim_span(tmp_path)
     image.save(page)
     result = detect_rim_diameter(page, [150, 260, 900, 700], detect_hesban_scale(page))
     assert result["status"] == "unresolved"
-    assert result["agreement"] > 0.05
+    assert result["agreement"] > 0.15
     assert result["warning"] == "diameter_estimators_disagree"
+
+
+def test_five_to_fifteen_percent_diameter_disagreement_is_accepted(tmp_path):
+    page = tmp_path / "minor_disagreement.png"
+    make_page(page, drawing=False)
+    image = Image.open(page)
+    draw = ImageDraw.Draw(image)
+    draw.line((200, 300, 800, 300), fill=0, width=3)
+    draw.line((470, 300, 470, 600), fill=0, width=3)
+    image.save(page)
+
+    result = detect_rim_diameter(
+        page, [150, 260, 900, 700], detect_hesban_scale(page))
+
+    assert 0.05 < result["agreement"] <= 0.15
+    assert result["status"] == "verified_automatic"
+    assert result["verified_cm"] == result["suggested_cm"]
+    assert result["warning"] == "diameter_estimators_minor_disagreement"
+
+
+def test_diameter_is_withheld_when_inferred_rim_exceeds_bbox_by_over_fifteen_percent(
+        tmp_path):
+    page = tmp_path / "oversized_rim.png"
+    make_page(page, drawing=False)
+    image = Image.open(page)
+    draw = ImageDraw.Draw(image)
+    draw.line((290, 300, 710, 300), fill=0, width=3)
+    draw.line((620, 300, 620, 600), fill=0, width=3)
+    image.save(page)
+
+    result = detect_rim_diameter(
+        page, [300, 260, 700, 700], detect_hesban_scale(page))
+
+    assert result["status"] == "unresolved"
+    assert result["suggested_cm"] is None
+    assert result["warning"] == "rim_endpoints_exceed_drawing_bbox"
 
 
 def test_manual_calibration_and_verified_endpoint_measurement(tmp_path):
@@ -313,4 +349,4 @@ def test_persistence_preserves_zoned_scales_and_clears_rejected_ratio(tmp_path):
                for scale in saved_scales)
     csv_text = (project / "cards" / "mask_info.csv").read_text(encoding="utf-8")
     assert "99" not in csv_text
-    assert _assign_px_per_cm([calibration], (200, 200)) is None
+    assert assign_px_per_cm([calibration], (200, 200)) is None

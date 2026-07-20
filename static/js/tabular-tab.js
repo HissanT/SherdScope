@@ -23,7 +23,8 @@ let tabularState = {
     metadataUndo: new Map(),
     metadataSnapshots: new Map(),
     selectedFigureKey: null,
-    metadataEvidenceState: new Map()
+    metadataEvidenceState: new Map(),
+    metadataRenderedFigureSignatures: new Map()
 };
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -39,6 +40,7 @@ document.addEventListener('DOMContentLoaded', () => {
         tabularState.metadataUndo.clear();
         tabularState.metadataSnapshots.clear();
         tabularState.metadataEvidenceState.clear();
+        tabularState.metadataRenderedFigureSignatures.clear();
         tabularState.metadataSaveTimers.forEach(timer => clearTimeout(timer));
         tabularState.metadataSaveTimers.clear();
         tabularState.metadataSaveQueues.clear();
@@ -928,15 +930,47 @@ function renderMetadataLinkState(state, active) {
         progress.title = state?.progress?.message || '';
     }
     if (!figuresContainer) return;
+    const selectedExists = figures.some(figure =>
+        (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey);
+    if (!selectedExists) {
+        const firstAttention = figures.find(figure =>
+            !['processing', 'queued'].includes(figure.processing_status) &&
+            figure.review_status !== 'approved' &&
+            figure.status !== 'ready');
+        const firstReviewable = figures.find(figure =>
+            !['processing', 'queued'].includes(figure.processing_status));
+        const choice = firstAttention || firstReviewable || figures[0];
+        tabularState.selectedFigureKey = choice ? (choice.figure_key || choice.figure_id) : null;
+    }
+    const selectedFigure = figures.find(figure =>
+        (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey) || figures[0];
+    const selectedKey = selectedFigure
+        ? String(selectedFigure.figure_key || selectedFigure.figure_id || '') : '';
+    const selectedSignature = JSON.stringify(selectedFigure || null);
     // Progress polling runs every 1.5 seconds while OCR is active. Preserve
-    // the reviewer's UI state before replacing the updated figure markup;
-    // otherwise every poll closes the figure they are currently inspecting.
+    // the selected figure as a real, mounted DOM node when its data has not
+    // changed. Replacing an unchanged publication image and restoring its
+    // viewport afterward still creates a visible jump on every poll.
     const renderProject = String(tabularState.currentProject?.project_id || '');
     const hadPreviousRender = figuresContainer.dataset.renderProject === renderProject;
     const editingCurrentFigure = hadPreviousRender && (
         tabularState.metadataDirty.size > 0 || figuresContainer.contains(document.activeElement));
     const forcedRender = figuresContainer.dataset.forceRender === '1';
     if (editingCurrentFigure && !forcedRender) return;
+    const renderedKeys = [...figuresContainer.querySelectorAll('[data-select-figure]')]
+        .map(button => button.dataset.selectFigure || '');
+    const currentKeys = figures.map(figure => String(figure.figure_key || figure.figure_id || ''));
+    const sameFigureList = renderedKeys.length === currentKeys.length &&
+        renderedKeys.every((key, index) => key === currentKeys[index]);
+    const sameSelectedFigure = hadPreviousRender && sameFigureList && !forcedRender &&
+        figuresContainer.dataset.activeFigureKey === selectedKey &&
+        tabularState.metadataRenderedFigureSignatures.get(selectedKey) === selectedSignature;
+    if (sameSelectedFigure) {
+        updateMetadataFigureSidebar(figuresContainer, figures);
+        figures.forEach(figure => tabularState.metadataSnapshots.set(
+            figure.figure_key || figure.figure_id, structuredClone(figure)));
+        return;
+    }
     const preserveViewport = hadPreviousRender && !forcedRender;
     const pageViewport = preserveViewport ? {left: window.scrollX, top: window.scrollY} : null;
     const figureListScrollTop = preserveViewport
@@ -961,26 +995,9 @@ function renderMetadataLinkState(state, active) {
                 top: wrap?.scrollTop || 0
             }];
         }));
-    const selectedExists = figures.some(figure =>
-        (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey);
-    if (!selectedExists) {
-        const firstAttention = figures.find(figure =>
-            !['processing', 'queued'].includes(figure.processing_status) &&
-            figure.review_status !== 'approved' &&
-            figure.status !== 'ready');
-        const firstReviewable = figures.find(figure =>
-            !['processing', 'queued'].includes(figure.processing_status));
-        const choice = firstAttention || firstReviewable || figures[0];
-        tabularState.selectedFigureKey = choice ? (choice.figure_key || choice.figure_id) : null;
-    }
-    const selectedFigure = figures.find(figure =>
-        (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey) || figures[0];
     const sidebar = figures.map(figure => {
         const key = figure.figure_key || figure.figure_id;
-        const label = figure.review_status === 'approved' ? 'Approved'
-            : figure.processing_status === 'processing' ? 'Processing'
-                : figure.processing_status === 'queued' ? 'Waiting'
-                : figure.status === 'ready' ? 'Ready' : 'Needs attention';
+        const label = metadataFigureStatusLabel(figure);
         return `<button type="button" class="metadata-figure-list-item ${key === tabularState.selectedFigureKey ? 'active' : ''}"
             data-select-figure="${linkEscape(key)}"><strong>Figure ${linkEscape(figure.figure_id || '?')}</strong>
             <span class="${linkEscape(label.toLowerCase().replace(/\s+/g, '-'))}">${linkEscape(label)}</span></button>`;
@@ -990,6 +1007,8 @@ function renderMetadataLinkState(state, active) {
     figures.forEach(figure => tabularState.metadataSnapshots.set(
         figure.figure_key || figure.figure_id, structuredClone(figure)));
     figuresContainer.dataset.renderProject = renderProject;
+    figuresContainer.dataset.activeFigureKey = selectedKey;
+    tabularState.metadataRenderedFigureSignatures.set(selectedKey, selectedSignature);
     figuresContainer.querySelectorAll('[data-select-figure]').forEach(button =>
         button.addEventListener('click', () => {
             tabularState.selectedFigureKey = button.dataset.selectFigure;
@@ -1018,15 +1037,8 @@ function renderMetadataLinkState(state, active) {
         button.addEventListener('click', () => undoMetadataRowDelete(button.dataset.linkUndoRow)));
     figuresContainer.querySelectorAll('[data-link-restore]').forEach(button =>
         button.addEventListener('click', () => restoreMetadataFigure(button.dataset.linkRestore)));
-    figuresContainer.querySelectorAll('[data-warning-toggle]').forEach(button =>
-        button.addEventListener('click', () => toggleMetadataWarning(
-            button.dataset.figureId, button.dataset.warningToggle)));
-    figuresContainer.querySelectorAll('[data-warning-focus]').forEach(button =>
-        button.addEventListener('click', () => focusMetadataWarning(
-            button.dataset.figureId, button.dataset.warningFocus)));
-    figuresContainer.querySelectorAll('[data-warning-add-row]').forEach(button =>
-        button.addEventListener('click', () => addMetadataTableRow(
-            button.dataset.figureId, button.dataset.warningAddRow)));
+    wireMetadataWarningActions(figuresContainer);
+    wireMetadataCellDebug(figuresContainer);
     figuresContainer.querySelectorAll('[data-link-rerun]').forEach(button =>
         button.addEventListener('click', () => rerunMetadataFigure(button.dataset.linkRerun)));
     figuresContainer.querySelectorAll('[data-link-measure]').forEach(button =>
@@ -1050,7 +1062,7 @@ function renderMetadataLinkState(state, active) {
     });
     figuresContainer.querySelectorAll(
         '[data-link-figure-id], [data-link-caption], [data-link-table-pages], ' +
-        '[data-link-drawing-number], [data-link-column], [data-warning-reason], [data-warning-note]'
+        '[data-link-drawing-number], [data-link-column]'
     ).forEach(input => {
         input.addEventListener('input', () => {
             input.classList.add('metadata-link-edited');
@@ -1098,6 +1110,178 @@ function renderMetadataLinkState(state, active) {
     }
 }
 
+function metadataFigureStatusLabel(figure) {
+    return figure.review_status === 'approved' ? 'Approved'
+        : figure.processing_status === 'processing' ? 'Processing'
+            : figure.processing_status === 'queued' ? 'Waiting'
+                : figure.status === 'ready' ? 'Ready' : 'Needs attention';
+}
+
+function updateMetadataFigureSidebar(container, figures) {
+    const figuresByKey = new Map(figures.map(figure => [
+        String(figure.figure_key || figure.figure_id || ''), figure
+    ]));
+    container.querySelectorAll('[data-select-figure]').forEach(button => {
+        const key = String(button.dataset.selectFigure || '');
+        const figure = figuresByKey.get(key);
+        if (!figure) return;
+        const label = metadataFigureStatusLabel(figure);
+        button.classList.toggle('active', key === String(tabularState.selectedFigureKey || ''));
+        const title = button.querySelector('strong');
+        if (title) title.textContent = `Figure ${figure.figure_id || '?'}`;
+        const status = button.querySelector('span');
+        if (status) {
+            status.className = label.toLowerCase().replace(/\s+/g, '-');
+            status.textContent = label;
+        }
+    });
+}
+
+function metadataWarningsMarkup(figure, disabled, reviewKey) {
+    const overrides = figure.warning_overrides || {};
+    return (figure.warnings || []).map(warning => {
+        const active = !!warning.overridden;
+        const reasonOptions = warning.code === 'missing_table_end'
+            ? [['visually_confirmed_complete', 'Visually confirmed table ending']]
+            : warning.code === 'missing_required_value'
+                ? [['publication_field_blank', 'Publication field is genuinely blank']]
+                : [['column_alignment_verified', 'Column alignment visually verified']];
+        const override = overrides[warning.id] || {};
+        const controls = warning.overrideable ? `<div class="metadata-link-warning-review">
+            <select data-warning-reason ${disabled}>${reasonOptions.map(([value, label]) =>
+                `<option value="${value}" ${override.reason === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+            <input data-warning-note placeholder="Optional reviewer note" value="${linkEscape(override.note || '')}" ${disabled}>
+            <button type="button" data-warning-toggle="${warning.id}" data-figure-id="${linkEscape(reviewKey)}" ${disabled}>
+                ${active ? 'Remove override' : 'Mark reviewed and ignore'}
+            </button></div>` : '';
+        const focusLabel = warning.code === 'missing_drawing_number'
+            ? 'Edit drawing number' : 'Go to row';
+        const focus = warning.row || warning.mask_file ? `<button type="button" class="metadata-warning-focus"
+            data-warning-focus="${warning.id}" data-figure-id="${linkEscape(reviewKey)}">${focusLabel}</button>` : '';
+        const addMissing = warning.code === 'missing_table_row' ? `<button type="button"
+            class="metadata-warning-focus" data-warning-add-row="${linkEscape(warning.row || '')}"
+            data-figure-id="${linkEscape(reviewKey)}">Add missing row</button>` : '';
+        return `<article class="metadata-link-warning-card ${warning.blocking ? 'blocking' : 'resolved'}"
+                         data-warning-id="${warning.id}" data-warning-code="${warning.code}"
+                         data-warning-row="${linkEscape(warning.row || '')}"
+                         data-warning-mask="${linkEscape(warning.mask_file || '')}"
+                         data-override-active="${active ? '1' : '0'}">
+            <div><strong>${active ? 'Reviewed' : warning.blocking ? 'Needs attention' : 'Information'}</strong>
+            <span>${linkEscape(warning.message)}</span>${focus}${addMissing}</div>${controls}</article>`;
+    }).join('');
+}
+
+function wireMetadataWarningActions(scope) {
+    scope.querySelectorAll('[data-warning-toggle]').forEach(button =>
+        button.addEventListener('click', () => toggleMetadataWarning(
+            button.dataset.figureId, button.dataset.warningToggle)));
+    scope.querySelectorAll('[data-warning-focus]').forEach(button =>
+        button.addEventListener('click', () => focusMetadataWarning(
+            button.dataset.figureId, button.dataset.warningFocus)));
+    scope.querySelectorAll('[data-warning-add-row]').forEach(button =>
+        button.addEventListener('click', () => addMetadataTableRow(
+            button.dataset.figureId, button.dataset.warningAddRow)));
+    scope.querySelectorAll('[data-warning-reason], [data-warning-note]').forEach(input => {
+        input.addEventListener('input', () => {
+            input.classList.add('metadata-link-edited');
+            scheduleMetadataAutosave(input.closest('[data-link-figure]').dataset.linkFigure);
+        });
+        input.addEventListener('change', () =>
+            scheduleMetadataAutosave(input.closest('[data-link-figure]').dataset.linkFigure));
+    });
+}
+
+function updateMetadataWarningsFromFigure(figureId, figure) {
+    const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
+    const section = figureEl?.querySelector('[data-link-warnings]');
+    if (!section) return;
+    const disabled = figure.processing_status === 'processing' || figure.processing_status === 'queued'
+        ? 'disabled' : '';
+    const markup = metadataWarningsMarkup(figure, disabled, figureId);
+    section.innerHTML = markup ? `<h4>Review warnings</h4>${markup}` : '';
+    section.hidden = !markup;
+    if (markup) wireMetadataWarningActions(section);
+}
+
+function metadataCellDebugMarkup(figure, projectId, reviewKey) {
+    if (window.SHERDSCOPE_OCR_CELL_DEBUG !== true) return '';
+    const cells = (figure.table_pages || []).flatMap(page =>
+        ((page.boundary || {}).cell_diagnostics || []).map(cell => ({
+            ...cell, image_name: page.image_name
+        })));
+    if (!cells.length) return `<details class="metadata-cell-debug">
+        <summary>Development: inspect every OCR cell</summary>
+        <p>No saved cell grid exists for this figure yet. Use More → Re-read this figure to generate it with the development extractor.</p>
+    </details>`;
+    const tokenText = tokens => (tokens || []).map(token =>
+        `${token.text || '(blank)'} (${Math.round(Number(token.confidence || 0) * 100)}%)`
+    ).join(', ');
+    const buttons = cells.map((cell, index) => {
+        const baseUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/` +
+            `${encodeURIComponent(cell.image_name)}?figure=${encodeURIComponent(reviewKey)}` +
+            `&kind=table&cell_row=${encodeURIComponent(cell.row || '')}` +
+            `&cell_field=${encodeURIComponent(cell.field || '')}` +
+            `&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
+        const focusedUrl = cell.focused_crop ? `${baseUrl}&cell_view=focused` : '';
+        const focusedText = cell.focused_text ||
+            ((cell.focused_tokens || []).length ? '(below acceptance threshold)' : '(blank)');
+        return `<button type="button" class="metadata-cell-debug-button"
+            data-cell-debug-open="${index}" data-cell-title="Row ${linkEscape(cell.row || '?')} · ${linkEscape(cell.field || '?')}"
+            data-cell-raw-url="${linkEscape(baseUrl)}" data-cell-focused-url="${linkEscape(focusedUrl)}"
+            data-cell-initial="${linkEscape(cell.initial_text || '(blank)')}"
+            data-cell-focused="${linkEscape(focusedText)}"
+            data-cell-accepted="${linkEscape(cell.accepted_text || '(blank)')}"
+            data-cell-source="${linkEscape(cell.accepted_source || 'table_pass')}"
+            data-cell-tokens="${linkEscape(tokenText(cell.initial_tokens) || 'No assigned page token')}"
+            data-cell-focused-tokens="${linkEscape(tokenText(cell.focused_tokens) || 'No focused token')}">
+            <strong>${linkEscape(cell.row || '?')}</strong><span>${linkEscape(cell.field || '?')}</span>
+            <small>${linkEscape(cell.accepted_text || '(blank)')}</small></button>`;
+    }).join('');
+    return `<details class="metadata-cell-debug">
+        <summary>Development: inspect every OCR cell (${cells.length})</summary>
+        <p>Orange horizontal lines and the existing column lines show the exact calculated cell grid. Select a cell to compare the whole-table page pass with the separate cell OCR result used as the final value.</p>
+        <div class="metadata-cell-debug-grid">${buttons}</div>
+        <dialog class="metadata-cell-debug-dialog">
+            <form method="dialog"><button aria-label="Close cell details">Close</button></form>
+            <h4 data-cell-debug-title></h4>
+            <div class="metadata-cell-debug-images">
+                <figure><figcaption>Raw calculated cell</figcaption><img data-cell-debug-raw alt="Raw OCR cell crop"></figure>
+                <figure data-cell-debug-focused-wrap><figcaption>Cell OCR input</figcaption><img data-cell-debug-focused-image alt="Prepared cell OCR crop"></figure>
+            </div>
+            <dl>
+                <dt>Page-pass text</dt><dd data-cell-debug-initial></dd>
+                <dt>Page-pass tokens</dt><dd data-cell-debug-tokens></dd>
+                <dt>Cell-pass text</dt><dd data-cell-debug-focused-text></dd>
+                <dt>Cell-pass tokens</dt><dd data-cell-debug-focused-tokens></dd>
+                <dt>Accepted value</dt><dd data-cell-debug-accepted></dd>
+            </dl>
+        </dialog>
+    </details>`;
+}
+
+function wireMetadataCellDebug(scope) {
+    scope.querySelectorAll('[data-cell-debug-open]').forEach(button => {
+        button.addEventListener('click', () => {
+            const panel = button.closest('.metadata-cell-debug');
+            const dialog = panel?.querySelector('.metadata-cell-debug-dialog');
+            if (!dialog) return;
+            dialog.querySelector('[data-cell-debug-title]').textContent = button.dataset.cellTitle || '';
+            dialog.querySelector('[data-cell-debug-raw]').src = button.dataset.cellRawUrl || '';
+            const focusedUrl = button.dataset.cellFocusedUrl || '';
+            const focusedWrap = dialog.querySelector('[data-cell-debug-focused-wrap]');
+            focusedWrap.hidden = !focusedUrl;
+            dialog.querySelector('[data-cell-debug-focused-image]').src = focusedUrl;
+            dialog.querySelector('[data-cell-debug-initial]').textContent = button.dataset.cellInitial || '';
+            dialog.querySelector('[data-cell-debug-tokens]').textContent = button.dataset.cellTokens || '';
+            dialog.querySelector('[data-cell-debug-focused-text]').textContent = button.dataset.cellFocused || '';
+            dialog.querySelector('[data-cell-debug-focused-tokens]').textContent = button.dataset.cellFocusedTokens || '';
+            dialog.querySelector('[data-cell-debug-accepted]').textContent =
+                `${button.dataset.cellAccepted || ''} (${button.dataset.cellSource || ''})`;
+            dialog.showModal();
+        });
+    });
+}
+
 function metadataMeasurementValue(measurement) {
     return ['verified', 'verified_automatic', 'verified_manual'].includes(measurement?.status)
         ? measurement.verified_cm : measurement?.suggested_cm;
@@ -1114,7 +1298,9 @@ function metadataMeasurementExplanation(measurement) {
         missing_scale_calibration: 'The page scale could not be measured reliably.',
         rim_span_not_found: 'The top rim line could not be found reliably.',
         centreline_not_found: 'The central vertical construction line could not be found.',
-        diameter_estimators_disagree: 'The full rim span and centreline-based estimate differ by more than 5%.',
+        diameter_estimators_minor_disagreement: 'The two diameter estimates differ by 5–15%. The centreline estimate remains accepted.',
+        diameter_estimators_disagree: 'The full rim span and centreline-based estimate differ by more than 15%.',
+        rim_endpoints_exceed_drawing_bbox: 'The measured rim extends more than 15% outside the drawing box.',
         invalid_drawing_bbox: 'The drawing crop is invalid or has changed.',
         image_not_found: 'The original publication page is unavailable.'
     };
@@ -1140,7 +1326,7 @@ function renderMetadataFigure(figure) {
     const pageHtml = evidencePages.map((page, pageIndex) => {
         const evidenceUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/${encodeURIComponent(page.image_name)}` +
             `?figure=${encodeURIComponent(reviewKey)}&kind=${page.kind}&overlay=1&measurement=${page.kind === 'drawing' ? '1' : '0'}&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
-        return `<a href="${evidenceUrl}" target="_blank" data-evidence-page="${pageIndex}" ${pageIndex ? 'hidden' : ''}>
+        return `<a href="${evidenceUrl}" data-evidence-page="${pageIndex}" ${pageIndex ? 'hidden' : ''}>
             <img src="${evidenceUrl}" data-evidence-kind="${page.kind}" alt="${linkEscape(page.image_name)}"
                  title="${linkEscape(page.kind)}: ${linkEscape(page.image_name)}">
         </a>`;
@@ -1189,62 +1375,8 @@ function renderMetadataFigure(figure) {
                         data-link-delete-row="${linkEscape(reviewKey)}" data-row-index="${rowIndex}" ${disabled}>🗑</button>
             </td>${dataCells.join('')}</tr>`;
     }).join('');
-    const ocrDiagnostics = (figure.table_pages || []).flatMap(page =>
-        (page.ocr_diagnostics || []).map(item => ({...item, image_name: page.image_name})));
-    const ocrDiagnosticCards = ocrDiagnostics.map(item => {
-        const retryTokens = (item.retry_tokens || []).map(token =>
-            `${token.text || '?'} (${Math.round(Number(token.confidence || 0) * 100)}%)`).join(', ');
-        const overlappingTokens = (item.page_overlap_tokens || []).map(token =>
-            `${token.text || '?'} (${Math.round(Number(token.confidence || 0) * 100)}%)`).join(', ');
-        const cropUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/` +
-            `${encodeURIComponent(item.image_name)}?figure=${encodeURIComponent(reviewKey)}` +
-            `&kind=table&ocr_row=${encodeURIComponent(item.row || '')}` +
-            `&ocr_field=${encodeURIComponent(item.field || '')}` +
-            `&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
-        return `<article class="metadata-ocr-diagnostic-card ${item.status === 'accepted' ? 'accepted' : 'needs-review'}">
-            <img src="${cropUrl}" alt="OCR crop for row ${linkEscape(item.row || '?')}, Non-Plastics Type">
-            <div><strong>Row ${linkEscape(item.row || '?')}</strong>
-                <span>Accepted: ${linkEscape(item.accepted_value || 'blank')}</span>
-                <span>Focused retry: ${linkEscape(retryTokens || 'no token')}</span>
-                <span>Original overlapping OCR: ${linkEscape(overlappingTokens || 'no token')}</span>
-            </div></article>`;
-    }).join('');
-    const ocrDiagnosticPanel = `<details class="metadata-ocr-diagnostics">
-        <summary>Inspect Non-Plastics Typ OCR${ocrDiagnostics.length ? ` (${ocrDiagnostics.length} rows)` : ''}</summary>
-        <p>This shows the first-line crop sent to PaddleOCR, its returned token and confidence, and any larger original token that crossed into this column.</p>
-        ${ocrDiagnosticCards || '<p>No diagnostic evidence is saved yet. Use More → Re-read this figure once to generate it.</p>'}
-    </details>`;
-    const overrides = figure.warning_overrides || {};
-    const warnings = (figure.warnings || []).map(warning => {
-        const active = !!warning.overridden;
-        const reasonOptions = warning.code === 'missing_table_end'
-            ? [['visually_confirmed_complete', 'Visually confirmed table ending']]
-            : warning.code === 'missing_required_value'
-                ? [['publication_field_blank', 'Publication field is genuinely blank']]
-                : [['column_alignment_verified', 'Column alignment visually verified']];
-        const override = overrides[warning.id] || {};
-        const controls = warning.overrideable ? `<div class="metadata-link-warning-review">
-            <select data-warning-reason ${disabled}>${reasonOptions.map(([value, label]) =>
-                `<option value="${value}" ${override.reason === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
-            <input data-warning-note placeholder="Optional reviewer note" value="${linkEscape(override.note || '')}" ${disabled}>
-            <button type="button" data-warning-toggle="${warning.id}" data-figure-id="${linkEscape(reviewKey)}" ${disabled}>
-                ${active ? 'Remove override' : 'Mark reviewed and ignore'}
-            </button></div>` : '';
-        const focusLabel = warning.code === 'missing_drawing_number'
-            ? 'Edit drawing number' : 'Go to row';
-        const focus = warning.row || warning.mask_file ? `<button type="button" class="metadata-warning-focus"
-            data-warning-focus="${warning.id}" data-figure-id="${linkEscape(reviewKey)}">${focusLabel}</button>` : '';
-        const addMissing = warning.code === 'missing_table_row' ? `<button type="button"
-            class="metadata-warning-focus" data-warning-add-row="${linkEscape(warning.row || '')}"
-            data-figure-id="${linkEscape(reviewKey)}">Add missing row</button>` : '';
-        return `<article class="metadata-link-warning-card ${warning.blocking ? 'blocking' : 'resolved'}"
-                         data-warning-id="${warning.id}" data-warning-code="${warning.code}"
-                         data-warning-row="${linkEscape(warning.row || '')}"
-                         data-warning-mask="${linkEscape(warning.mask_file || '')}"
-                         data-override-active="${active ? '1' : '0'}">
-            <div><strong>${active ? 'Reviewed' : warning.blocking ? 'Needs attention' : 'Information'}</strong>
-            <span>${linkEscape(warning.message)}</span>${focus}${addMissing}</div>${controls}</article>`;
-    }).join('');
+    const cellDebugPanel = metadataCellDebugMarkup(figure, projectId, reviewKey);
+    const warnings = metadataWarningsMarkup(figure, disabled, reviewKey);
     const tablePageNames = (figure.table_pages || []).map(page => page.image_name).join(', ');
     const open = figure.status === 'needs_review' ? 'open' : '';
     const blockers = (figure.warnings || []).filter(warning => warning.blocking).length;
@@ -1306,8 +1438,10 @@ function renderMetadataFigure(figure) {
             </div><div class="metadata-link-table-wrap" role="region" tabindex="0" aria-label="Editable publication table">
                 <table class="metadata-link-table"><thead>${hesbanGroupedHeaders()}</thead><tbody>${rows}</tbody></table>
             </div></div>
-            ${ocrDiagnosticPanel}
-            ${warnings ? `<section class="metadata-link-warnings"><h4>Review warnings</h4>${warnings}</section>` : ''}
+            ${cellDebugPanel}
+            <section class="metadata-link-warnings" data-link-warnings ${warnings ? '' : 'hidden'}>
+                ${warnings ? `<h4>Review warnings</h4>${warnings}` : ''}
+            </section>
             <div class="metadata-link-readiness ${blockers || unmatched ? 'blocked' : 'ready'}">
                 <strong>CSV readiness</strong>
                 <span>${processing ? 'This figure is still processing.' : waiting ? 'This figure is waiting for OCR.' : blockers
@@ -1385,6 +1519,11 @@ function setupMetadataEvidenceViewer(figureElement) {
         stored.scrollTop = viewer.scrollTop;
         tabularState.metadataEvidenceState.set(figureKey, stored);
     }, {passive: true});
+    pages.forEach(page => page.addEventListener('click', event => {
+        event.preventDefault();
+        const image = page.querySelector('img');
+        if (image && typeof showImageModal === 'function') showImageModal(image.src);
+    }));
     previousButton?.addEventListener('click', () => showPage(-1));
     nextButton?.addEventListener('click', () => showPage(1));
     figureElement.querySelector('[data-evidence-zoom-out]')?.addEventListener('click', () =>
@@ -1955,6 +2094,7 @@ async function performMetadataFigureSave(figureId, quiet = false, retryConflict 
         input.dataset.measurementEdited = '0';
     });
     setMetadataSaveStatus(figureId, 'Saved');
+    updateMetadataWarningsFromFigure(figureId, response.figure);
     updateMetadataReadinessFromFigure(figureId, response.figure);
     refreshMetadataDrawingEvidence(figureId);
     if (!quiet) window.PyPotteryUtils.showToast(`Figure ${figureId} saved`, 'success');

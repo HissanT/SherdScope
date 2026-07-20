@@ -17,7 +17,7 @@ import zipfile
 
 import pandas as pd
 
-from metadata_linker import load_linkage_state, migrate_linkage_columns
+from catalog.linkage import load_linkage_state, migrate_linkage_columns
 
 
 EXPORT_SCHEMA_VERSION = 1

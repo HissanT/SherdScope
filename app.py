@@ -17,31 +17,35 @@ import shutil
 import tempfile
 import secrets
 
-from utils import (
-    PDFProcessor,
-    ModelProcessor,
-    MaskExtractor,
-    AnnotationProcessor,
-    ImageProcessor,
-    TabularProcessor,
-    SecondStepProcessor,
-    ExportProcessor,
-    PDFConfig,
-    ModelConfig,
-    MaskExtractionConfig,
+from processors import (
     AnnotationConfig,
+    MaskExtractionConfig,
+    ModelConfig,
+    PDFConfig,
+    PDFProcessor,
     TabularConfig,
-    SecondStepConfig,
+)
+from processors.pipeline import (
+    AnnotationProcessor,
     ExportConfig,
-    read_vessels_sidecar,
-    write_vessels_sidecar,
+    ExportProcessor,
+    ImageProcessor,
+    MaskExtractor,
+    ModelProcessor,
+    SecondStepConfig,
+    SecondStepProcessor,
+    TabularProcessor,
+)
+from catalog.sidecars import (
     VESSELS_SIDECAR_SUFFIX,
     read_scale_sidecar,
+    read_vessels_sidecar,
     write_scale_sidecar,
+    write_vessels_sidecar,
 )
 
-from project_manager import ProjectManager
-from metadata_linker import (
+from services.projects import ProjectManager
+from catalog.linkage import (
     HESBAN_TABLE_COLUMNS,
     WARNING_OVERRIDE_REASONS,
     Hesban11Profile,
@@ -61,8 +65,8 @@ from metadata_linker import (
     save_linkage_state,
     validate_figure,
 )
-from ocr_extractor import PaddleOCRStructuredExtractor
-from hesban_measurements import (
+from processors.ocr import PaddleOCRStructuredExtractor
+from catalog.measurements import (
     manual_calibration,
     measure_figure,
     persist_figure_measurements,
@@ -577,7 +581,8 @@ def check_ai_requirements():
 @app.route('/')
 def index():
     """Main page"""
-    return render_template('index.html')
+    ocr_cell_debug = app.debug or os.environ.get('SHERDSCOPE_OCR_CELL_DEBUG') == '1'
+    return render_template('index.html', ocr_cell_debug=ocr_cell_debug)
 
 # ============================================================================
 # PROJECT MANAGEMENT API ROUTES
@@ -1075,12 +1080,9 @@ def upload_pdf():
         
         file = request.files['file']
         split_pages = request.form.get('split_pages', 'false').lower() == 'true'
-        try:
-            render_dpi = int(request.form.get('render_dpi', '400'))
-        except (TypeError, ValueError):
-            return jsonify({'error': 'Render DPI must be a whole number', 'success': False}), 400
-        if not 200 <= render_dpi <= 600:
-            return jsonify({'error': 'Render DPI must be between 200 and 600', 'success': False}), 400
+        # SherdScope uses one stable render scale. Allowing browser-supplied DPI
+        # changes invalidates masks, OCR coordinates, and measurement geometry.
+        render_dpi = 400
         project_id = request.form.get('project_id', '').strip()
         
         print(f"File name: {file.filename}")
@@ -3015,9 +3017,48 @@ def get_project_metadata_link_evidence(project_id, filename):
                 if index == len(columns) - 1:
                     draw.line((column_right, y1, column_right, y2), fill=color,
                               width=max(2, line_width // 2))
+            row_bounds = boundary.get('row_bounds', [])
+            for index, row_bound in enumerate(row_bounds):
+                if not isinstance(row_bound, dict):
+                    continue
+                top = row_bound.get('top')
+                bottom = row_bound.get('bottom')
+                if top is not None:
+                    draw.line((x1, int(top), x2, int(top)), fill=(249, 115, 22),
+                              width=max(2, line_width // 2))
+                if index == len(row_bounds) - 1 and bottom is not None:
+                    draw.line((x1, int(bottom), x2, int(bottom)), fill=(249, 115, 22),
+                              width=max(2, line_width // 2))
             pad = max(20, round(image.width * .01))
             image = image.crop((max(0, x1-pad), max(0, y1-pad),
                                 min(image.width, x2+pad), min(image.height, y2+pad)))
+        elif request.args.get('cell_row') and request.args.get('cell_field'):
+            diagnostic = next((
+                item for item in boundary.get('cell_diagnostics', [])
+                if str(item.get('row', '')) == str(request.args.get('cell_row', ''))
+                and str(item.get('field', '')) == str(request.args.get('cell_field', ''))
+            ), None)
+            if not diagnostic or len(diagnostic.get('crop', [])) != 4:
+                return jsonify({'error': 'Development cell crop not found',
+                                'success': False}), 404
+            focused = request.args.get('cell_view') == 'focused'
+            crop_box = diagnostic.get('focused_crop') if focused else diagnostic.get('crop')
+            if not isinstance(crop_box, (list, tuple)) or len(crop_box) != 4:
+                return jsonify({'error': 'Focused OCR was not run for this cell',
+                                'success': False}), 404
+            image = image.crop(tuple(int(value) for value in crop_box))
+            if focused:
+                preparation = diagnostic.get('focused_preparation')
+                if preparation == 'generic_cell':
+                    from processors.ocr import _prepare_table_cell
+                    image = _prepare_table_cell(
+                        image, diagnostic.get('focused_keep_bounds'))
+                elif preparation == 'compact':
+                    from processors.ocr import _prepare_compact_cell
+                    image = _prepare_compact_cell(image)
+                else:
+                    from processors.ocr import _prepare_image
+                    image = _prepare_image(image, min_height=100)
         elif request.args.get('ocr_row') and request.args.get('ocr_field'):
             diagnostic = next((
                 item for item in (page or {}).get('ocr_diagnostics', [])
@@ -3027,7 +3068,7 @@ def get_project_metadata_link_evidence(project_id, filename):
             if not diagnostic or len(diagnostic.get('crop', [])) != 4:
                 return jsonify({'error': 'OCR diagnostic crop not found',
                                 'success': False}), 404
-            from ocr_extractor import _prepare_compact_cell
+            from processors.ocr import _prepare_compact_cell
             image = _prepare_compact_cell(image.crop(tuple(
                 int(value) for value in diagnostic['crop'])))
         elif page and page.get('crop'):
@@ -3229,13 +3270,15 @@ def update_project_metadata_link_figure(project_id, figure_id):
                     with PILImage.open(project_path / 'images' /
                                        Path(str(drawing.get('image_name', ''))).name) as page_image:
                         page_width, page_height = page_image.size
-                    margin_x, margin_y = max(10, (x2 - x1) * .08), max(10, (y2 - y1) * .08)
+                    margin_x = (x2 - x1) * .15
+                    margin_y = (y2 - y1) * .15
                     if any(point[0] < 0 or point[0] > page_width or
                            point[1] < 0 or point[1] > page_height or
                            point[0] < x1 - margin_x or point[0] > x2 + margin_x or
                            point[1] < y1 - margin_y or point[1] > y2 + margin_y
                            for point in endpoints):
-                        raise ValueError('Rim endpoints must remain inside the drawing crop')
+                        raise ValueError(
+                            'Rim endpoints cannot exceed the drawing bounding box by more than 15%')
                 calibration = figure.get('scale_calibrations', {}).get(
                     str(drawing.get('image_name', '')), {})
                 value = submitted.get('verified_cm')

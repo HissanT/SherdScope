@@ -5,7 +5,7 @@ import fitz
 import pytest
 from PIL import Image
 
-from metadata_linker import AmbiguousSourceError, ensure_page_manifest, record_pdf_pages
+from catalog.linkage import AmbiguousSourceError, ensure_page_manifest, record_pdf_pages
 
 
 def _write_pdf(path: Path, pages: int = 2) -> None:

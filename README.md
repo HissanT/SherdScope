@@ -240,7 +240,7 @@ pytest -q
 
 At the current milestone:
 
-- all 77 Python tests pass;
+- the complete Python test suite passes;
 - JavaScript syntax checks pass for the main, Review & Link, and Export scripts;
 - Python compilation and Git diff validation pass;
 - a local PP-OCRv5 acceptance check read all 19 Non-Plastics Type values in
@@ -253,17 +253,18 @@ Real-corpus results still require researcher review.
 
 ## Repository structure
 
-Key implementation files include:
+The repository root is intentionally limited to the Flask launcher,
+documentation, dependency lists, version metadata, and platform launchers.
+Implementation is grouped by responsibility:
 
-- `app.py` - Flask application and project APIs;
-- `metadata_linker.py` - figure discovery, validation, review persistence, and
-  CSV application;
-- `ocr_extractor.py` - local OCR, table boundaries, adaptive columns, rows, and
-  diagnostic evidence;
-- `hesban_measurements.py` - graphic-scale calibration and rim measurement;
-- `research_export.py` - clean CSV and dataset ZIP generation;
-- `static/js/tabular-tab.js` - Review & Link workspace;
-- `static/js/export-tab.js` - export selection and downloads;
+- `app.py` - the obvious Flask entry point and application API assembly;
+- `catalog/` - figure/table linkage, measurements, sidecar persistence, and
+  clean research-dataset export;
+- `processors/` - PDF rendering, OCR, model architecture, and the image
+  processing pipeline;
+- `routes/` - focused Flask route groups;
+- `services/` - project-workspace management;
+- `static/` and `templates/` - browser assets and the application page;
 - `tests/` - unit and Flask integration coverage.
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed implementation history.

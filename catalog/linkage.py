@@ -932,7 +932,7 @@ class MetadataLinker:
                         figure["table_rows"].append(clean)
                         missing.remove(normalized_number)
             try:
-                from hesban_measurements import measure_figure
+                from catalog.measurements import measure_figure
                 figure_sources = {page.get("source_pdf") for page in figure.get("drawing_pages", [])}
                 figure_dpis = {page.get("render_dpi") for page in figure.get("drawing_pages", [])
                                if page.get("render_dpi") is not None}

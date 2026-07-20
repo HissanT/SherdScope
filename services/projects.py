@@ -1,7 +1,4 @@
-"""
-Project Manager for PyPotteryLens
-Handles creation, loading, and management of project workspaces
-"""
+"""Creation, loading, and management of SherdScope project workspaces."""
 
 import json
 import re

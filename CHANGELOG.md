@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-07-19
+
+### Changed
+
+- Reorganized the Python implementation into purpose-based packages: catalogue linkage, measurements, sidecars, and research export now live in `catalog/`; OCR, model architecture, PDF handling, configuration, and image-processing code live in `processors/`; and project workspace management lives in `services/`.
+- Kept `app.py` as the single obvious root-level Python launcher and preserved the existing Flask routes, file formats, browser asset paths, and platform launch commands.
+- Updated application, route, and test imports for the new package layout, and revised the README structure guide so it matches the repository.
+
+### Removed
+
+- Removed the unreferenced duplicate model downloader, obsolete private sidecar alias, commented-out duplicate implementations, and broad compatibility re-exports after repository-wide reference tracing showed that the application did not use them.
+- Removed the old root-level implementation modules after moving their active code into the focused packages. No compatibility shims were retained because no repository, documentation, test, or launcher consumer used the old import paths; unknown external scripts must update their imports.
+
+### Tests
+
+- Full Python suite: 93 tests passed.
+- Ruff lint/static analysis passed for the product and test code.
+- Python compilation passed for all tracked and newly organized source and test files, and importing `app` succeeded with all 78 Flask routes registered.
+- JavaScript syntax validation passed for all 8 tracked scripts.
+- Launch-path, template asset, stale-import, and Git diff validation passed. Diff validation reported only the repository's existing Windows line-ending warnings.
+
 ## 2026-07-16
 
 ### Added

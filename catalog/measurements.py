@@ -356,11 +356,33 @@ def detect_rim_diameter(image_path: Path, bbox: Iterable[int],
     observed_span_px = float(rim_right - rim_left)
     agreement = (abs(observed_span_px - axis_diameter_px) / axis_diameter_px
                  if axis_diameter_px is not None and observed_span_px else None)
-    confidence = 0.9 if agreement is not None and agreement <= 0.05 else 0.55
-    status = "verified_automatic" if agreement is not None and agreement <= 0.05 else "unresolved"
+    # A small difference between the observed rim stroke and the mirrored
+    # centreline estimate is normal in scanned drawings. Keep 5--15% as an
+    # accepted advisory range; only larger disagreement requires attention.
+    ideal_agreement = agreement is not None and agreement <= 0.05
+    acceptable_agreement = agreement is not None and agreement <= 0.15
+    confidence = 0.9 if ideal_agreement else 0.75 if acceptable_agreement else 0.55
+    status = "verified_automatic" if acceptable_agreement else "unresolved"
     suggested_cm = axis_diameter_px / px_per_cm if axis_diameter_px else None
     inferred_right = (rim_left + axis_diameter_px
                       if axis_diameter_px is not None else rim_right)
+    bbox_width = float(x2 - x1)
+    bbox_height = float(y2 - y1)
+    allowed_x_margin = bbox_width * 0.15
+    allowed_y_margin = bbox_height * 0.15
+    inferred_page_endpoints = [
+        [left + rim_left, top + rim_y],
+        [left + inferred_right, top + rim_y],
+    ]
+    exceeds_bbox_limit = any(
+        point_x < x1 - allowed_x_margin or point_x > x2 + allowed_x_margin
+        or point_y < y1 - allowed_y_margin or point_y > y2 + allowed_y_margin
+        for point_x, point_y in inferred_page_endpoints
+    )
+    if exceeds_bbox_limit:
+        status = "unresolved"
+        confidence = min(confidence, 0.25)
+        suggested_cm = None
     result = {
         **base, "status": status, "confidence": confidence,
         "suggested_cm": suggested_cm,
@@ -368,8 +390,7 @@ def detect_rim_diameter(image_path: Path, bbox: Iterable[int],
         "diameter_px": axis_diameter_px, "axis_diameter_px": axis_diameter_px,
         "observed_span_px": observed_span_px,
         "agreement": agreement,
-        "rim_endpoints": [[left + rim_left, top + rim_y],
-                          [left + inferred_right, top + rim_y]],
+        "rim_endpoints": inferred_page_endpoints,
         "observed_rim_endpoints": [[left + rim_left, top + rim_y],
                                    [left + rim_right, top + rim_y]],
         "connected_radius_endpoints": ([[left + rim_left, top + rim_y],
@@ -379,7 +400,11 @@ def detect_rim_diameter(image_path: Path, bbox: Iterable[int],
         "rim_search_region": [left, top + bbox_top, right, top + search_bottom],
         "scale_page_fingerprint": calibration.get("page_fingerprint", ""),
     }
-    if status == "unresolved":
+    if exceeds_bbox_limit:
+        result["warning"] = "rim_endpoints_exceed_drawing_bbox"
+    elif status == "verified_automatic" and not ideal_agreement:
+        result["warning"] = "diameter_estimators_minor_disagreement"
+    elif status == "unresolved":
         result["warning"] = "diameter_estimators_disagree" if axis_diameter_px else "centreline_not_found"
     return result
 
@@ -443,7 +468,7 @@ def persist_figure_measurements(project_path: Path, figure: dict[str, Any]) -> N
     # Import lazily to avoid the module-level linker -> measurement dependency.
     # Reviewer edits are allowed while later figures are processing, so this
     # must share the same lock as linkage state and CSV approval writes.
-    from metadata_linker import _LINKAGE_STATE_LOCK
+    from catalog.linkage import _LINKAGE_STATE_LOCK
     with _LINKAGE_STATE_LOCK:
         _persist_figure_measurements(project_path, figure)
 

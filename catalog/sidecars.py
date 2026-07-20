@@ -94,10 +94,6 @@ def assign_px_per_cm(scales: list, centroid: tuple):
     return None
 
 
-# Backward-compatible private name used inside the existing extraction code.
-_assign_px_per_cm = assign_px_per_cm
-
-
 __all__ = [
     "SCALE_SIDECAR_SUFFIX",
     "VESSELS_SIDECAR_SUFFIX",

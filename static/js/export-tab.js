@@ -184,6 +184,13 @@
                 throw new Error(error.error || 'Export failed');
             }
             const blob = await response.blob();
+            if (!blob.size) throw new Error('The server returned an empty export. Please try again.');
+            if (kind === 'dataset') {
+                const signature = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+                if (signature[0] !== 0x50 || signature[1] !== 0x4b) {
+                    throw new Error('The downloaded dataset was not a valid ZIP file.');
+                }
+            }
             const url = URL.createObjectURL(blob);
             const anchor = document.createElement('a');
             anchor.href = url;
@@ -191,7 +198,10 @@
             document.body.appendChild(anchor);
             anchor.click();
             anchor.remove();
-            URL.revokeObjectURL(url);
+            // Large ZIP downloads can still be reading this object URL after
+            // the synthetic click returns. Revoke it later; immediate cleanup
+            // can produce a zero-byte or corrupt archive while small CSVs work.
+            window.setTimeout(() => URL.revokeObjectURL(url), 60000);
             window.PyPotteryUtils.showToast('Export downloaded', 'success');
         } catch (error) {
             window.PyPotteryUtils.showToast(error.message, 'error');
