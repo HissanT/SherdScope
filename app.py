@@ -790,26 +790,11 @@ def get_project_masks(project_id):
         if masks is None:
             return jsonify({'error': 'Project not found', 'success': False}), 404
         
-        masks_path = project_manager.get_project_path(project_id, 'masks')
-        masks_with_vessels = []
-        if masks_path and masks_path.exists():
-            for filename in masks:
-                if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                    continue
-                try:
-                    with Image.open(masks_path / filename) as mask_image:
-                        if mask_image.getbbox() is not None:
-                            masks_with_vessels.append(filename)
-                except (OSError, ValueError):
-                    # Do not silently hide a page when its mask cannot be read.
-                    masks_with_vessels.append(filename)
-
         # Create URLs for each mask
         mask_urls = [f'/api/projects/{project_id}/mask/{img}' for img in masks]
         
         return jsonify({
             'masks': mask_urls,
-            'masks_with_vessels': masks_with_vessels,
             'count': len(masks),
             'success': True
         })

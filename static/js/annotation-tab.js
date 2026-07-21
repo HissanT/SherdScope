@@ -276,7 +276,9 @@ function resetAnnotationTab() {
 }
 
 function imageHasVessels(img) {
-    return Boolean(img && (img.hasVesselMask || annotationState.vesselsSummary[img.baseName] > 0));
+    // The model writes a mask file only when it detects at least one vessel.
+    // Manually drawn polygons also make a page eligible even without a model mask.
+    return Boolean(img && (img.hasMask || annotationState.vesselsSummary[img.baseName] > 0));
 }
 
 function getVisibleImageIndices() {
@@ -335,9 +337,6 @@ async function loadProjectImages() {
         
         const imageUrls = imagesRes.images || [];
         const maskUrls = masksRes.success ? (masksRes.masks || []) : [];
-        const vesselMaskFiles = new Set(
-            masksRes.success ? (masksRes.masks_with_vessels || []) : []
-        );
         
         // Get excluded images from project settings
         const excludedImages = new Set();
@@ -370,8 +369,7 @@ async function loadProjectImages() {
                     maskUrl: maskMap[base] || null,
                     filename: filename,
                     baseName: base,
-                    hasMask: !!maskMap[base],
-                    hasVesselMask: vesselMaskFiles.has(`${base}_mask_layer.png`)
+                    hasMask: !!maskMap[base]
                 };
             });
         
@@ -1290,16 +1288,6 @@ async function saveMask() {
         if (result.success) {
             annotationState.isModified = false;
             img.hasMask = true;
-            const pixels = annotationState.maskCtx.getImageData(
-                0, 0, annotationState.maskCanvas.width, annotationState.maskCanvas.height
-            ).data;
-            img.hasVesselMask = false;
-            for (let i = 0; i < pixels.length; i += 4) {
-                if (pixels[i] || pixels[i + 1] || pixels[i + 2] || pixels[i + 3]) {
-                    img.hasVesselMask = true;
-                    break;
-                }
-            }
             // Update maskUrl so it can be reloaded
             img.maskUrl = result.mask_url || `/api/projects/${projectId}/mask/${img.baseName}_mask_layer.png`;
             renderImageList();
