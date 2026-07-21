@@ -24,11 +24,16 @@ let tabularState = {
     metadataSnapshots: new Map(),
     selectedFigureKey: null,
     metadataEvidenceState: new Map(),
-    metadataRenderedFigureSignatures: new Map()
+    metadataRenderedFigureSignatures: new Map(),
+    metadataProfile: null,
+    metadataFigureDetails: new Map(),
+    metadataBackendReload: null,
+    metadataStaleFigureCount: 0
 };
 
 document.addEventListener('DOMContentLoaded', () => {
     setupTabularListeners();
+    organizeAdvancedReviewTools();
     loadCurrentProject();
     
     // Listen for project changes
@@ -41,12 +46,29 @@ document.addEventListener('DOMContentLoaded', () => {
         tabularState.metadataSnapshots.clear();
         tabularState.metadataEvidenceState.clear();
         tabularState.metadataRenderedFigureSignatures.clear();
+        tabularState.metadataFigureDetails.clear();
         tabularState.metadataSaveTimers.forEach(timer => clearTimeout(timer));
         tabularState.metadataSaveTimers.clear();
         tabularState.metadataSaveQueues.clear();
         loadProjectCards();
     });
 });
+
+function organizeAdvancedReviewTools() {
+    const tab = document.getElementById('tabular-tab');
+    const tablePanel = tab?.querySelector('.tabular-table');
+    const metadataPanel = document.getElementById('metadata-link-panel');
+    if (!tab || !tablePanel || !metadataPanel || tab.querySelector('.metadata-advanced-tools')) return;
+    const details = document.createElement('details');
+    details.className = 'metadata-advanced-tools';
+    details.innerHTML = '<summary>Advanced legacy tools</summary><div></div>';
+    const body = details.querySelector('div');
+    [tab.querySelector('.navigation-bar'), tab.querySelector('.tabular-sidebar'),
+     tab.querySelector('.tabular-image'), ...tablePanel.querySelectorAll(':scope > .form-row, :scope > .collapsible-panel, :scope > #tabular-table-container')]
+        .filter(Boolean).forEach(element => body.appendChild(element));
+    metadataPanel.insertAdjacentElement('afterend', details);
+    tab.querySelector('.tabular-layout')?.classList.add('metadata-primary-layout');
+}
 
 function loadCurrentProject() {
     if (window.projectManager && window.projectManager.getCurrentProject) {
@@ -794,8 +816,8 @@ function updateReviewedButton() {
     }
 }
 
-const HESBAN_LINK_FIELDS = [
-    ['table_no', 'No.'], ['table_type', 'Type'], ['table_square', 'Sq'],
+let HESBAN_LINK_FIELDS = [
+    ['table_no', 'No.'], ['table_type', 'Type'], ['table_square', 'Sq/Area'],
     ['table_locus', 'Loc'], ['table_pail', 'Pail'], ['table_registration', 'Reg'],
     ['fabric_exterior', 'Exterior'], ['fabric_core', 'Core'], ['fabric_interior', 'Interior'],
     ['nonplastics_type', 'Typ'], ['nonplastics_size', 'Siz'],
@@ -805,24 +827,40 @@ const HESBAN_LINK_FIELDS = [
     ['surface_interior', 'Int'], ['surface_interior_color', 'Color'],
     ['decor', 'Decor'], ['fire', 'Fire']
 ];
-const HESBAN_LINK_COLUMNS = HESBAN_LINK_FIELDS.map(field => field[0]);
+let HESBAN_LINK_COLUMNS = HESBAN_LINK_FIELDS.map(field => field[0]);
+
+function applyMetadataProfile(profile) {
+    if (!profile?.columns?.length) return;
+    tabularState.metadataProfile = profile;
+    HESBAN_LINK_FIELDS = profile.columns.map(column => [column.key, column.ui_label]);
+    HESBAN_LINK_COLUMNS = HESBAN_LINK_FIELDS.map(field => field[0]);
+}
 
 function hesbanGroupedHeaders() {
-    return `<tr class="metadata-link-group-header">
-        <th rowspan="2" class="sticky-col sticky-actions">Actions</th>
-        <th rowspan="2" class="sticky-col sticky-no">No.</th>
-        <th rowspan="2" class="sticky-col sticky-type">Type</th>
-        <th rowspan="2" class="metadata-diameter-header">Rim Diameter (cm)</th>
-        <th rowspan="2" data-column-group="identity">Sq</th><th rowspan="2">Loc</th><th rowspan="2">Pail</th><th rowspan="2">Reg</th>
-        <th colspan="3" data-column-group="fabric">Fabric Color</th><th colspan="4" data-column-group="nonplastics">Non-Plastics</th>
-        <th colspan="2" data-column-group="voids">Voids</th><th rowspan="2">Man</th>
-        <th colspan="4" data-column-group="surface">Surface Treatment</th><th rowspan="2" data-column-group="finish">Decor</th><th rowspan="2">Fire</th>
-    </tr><tr class="metadata-link-sub-header">
-        <th>Exterior</th><th>Core</th><th>Interior</th>
-        <th>Typ</th><th>Siz</th><th>Shap</th><th>Den</th>
-        <th>Ty/Sz</th><th>Den</th>
-        <th>Ext</th><th>Color</th><th>Int</th><th>Color</th>
-    </tr>`;
+    const columns = tabularState.metadataProfile?.columns || HESBAN_LINK_FIELDS.map(
+        ([key, label]) => ({key, ui_label: label, group: 'identity', header_tier: 'primary'}));
+    const groupMap = new Map((tabularState.metadataProfile?.groups || []).map(group =>
+        [group.key, group]));
+    let top = '<th rowspan="2" class="sticky-col sticky-actions">Actions</th>';
+    let bottom = '';
+    for (let index = 0; index < columns.length;) {
+        const column = columns[index];
+        if (index === 2) top += '<th rowspan="2" class="metadata-diameter-header">Rim Diameter (cm)</th>';
+        const group = groupMap.get(column.group);
+        if (column.header_tier === 'secondary' && group?.header_label) {
+            const members = [];
+            while (index < columns.length && columns[index].group === column.group &&
+                   columns[index].header_tier === 'secondary') members.push(columns[index++]);
+            top += `<th colspan="${members.length}" data-column-group="${linkEscape(column.group)}">${linkEscape(group.header_label)}</th>`;
+            bottom += members.map(member => `<th>${linkEscape(member.ui_label)}</th>`).join('');
+            continue;
+        }
+        const sticky = index === 0 ? ' class="sticky-col sticky-no"' :
+            index === 1 ? ' class="sticky-col sticky-type"' : '';
+        top += `<th rowspan="2"${sticky} data-column-group="${linkEscape(column.group || '')}">${linkEscape(column.ui_label)}</th>`;
+        index += 1;
+    }
+    return `<tr class="metadata-link-group-header">${top}</tr><tr class="metadata-link-sub-header">${bottom}</tr>`;
 }
 
 function linkEscape(value) {
@@ -839,11 +877,37 @@ async function loadMetadataLinkState() {
         const data = await window.PyPotteryUtils.apiRequest(
             `/api/projects/${tabularState.currentProject.project_id}/metadata-link/state`);
         if (!data.success) return;
-        tabularState.metadataLinkState = data.state;
+        applyMetadataProfile(data.profile);
+        const summaries = data.state?.figures || [];
+        if (!summaries.some(figure =>
+            (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey)) {
+            const attention = summaries.find(figure => figure.needs_column_review ||
+                (figure.processing_status !== 'processing' && figure.processing_status !== 'queued' &&
+                 figure.review_status !== 'approved' && figure.status !== 'ready'));
+            const reviewable = summaries.find(figure =>
+                !['processing', 'queued'].includes(figure.processing_status));
+            const choice = attention || reviewable || summaries[0];
+            tabularState.selectedFigureKey = choice ? (choice.figure_key || choice.figure_id) : null;
+        }
+        if (tabularState.selectedFigureKey) {
+            try {
+                const detail = await window.PyPotteryUtils.apiRequest(
+                    `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(tabularState.selectedFigureKey)}`);
+                if (detail.success) tabularState.metadataFigureDetails.set(
+                    tabularState.selectedFigureKey, detail.figure);
+            } catch (error) {
+                console.warn('Could not load selected figure detail', error);
+            }
+        }
+        const displayState = {...data.state, figures: summaries.map(summary => {
+            const key = summary.figure_key || summary.figure_id;
+            return tabularState.metadataFigureDetails.get(key) || summary;
+        })};
+        tabularState.metadataLinkState = displayState;
         // The tabular page is commonly already open when the background OCR
         // finishes. Update its box labels immediately; otherwise every box
         // remains the initial ``?`` until the user navigates away and back.
-        const stagedNumbers = new Map((data.state?.figures || []).flatMap(figure =>
+        const stagedNumbers = new Map((displayState.figures || []).flatMap(figure =>
             (figure.drawings || []).map(drawing => [
                 String(drawing.mask_file || '').replace(/\.png$/i, ''),
                 String(drawing.vessel_number || '').trim()
@@ -858,6 +922,9 @@ async function loadMetadataLinkState() {
         });
         if (labelsChanged) redrawTabularCanvas();
         tabularState.metadataLinkOcrAvailable = data.ocr_available;
+        tabularState.metadataLinkOcrHealth = data.ocr_health || null;
+        tabularState.metadataBackendReload = data.backend_reload || null;
+        tabularState.metadataStaleFigureCount = Number(data.stale_figure_count || 0);
         const sourceSelect = document.getElementById('metadata-link-source');
         if (sourceSelect) {
             const previous = sourceSelect.value;
@@ -866,9 +933,10 @@ async function loadMetadataLinkState() {
             if (data.sources.includes(previous)) sourceSelect.value = previous;
             sourceSelect.hidden = data.sources.length <= 1;
         }
-        renderMetadataLinkState(data.state, data.active);
+        renderMetadataLinkState(displayState, data.active);
         clearTimeout(tabularState.metadataLinkPoll);
-        if (data.active || data.state.status === 'running') {
+        if (data.active || data.state.status === 'running' || data.jobs?.paused ||
+                (data.jobs?.queued || []).length) {
             tabularState.metadataLinkPoll = setTimeout(loadMetadataLinkState, 1500);
         }
     } catch (error) {
@@ -883,7 +951,11 @@ async function runMetadataLinking() {
     const source = document.getElementById('metadata-link-source')?.value || '';
     const backend = 'ocr';
     try {
-        if (button) button.disabled = true;
+        if (button) {
+            button.disabled = true;
+            button.textContent = 'Queuing…';
+            button.setAttribute('aria-busy', 'true');
+        }
         const backendParams = {backend};
         if (backend === 'openrouter') {
             backendParams.openrouter_api_key = document.getElementById('ai-openrouter-apikey')?.value.trim() || '';
@@ -895,12 +967,45 @@ async function runMetadataLinking() {
                 body: JSON.stringify({...backendParams, source_pdf: source || null})
             });
         if (!response.success) throw new Error(response.error || 'Could not start linking');
-        window.PyPotteryUtils.showToast('Figure-table linking started', 'success');
+        if (button) button.textContent = 'Queued';
+        window.PyPotteryUtils.showToast('Figure-table linking queued', 'success');
         await loadMetadataLinkState();
     } catch (error) {
         window.PyPotteryUtils.showToast(error.message, 'error');
+        if (button) { button.disabled = false; button.textContent = 'Failed'; }
     } finally {
-        if (button) button.disabled = false;
+        button?.removeAttribute('aria-busy');
+    }
+}
+
+async function runMetadataButtonAction(button, runningText, doneText, action) {
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = runningText;
+    button.setAttribute('aria-busy', 'true');
+    try {
+        const result = await action();
+        if (button.isConnected) button.textContent = doneText;
+        return result;
+    } catch (error) {
+        if (button.isConnected) button.textContent = 'Failed';
+        throw error;
+    } finally {
+        if (button.isConnected) {
+            button.removeAttribute('aria-busy');
+            if ([doneText, 'Failed'].includes(button.textContent)) {
+                const finalText = button.textContent;
+                setTimeout(() => {
+                    if (button.isConnected && button.textContent === finalText) {
+                        button.disabled = false;
+                        button.textContent = originalText;
+                    }
+                }, 1400);
+            } else {
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+        }
     }
 }
 
@@ -909,25 +1014,71 @@ function renderMetadataLinkState(state, active) {
     const progress = document.getElementById('metadata-link-progress');
     const progressBar = document.getElementById('metadata-link-progress-bar');
     const figuresContainer = document.getElementById('metadata-link-figures');
+    const jobsElement = document.getElementById('metadata-link-jobs');
     const figures = state?.figures || [];
-    const matches = figures.flatMap(figure => figure.matches || []);
-    const ready = matches.filter(match => match.status === 'ready').length;
-    const unresolved = matches.length - ready;
+    const ready = figures.reduce((total, figure) => total +
+        (figure.matches ? figure.matches.filter(match => match.status === 'ready').length :
+         Math.max(0, Number(figure.match_count || 0) - Number(figure.unresolved_count || 0))), 0);
+    const unresolved = figures.reduce((total, figure) => total +
+        (figure.matches ? figure.matches.filter(match => match.status !== 'ready').length :
+         Number(figure.unresolved_count || 0)), 0);
     const approved = figures.filter(figure => figure.review_status === 'approved').length;
+    if (jobsElement) {
+        const restartRequired = tabularState.metadataBackendReload?.required === true;
+        const activeJob = state?.jobs?.active;
+        const pausedJob = state?.jobs?.paused;
+        const queuedJobs = state?.jobs?.queued || [];
+        const latestJob = state?.jobs?.recent?.[0];
+        jobsElement.hidden = !restartRequired && !activeJob && !pausedJob && !queuedJobs.length && !latestJob;
+        jobsElement.innerHTML = [
+            restartRequired
+                ? `<strong>Restart SherdScope</strong><span class="failed">${linkEscape(tabularState.metadataBackendReload.message)}</span>`
+                : '',
+            activeJob ? `<strong>${linkEscape(activeJob.progress?.message || activeJob.kind)}</strong><span>Running</span>` : '',
+            pausedJob ? `<strong>${linkEscape(pausedJob.progress?.message || pausedJob.kind)}</strong><span>Paused; resumes automatically</span>` : '',
+            ...queuedJobs.slice(0, 4).map(job => `<strong>${linkEscape(job.kind.replaceAll('_', ' '))}</strong><span>Queued</span>`),
+            latestJob && !activeJob && !pausedJob && !queuedJobs.length
+                ? `<strong>${linkEscape(latestJob.kind.replaceAll('_', ' '))}</strong><span class="${latestJob.status === 'failed' ? 'failed' : 'done'}">${latestJob.status === 'failed' ? `Failed: ${linkEscape(latestJob.error || 'Unknown error')}` : 'Done'}</span>` : ''
+        ].filter(Boolean).join('');
+    }
+    const runButton = document.getElementById('metadata-link-run-btn');
+    const bulkJob = [state?.jobs?.active, state?.jobs?.paused,
+        ...(state?.jobs?.queued || [])].find(job => job?.kind === 'bulk_link');
+    if (runButton) {
+        const restartRequired = tabularState.metadataBackendReload?.required === true;
+        runButton.disabled = !!bulkJob || restartRequired;
+        runButton.setAttribute('aria-busy', bulkJob?.status === 'running' ? 'true' : 'false');
+        runButton.textContent = restartRequired ? 'Restart SherdScope first' : bulkJob
+            ? bulkJob.status === 'running' ? 'Reading and linking…' :
+                bulkJob.status === 'paused' ? 'Paused for priority work' : 'Read and Link queued'
+            : 'Read and Link Tables';
+    }
     if (summary) {
+        const activeJob = state?.jobs?.active;
+        const pausedJob = state?.jobs?.paused;
+        const queueCount = (state?.jobs?.queued || []).length;
+        const jobText = activeJob
+            ? ` | ${activeJob.progress?.message || activeJob.kind}`
+            : pausedJob ? ' | Bulk work paused for priority work' : queueCount ? ` | ${queueCount} queued` : '';
         const baseSummary = state?.status === 'error'
             ? `Error: ${state.error || state.progress?.message || 'Unknown error'}`
             : `${figures.length} figures | ${ready} ready matches | ${unresolved} unresolved | ${approved} approved`;
-        summary.textContent = baseSummary + (tabularState.metadataLinkOcrAvailable === false
-            ? ' | Local OCR is not installed yet (install requirements-ocr.txt).'
+        const restartText = tabularState.metadataBackendReload?.required
+            ? ` | ${tabularState.metadataBackendReload.message}`
+            : tabularState.metadataStaleFigureCount
+                ? ` | ${tabularState.metadataStaleFigureCount} figure(s) were read by older OCR logic; run Read and Link Tables again.`
+                : '';
+        summary.textContent = baseSummary + jobText + restartText + (tabularState.metadataLinkOcrAvailable === false
+            ? ` | ${tabularState.metadataLinkOcrHealth?.message || 'Local OCR could not start.'}`
             : '');
     }
-    const current = Number(state?.progress?.current || 0);
-    const total = Number(state?.progress?.total || 0);
+    const currentProgress = state?.jobs?.active?.progress || state?.progress || {};
+    const current = Number(currentProgress.current || 0);
+    const total = Number(currentProgress.total || 0);
     if (progress && progressBar) {
         progress.hidden = !(active || state?.status === 'running');
         progressBar.style.width = `${total ? Math.round(current / total * 100) : 3}%`;
-        progress.title = state?.progress?.message || '';
+        progress.title = currentProgress.message || '';
     }
     if (!figuresContainer) return;
     const selectedExists = figures.some(figure =>
@@ -1014,15 +1165,20 @@ function renderMetadataLinkState(state, active) {
             tabularState.selectedFigureKey = button.dataset.selectFigure;
             figuresContainer.dataset.forceRender = '1';
             button.blur();
-            renderMetadataLinkState(state, active);
+            loadMetadataLinkState();
         }));
     figuresContainer.querySelectorAll('[data-link-save]').forEach(button =>
-        button.addEventListener('click', () => saveMetadataFigure(button.dataset.linkSave)
+        button.addEventListener('click', () => runMetadataButtonAction(
+            button, 'Saving…', 'Done', () => saveMetadataFigure(button.dataset.linkSave))
             .catch(error => window.PyPotteryUtils.showToast(error.message, 'error'))));
     figuresContainer.querySelectorAll('[data-link-approve]').forEach(button =>
-        button.addEventListener('click', () => approveMetadataFigure(button.dataset.linkApprove)));
+        button.addEventListener('click', () => runMetadataButtonAction(
+            button, 'Saving…', 'Done', () => approveMetadataFigure(button.dataset.linkApprove))
+            .catch(() => null)));
     figuresContainer.querySelectorAll('[data-link-reject]').forEach(button =>
-        button.addEventListener('click', () => rejectMetadataFigure(button.dataset.linkReject)));
+        button.addEventListener('click', () => runMetadataButtonAction(
+            button, 'Saving…', 'Done', () => rejectMetadataFigure(button.dataset.linkReject))
+            .catch(() => null)));
     figuresContainer.querySelectorAll('[data-link-add-row]').forEach(button =>
         button.addEventListener('click', () => addMetadataTableRow(button.dataset.linkAddRow)));
     figuresContainer.querySelectorAll('[data-link-delete-row]').forEach(button =>
@@ -1111,7 +1267,10 @@ function renderMetadataLinkState(state, active) {
 }
 
 function metadataFigureStatusLabel(figure) {
+    const needsColumns = figure.needs_column_review || (figure.warnings || []).some(warning =>
+        ['column_headers_incomplete', 'manual_column_bounds_invalid'].includes(warning.code));
     return figure.review_status === 'approved' ? 'Approved'
+        : needsColumns ? 'Adjust columns'
         : figure.processing_status === 'processing' ? 'Processing'
             : figure.processing_status === 'queued' ? 'Waiting'
                 : figure.status === 'ready' ? 'Ready' : 'Needs attention';
@@ -1209,8 +1368,26 @@ function metadataCellDebugMarkup(figure, projectId, reviewKey) {
         ((page.boundary || {}).cell_diagnostics || []).map(cell => ({
             ...cell, image_name: page.image_name
         })));
+    const diagnosticPages = (figure.table_pages || []).filter(page => page.diagnostics_ref);
+    const statusPages = (figure.table_pages || []).filter(page =>
+        (page.boundary || {}).diagnostic_status);
+    const statusMarkup = statusPages.map(page => {
+        const status = page.boundary.diagnostic_status || {};
+        const missing = (status.missing_labels || []).length
+            ? `<br><strong>Missing:</strong> ${linkEscape(status.missing_labels.join(', '))}` : '';
+        return `<p><strong>${linkEscape(page.image_name || 'Table page')}:</strong>
+            ${linkEscape(status.message || '')}${missing}<br>${linkEscape(status.action || '')}</p>`;
+    }).join('');
+    if (!cells.length && diagnosticPages.length) return `<details class="metadata-cell-debug">
+        <summary>Development: inspect OCR cells</summary>
+        <p>Detailed OCR evidence is stored separately so normal progress polling stays fast.</p>
+        ${statusMarkup}
+        ${diagnosticPages.map(page => `<button type="button" data-load-cell-diagnostics="${linkEscape(page.image_name)}"
+            data-figure-id="${linkEscape(reviewKey)}">Load ${linkEscape(page.image_name)}</button>`).join('')}
+    </details>`;
     if (!cells.length) return `<details class="metadata-cell-debug">
         <summary>Development: inspect every OCR cell</summary>
+        ${statusMarkup}
         <p>No saved cell grid exists for this figure yet. Use More → Re-read this figure to generate it with the development extractor.</p>
     </details>`;
     const tokenText = tokens => (tokens || []).map(token =>
@@ -1232,14 +1409,23 @@ function metadataCellDebugMarkup(figure, projectId, reviewKey) {
             data-cell-focused="${linkEscape(focusedText)}"
             data-cell-accepted="${linkEscape(cell.accepted_text || '(blank)')}"
             data-cell-source="${linkEscape(cell.accepted_source || 'table_pass')}"
+            data-cell-geometry="${cell.page_geometry_reliable === false ? 'Crossed a column boundary' : 'Inside this cell'}"
+            data-cell-reason="${linkEscape(cell.decision_reason || '')}"
             data-cell-tokens="${linkEscape(tokenText(cell.initial_tokens) || 'No assigned page token')}"
             data-cell-focused-tokens="${linkEscape(tokenText(cell.focused_tokens) || 'No focused token')}">
             <strong>${linkEscape(cell.row || '?')}</strong><span>${linkEscape(cell.field || '?')}</span>
             <small>${linkEscape(cell.accepted_text || '(blank)')}</small></button>`;
     }).join('');
+    const conflicts = (figure.table_pages || []).flatMap(page =>
+        (page.boundary?.row_anchor_conflicts || []).map(conflict => ({
+            ...conflict, image_name: page.image_name
+        })));
+    const conflictMarkup = conflicts.length ? `<p><strong>${conflicts.length} row-number conflict${conflicts.length === 1 ? '' : 's'} resolved:</strong> ${conflicts.map(conflict =>
+        `${linkEscape((conflict.candidates || []).map(item => item.number).join(' / '))} → ${linkEscape(conflict.chosen || '?')}`).join('; ')}</p>` : '';
     return `<details class="metadata-cell-debug">
         <summary>Development: inspect every OCR cell (${cells.length})</summary>
         <p>Orange horizontal lines and the existing column lines show the exact calculated cell grid. Select a cell to compare the whole-table page pass with the separate cell OCR result used as the final value.</p>
+        ${conflictMarkup}
         <div class="metadata-cell-debug-grid">${buttons}</div>
         <dialog class="metadata-cell-debug-dialog">
             <form method="dialog"><button aria-label="Close cell details">Close</button></form>
@@ -1254,12 +1440,37 @@ function metadataCellDebugMarkup(figure, projectId, reviewKey) {
                 <dt>Cell-pass text</dt><dd data-cell-debug-focused-text></dd>
                 <dt>Cell-pass tokens</dt><dd data-cell-debug-focused-tokens></dd>
                 <dt>Accepted value</dt><dd data-cell-debug-accepted></dd>
+                <dt>Page geometry</dt><dd data-cell-debug-geometry></dd>
+                <dt>Decision</dt><dd data-cell-debug-reason></dd>
             </dl>
         </dialog>
     </details>`;
 }
 
 function wireMetadataCellDebug(scope) {
+    scope.querySelectorAll('[data-load-cell-diagnostics]').forEach(button =>
+        button.addEventListener('click', async () => {
+            try {
+                button.disabled = true; button.textContent = 'Loading…';
+                const response = await window.PyPotteryUtils.apiRequest(
+                    `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(button.dataset.figureId)}/diagnostics/${encodeURIComponent(button.dataset.loadCellDiagnostics)}`);
+                if (!response.success) throw new Error(response.error || 'Could not load diagnostics');
+                const figure = tabularState.metadataLinkState?.figures.find(item =>
+                    (item.figure_key || item.figure_id) === button.dataset.figureId);
+                const page = (figure?.table_pages || []).find(item =>
+                    item.image_name === button.dataset.loadCellDiagnostics);
+                if (page) {
+                    page.boundary.cell_diagnostics = response.diagnostics?.cell_diagnostics || [];
+                    page.boundary.diagnostic_status = response.diagnostics?.status || page.boundary.diagnostic_status;
+                    page.boundary.row_anchor_conflicts = response.diagnostics?.row_anchor_conflicts || [];
+                }
+                document.getElementById('metadata-link-figures').dataset.forceRender = '1';
+                renderMetadataLinkState(tabularState.metadataLinkState, true);
+            } catch (error) {
+                button.disabled = false; button.textContent = 'Retry diagnostics';
+                window.PyPotteryUtils.showToast(error.message, 'error');
+            }
+        }));
     scope.querySelectorAll('[data-cell-debug-open]').forEach(button => {
         button.addEventListener('click', () => {
             const panel = button.closest('.metadata-cell-debug');
@@ -1277,6 +1488,10 @@ function wireMetadataCellDebug(scope) {
             dialog.querySelector('[data-cell-debug-focused-tokens]').textContent = button.dataset.cellFocusedTokens || '';
             dialog.querySelector('[data-cell-debug-accepted]').textContent =
                 `${button.dataset.cellAccepted || ''} (${button.dataset.cellSource || ''})`;
+            dialog.querySelector('[data-cell-debug-geometry]').textContent =
+                button.dataset.cellGeometry || '';
+            dialog.querySelector('[data-cell-debug-reason]').textContent =
+                button.dataset.cellReason || '';
             dialog.showModal();
         });
     });
@@ -1315,10 +1530,18 @@ function renderMetadataFigure(figure) {
     const processing = figure.processing_status === 'processing';
     const waiting = figure.processing_status === 'queued';
     const unavailable = processing || waiting;
-    const status = figure.review_status === 'approved' ? 'Approved'
-        : processing ? 'Processing' : waiting ? 'Waiting'
-            : figure.status === 'ready' ? 'Ready' : 'Needs attention';
+    const status = metadataFigureStatusLabel(figure);
     const disabled = unavailable ? 'disabled' : '';
+    const jobs = tabularState.metadataLinkState?.jobs || {};
+    const figureJobs = [jobs.active, jobs.paused, ...(jobs.queued || [])].filter(job => {
+        const target = String(job?.payload?.figure_key || '');
+        return target && [String(reviewKey), String(figure.figure_id || '')].includes(target);
+    });
+    const measurementJob = figureJobs.find(job => job.kind === 'measurement_reread');
+    const rereadJob = figureJobs.find(job => ['figure_reread', 'boundary_reread'].includes(job.kind));
+    const jobButtonLabel = (job, fallback) => job
+        ? job.status === 'running' ? 'Running…' : job.status === 'paused' ? 'Paused' : 'Queued'
+        : fallback;
     const evidencePages = [
         ...(figure.drawing_pages || []).map(page => ({...page, kind: 'drawing'})),
         ...(figure.table_pages || []).map(page => ({...page, kind: 'table'}))
@@ -1367,7 +1590,7 @@ function renderMetadataFigure(figure) {
             `<td class="${columnIndex === 0 ? 'sticky-col sticky-no' : columnIndex === 1 ? 'sticky-col sticky-type' : ''}"><textarea data-link-column="${column}" ${disabled}>${linkEscape(row[column] || '')}</textarea></td>`);
         dataCells.splice(2, 0, diameterCell);
         return `
-        <tr data-link-row="${rowIndex}">
+        <tr data-link-row="${rowIndex}" ${metadataReviewRowAttribute(row, rowIndex)}>
             <td class="sticky-col sticky-actions metadata-link-row-actions">
                 <button type="button" aria-label="Duplicate row ${rowIndex + 1}" title="Duplicate row"
                         data-link-duplicate-row="${linkEscape(reviewKey)}" data-row-index="${rowIndex}" ${disabled}>⧉</button>
@@ -1412,13 +1635,15 @@ function renderMetadataFigure(figure) {
                     <output data-evidence-page-status aria-live="polite"></output>
                     <button type="button" data-evidence-zoom-out aria-label="Zoom out">Zoom out</button>
                     <button type="button" data-evidence-zoom-in aria-label="Zoom in">Zoom in</button>
+                    <button type="button" data-evidence-columns>Adjust columns</button>
                     <button type="button" data-evidence-boxes>Hide boxes</button>
                     <button type="button" data-evidence-reset>Reset</button></span></div>
                     <div class="metadata-link-pages" data-evidence-index="0" data-evidence-zoom="1">${pageHtml}</div></div>
             </div>
             <section class="metadata-scale-workspace"><div class="metadata-scale-heading">
                 <div><h4>Scale and rim diameters</h4><p>Valid automatic measurements are already accepted. Correct only the values that look wrong.</p></div>
-                <button type="button" data-link-measure="${linkEscape(reviewKey)}" ${disabled}>Re-read measurements</button>
+                <button type="button" data-link-measure="${linkEscape(reviewKey)}"
+                    ${unavailable || measurementJob ? 'disabled' : ''} aria-busy="${measurementJob?.status === 'running'}">${jobButtonLabel(measurementJob, 'Re-read measurements')}</button>
             </div><div class="metadata-scale-cards">${scaleSummary}</div></section>
             <div class="metadata-link-number-workspace"><h4>Drawing numbers</h4>
                 <p>Correct a printed number or diameter only when it does not match the publication.</p>
@@ -1455,7 +1680,7 @@ function renderMetadataFigure(figure) {
                         ${figure.status !== 'ready' || unavailable ? 'disabled' : ''}>Approve and apply to CSV</button>
                 <details class="metadata-more-actions"><summary>More</summary><div>
                     <button class="btn btn-secondary" data-link-rerun="${linkEscape(reviewKey)}"
-                        ${unavailable || tabularState.metadataLinkState?.status === 'running' ? 'disabled' : ''}>Re-read this figure</button>
+                        ${unavailable || rereadJob ? 'disabled' : ''} aria-busy="${rereadJob?.status === 'running'}">${jobButtonLabel(rereadJob, 'Re-read this figure')}</button>
                     <button class="btn btn-danger" data-link-reject="${linkEscape(reviewKey)}" ${disabled}>Reject figure</button>
                 </div></details>
             </div>
@@ -1474,6 +1699,7 @@ function setupMetadataEvidenceViewer(figureElement) {
     const overlayButton = figureElement.querySelector('[data-evidence-boxes]');
     const previousButton = figureElement.querySelector('[data-evidence-prev]');
     const nextButton = figureElement.querySelector('[data-evidence-next]');
+    const columnsButton = figureElement.querySelector('[data-evidence-columns]');
     const applyOverlays = visible => {
         pages.forEach(page => {
             const image = page.querySelector('img');
@@ -1498,6 +1724,11 @@ function setupMetadataEvidenceViewer(figureElement) {
         if (status) status.textContent = pages.length ? `${index + 1} / ${pages.length}` : 'No pages';
         if (previousButton) previousButton.disabled = !pages.length || index === 0;
         if (nextButton) nextButton.disabled = !pages.length || index === pages.length - 1;
+        if (columnsButton) {
+            const image = pages[index]?.querySelector('img');
+            columnsButton.hidden = image?.dataset.evidenceKind !== 'table';
+            columnsButton.dataset.imageName = image?.alt || '';
+        }
     };
     const setZoom = value => {
         const zoom = Math.max(.5, Math.min(2.5, value));
@@ -1531,12 +1762,187 @@ function setupMetadataEvidenceViewer(figureElement) {
     figureElement.querySelector('[data-evidence-zoom-in]')?.addEventListener('click', () =>
         setZoom(Number(viewer.dataset.evidenceZoom || 1) + .15));
     figureElement.querySelector('[data-evidence-reset]')?.addEventListener('click', () => setZoom(1));
+    columnsButton?.addEventListener('click', () => {
+        if (columnsButton.dataset.imageName) openMetadataColumnEditor(
+            figureKey, columnsButton.dataset.imageName);
+    });
     overlayButton?.addEventListener('click', event => {
         const currentlyVisible = event.currentTarget.dataset.hidden !== '1';
         stored.overlays = !currentlyVisible;
         tabularState.metadataEvidenceState.set(figureKey, stored);
         applyOverlays(stored.overlays);
     });
+}
+
+async function openMetadataColumnEditor(figureId, imageName) {
+    const figure = tabularState.metadataLinkState?.figures.find(item =>
+        (item.figure_key || item.figure_id) === figureId);
+    const page = (figure?.table_pages || []).find(item => item.image_name === imageName);
+    if (!figure || !page) return;
+    const boundary = page.boundary || {};
+    const imageSize = boundary.image_size || [1, 1];
+    const imageWidth = Number(imageSize[0] || 1);
+    const imageHeight = Number(imageSize[1] || 1);
+    const table = boundary.table_bounds || [0, 0, imageWidth, imageHeight];
+    let edges = page.manual_column_edges || boundary.normalized_column_edges;
+    if (!Array.isArray(edges) || edges.length !== HESBAN_LINK_COLUMNS.length + 1) {
+        const left = Number(table[0] || 0) / imageWidth;
+        const right = Number(table[2] || imageWidth) / imageWidth;
+        const suggestions = Array(HESBAN_LINK_COLUMNS.length + 1).fill(null);
+        const anchors = Array.isArray(boundary.header_anchors) ? boundary.header_anchors : [];
+        const heights = anchors.map(anchor => Number(anchor.bbox?.[3]) - Number(anchor.bbox?.[1]))
+            .filter(height => Number.isFinite(height) && height > 0).sort((a, b) => a - b);
+        const medianHeight = heights.length ? heights[Math.floor(heights.length / 2)] : 20;
+        const lead = Math.max(3, Math.min(18, medianHeight * .2));
+        anchors.forEach(anchor => {
+            const index = HESBAN_LINK_COLUMNS.indexOf(anchor.column);
+            const anchorLeft = Number(anchor.bbox?.[0]);
+            if (index >= 0 && Number.isFinite(anchorLeft)) {
+                suggestions[index] = Math.max(0, anchorLeft - lead) / imageWidth;
+            }
+        });
+        suggestions[22] = right;
+        if (suggestions.some(value => value != null)) {
+            if (suggestions[0] == null) suggestions[0] = left;
+            const known = suggestions.map((value, index) => value == null ? null : index)
+                .filter(index => index != null);
+            for (let part = 0; part < known.length - 1; part += 1) {
+                const start = known[part]; const end = known[part + 1];
+                for (let index = start + 1; index < end; index += 1) {
+                    suggestions[index] = suggestions[start] +
+                        (suggestions[end] - suggestions[start]) * (index - start) / (end - start);
+                }
+            }
+            edges = suggestions;
+        } else {
+            edges = Array.from({length: HESBAN_LINK_COLUMNS.length + 1}, (_, index) =>
+                left + (right - left) * index / HESBAN_LINK_COLUMNS.length);
+        }
+    }
+    edges = edges.map(Number);
+    const dialog = document.createElement('dialog');
+    dialog.className = 'metadata-column-dialog';
+    dialog.innerHTML = `<form method="dialog"><header><div><strong>Adjust table columns</strong>
+        <span>${linkEscape(imageName)}</span></div><button aria-label="Cancel column changes">Cancel</button></header>
+        <p>Drag a line, or select it and use the arrow keys. Lines cannot cross.</p>
+        <div class="metadata-column-canvas-wrap"><canvas tabindex="0" aria-label="Draggable table column lines"></canvas></div>
+        <footer><output data-column-output aria-live="polite"></output><div>
+            <button type="button" data-column-reset>Reset to detected</button>
+            <button type="button" data-column-save>Save and re-read</button>
+        </div></footer></form>`;
+    document.body.appendChild(dialog);
+    const canvas = dialog.querySelector('canvas');
+    const ctx = canvas.getContext('2d');
+    const output = dialog.querySelector('[data-column-output]');
+    const image = new Image();
+    image.src = `/api/projects/${tabularState.currentProject.project_id}/metadata-link/evidence/${encodeURIComponent(imageName)}` +
+        `?figure=${encodeURIComponent(figureId)}&kind=table&overlay=0&full=1&v=${Date.now()}`;
+    let selected = 0;
+    let dragging = false;
+    const padding = Math.max(18, imageWidth * .01);
+    const topPadding = Math.max(80, (Number(table[3]) - Number(table[1])) * .08);
+    const view = [Math.max(0, Number(table[0]) - padding),
+        Math.max(0, Number(table[1]) - topPadding),
+        Math.min(imageWidth, Number(table[2]) + padding),
+        Math.min(imageHeight, Number(table[3]) + padding)];
+    const resize = () => {
+        const width = Math.min(1500, Math.max(720, window.innerWidth * .88));
+        const ratio = (view[3] - view[1]) / Math.max(1, view[2] - view[0]);
+        canvas.width = Math.round(width);
+        canvas.height = Math.round(Math.min(window.innerHeight * .7, width * ratio));
+    };
+    const imageX = normalized => normalized * imageWidth;
+    const canvasX = normalized => (imageX(normalized) - view[0]) /
+        Math.max(1, view[2] - view[0]) * canvas.width;
+    const pointerImageX = event => {
+        const rect = canvas.getBoundingClientRect();
+        return view[0] + (event.clientX - rect.left) / rect.width * (view[2] - view[0]);
+    };
+    const redraw = () => {
+        if (!image.complete) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(image, view[0], view[1], view[2] - view[0], view[3] - view[1],
+            0, 0, canvas.width, canvas.height);
+        edges.forEach((edge, index) => {
+            const x = canvasX(edge);
+            ctx.strokeStyle = index === selected ? '#f97316' : '#2563eb';
+            ctx.lineWidth = index === selected ? 4 : 2;
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+            if (index < HESBAN_LINK_FIELDS.length) {
+                ctx.save(); ctx.translate(x + 4, 14); ctx.rotate(-Math.PI / 4);
+                ctx.fillStyle = index === selected ? '#9a3412' : '#172033';
+                ctx.font = 'bold 12px sans-serif';
+                ctx.fillText(HESBAN_LINK_FIELDS[index][1], 0, 0); ctx.restore();
+            }
+        });
+        output.textContent = `Selected line ${selected + 1} of ${edges.length}`;
+    };
+    const moveSelected = pageX => {
+        const minimum = .0015;
+        const normalized = pageX / imageWidth;
+        const low = selected ? edges[selected - 1] + minimum : 0;
+        const high = selected < edges.length - 1 ? edges[selected + 1] - minimum : 1;
+        edges[selected] = Math.max(low, Math.min(high, normalized));
+        redraw();
+    };
+    canvas.addEventListener('pointerdown', event => {
+        const pageX = pointerImageX(event);
+        selected = edges.map(edge => Math.abs(imageX(edge) - pageX))
+            .reduce((best, distance, index, values) => distance < values[best] ? index : best, 0);
+        dragging = true; canvas.setPointerCapture(event.pointerId); moveSelected(pageX);
+    });
+    canvas.addEventListener('pointermove', event => {
+        if (dragging) moveSelected(pointerImageX(event));
+    });
+    canvas.addEventListener('pointerup', () => { dragging = false; });
+    canvas.addEventListener('pointercancel', () => { dragging = false; });
+    canvas.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+        event.preventDefault();
+        const amount = event.shiftKey ? 5 : 1;
+        moveSelected(imageX(edges[selected]) + (event.key === 'ArrowLeft' ? -amount : amount));
+    });
+    image.addEventListener('load', () => { resize(); redraw(); });
+    dialog.querySelector('[data-column-save]').addEventListener('click', async event => {
+        const button = event.currentTarget;
+        try {
+            button.disabled = true; button.textContent = 'Saving…'; button.setAttribute('aria-busy', 'true');
+            const response = await window.PyPotteryUtils.apiRequest(
+                `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}/pages/${encodeURIComponent(imageName)}/columns`, {
+                    method: 'PUT', body: JSON.stringify({
+                        reviewer_revision: Number(figure.reviewer_revision || 0),
+                        normalized_column_edges: edges
+                    })
+                });
+            if (!response.success) throw new Error(response.error || 'Could not save columns');
+            dialog.close();
+            window.PyPotteryUtils.showToast('Column reprocessing queued', 'success');
+            await loadMetadataLinkState();
+        } catch (error) {
+            button.disabled = false; button.textContent = 'Save and re-read';
+            button.removeAttribute('aria-busy');
+            window.PyPotteryUtils.showToast(error.message, 'error');
+        }
+    });
+    dialog.querySelector('[data-column-reset]').addEventListener('click', async event => {
+        const button = event.currentTarget;
+        try {
+            button.disabled = true; button.textContent = 'Resetting…';
+            button.setAttribute('aria-busy', 'true');
+            const response = await window.PyPotteryUtils.apiRequest(
+                `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}/pages/${encodeURIComponent(imageName)}/columns`, {
+                    method: 'DELETE', body: JSON.stringify({reviewer_revision: Number(figure.reviewer_revision || 0)})
+                });
+            if (!response.success) throw new Error(response.error || 'Could not reset columns');
+            dialog.close(); await loadMetadataLinkState();
+        } catch (error) {
+            button.disabled = false; button.textContent = 'Reset to detected';
+            button.removeAttribute('aria-busy');
+            window.PyPotteryUtils.showToast(error.message, 'error');
+        }
+    });
+    dialog.addEventListener('close', () => dialog.remove());
+    dialog.showModal();
 }
 
 function addMetadataTableRow(figureId, tableNumber = '') {
@@ -1551,6 +1957,16 @@ function addMetadataTableRow(figureId, tableNumber = '') {
     wireMetadataDynamicRow(row, figureId);
     scheduleMetadataAutosave(figureId);
     row.querySelector('[data-link-column="table_no"]')?.focus();
+}
+
+function metadataReviewRowKey(row, index = 0) {
+    if (row?.review_override_id) return `manual:${row.review_override_id}`;
+    const number = String(row?.normalized_table_no || row?.table_no || `row-${index}`).trim().toLowerCase();
+    return `${row?.source_image || ''}|${number}`;
+}
+
+function metadataReviewRowAttribute(row, index = 0) {
+    return `data-review-key="${linkEscape(metadataReviewRowKey(row, index))}"`;
 }
 
 function metadataDynamicRowCells(figureId, rowIndex, values) {
@@ -1597,6 +2013,7 @@ function reindexMetadataRows(figureId) {
 function readMetadataRow(row) {
     const result = {};
     row.querySelectorAll('[data-link-column]').forEach(input => result[input.dataset.linkColumn] = input.value);
+    if (row.dataset.reviewKey) result._review_key = row.dataset.reviewKey;
     return result;
 }
 
@@ -1622,6 +2039,7 @@ function undoMetadataRowDelete(figureId) {
     if (!body) return;
     const row = document.createElement('tr');
     row.innerHTML = metadataDynamicRowCells(figureId, deleted.index, deleted.row);
+    if (deleted.row._review_key) row.dataset.reviewKey = deleted.row._review_key;
     body.insertBefore(row, body.children[deleted.index] || null);
     wireMetadataDynamicRow(row, figureId);
     reindexMetadataRows(figureId);
@@ -1661,7 +2079,7 @@ function restoreMetadataFigure(figureId) {
         figureId, (tabularState.metadataEditVersions.get(figureId) || 0) + 1);
     const body = figureEl.querySelector('.metadata-link-table tbody');
     body.innerHTML = (snapshot.table_rows || []).map((row, index) =>
-        `<tr data-link-row="${index}">${metadataDynamicRowCells(figureId, index, row)}</tr>`).join('');
+        `<tr data-link-row="${index}" ${metadataReviewRowAttribute(row, index)}>${metadataDynamicRowCells(figureId, index, row)}</tr>`).join('');
     body.querySelectorAll('tr').forEach(row => wireMetadataDynamicRow(row, figureId));
     const numbers = new Map((snapshot.drawings || []).map(drawing => [drawing.mask_file, drawing.vessel_number || '']));
     figureEl.querySelectorAll('[data-link-drawing-number]').forEach(input =>
@@ -1806,17 +2224,23 @@ function setupMetadataTableNavigation(figureEl) {
 }
 
 async function redetectMetadataMeasurements(figureId) {
+    const button = document.querySelector(`[data-link-measure="${CSS.escape(figureId)}"]`);
     try {
+        if (button) { button.disabled = true; button.textContent = 'Saving…'; button.setAttribute('aria-busy', 'true'); }
         const figure = await saveMetadataFigure(figureId, true);
         const response = await window.PyPotteryUtils.apiRequest(
             `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}/measure`, {
                 method: 'POST', body: JSON.stringify({reviewer_revision: figure?.reviewer_revision || 0})
             });
         if (!response.success) throw new Error(response.error || 'Could not detect measurements');
-        window.PyPotteryUtils.showToast('Scale and diameter suggestions updated', 'success');
+        if (button) button.textContent = 'Queued';
+        window.PyPotteryUtils.showToast('Measurement reread queued', 'success');
         await loadMetadataLinkState();
     } catch (error) {
         window.PyPotteryUtils.showToast(error.message, 'error');
+        if (button) { button.disabled = false; button.textContent = 'Re-read measurements'; }
+    } finally {
+        button?.removeAttribute('aria-busy');
     }
 }
 
@@ -2187,7 +2611,7 @@ function mergeMetadataConflict(figureId, serverFigure) {
     if (sameMetadataValue(localRows, baselineRows)) {
         const body = figureEl.querySelector('.metadata-link-table tbody');
         body.innerHTML = (serverFigure.table_rows || []).map((row, index) =>
-            `<tr data-link-row="${index}">${metadataDynamicRowCells(figureId, index, row)}</tr>`).join('');
+            `<tr data-link-row="${index}" ${metadataReviewRowAttribute(row, index)}>${metadataDynamicRowCells(figureId, index, row)}</tr>`).join('');
         body.querySelectorAll('tr').forEach(row => wireMetadataDynamicRow(row, figureId));
     } else if (!sameMetadataValue(serverRows, baselineRows)) {
         overlappingChange = true;
@@ -2364,11 +2788,14 @@ async function approveMetadataFigure(figureId) {
         await loadTabularData(tabularState.currentIndex);
     } catch (error) {
         window.PyPotteryUtils.showToast(error.message, 'error');
+        throw error;
     }
 }
 
 async function rerunMetadataFigure(figureId) {
+    const button = document.querySelector(`[data-link-rerun="${CSS.escape(figureId)}"]`);
     try {
+        if (button) { button.disabled = true; button.textContent = 'Saving…'; button.setAttribute('aria-busy', 'true'); }
         const saved = await saveMetadataFigure(figureId, true);
         const targetId = saved?.figure_id || figureId;
         const response = await window.PyPotteryUtils.apiRequest(
@@ -2376,10 +2803,14 @@ async function rerunMetadataFigure(figureId) {
                 method: 'POST', body: JSON.stringify({backend: 'ocr'})
             });
         if (!response.success) throw new Error(response.error || 'Could not rerun OCR');
-        window.PyPotteryUtils.showToast(`OCR rerun finished for figure ${targetId}`, 'success');
+        if (button) button.textContent = 'Queued';
+        window.PyPotteryUtils.showToast(`OCR reread queued for figure ${targetId}`, 'success');
         await loadMetadataLinkState();
     } catch (error) {
         window.PyPotteryUtils.showToast(error.message, 'error');
+        if (button) { button.disabled = false; button.textContent = 'Re-read this figure'; }
+    } finally {
+        button?.removeAttribute('aria-busy');
     }
 }
 
@@ -2392,6 +2823,7 @@ async function rejectMetadataFigure(figureId) {
         await loadMetadataLinkState();
     } catch (error) {
         window.PyPotteryUtils.showToast(error.message, 'error');
+        throw error;
     }
 }
 

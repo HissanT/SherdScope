@@ -25,8 +25,10 @@ real-corpus validation. The current workflow can:
 - segment vessel drawings using the PyPotteryLens detection models;
 - preserve each card's source page, bounding box, and stable internal identity;
 - recognize printed figure and vessel numbers with local PaddleOCR;
-- locate Hesban table headers, column boundaries, rows, continuation pages, and
-  closing rules using deterministic image processing;
+- locate all 22 configured Hesban headings, exact column boundaries, rows,
+  continuation pages, and closing rules using deterministic image processing;
+- fail closed and request column adjustment when any required heading is
+  missing, duplicated, ambiguous, or out of order;
 - link drawings to table rows through validated `(figure, vessel number)` keys;
 - autosave reviewer corrections without allowing background OCR refreshes to
   erase the active figure, scroll position, or draft;
@@ -34,6 +36,8 @@ real-corpus validation. The current workflow can:
   rim diameter, with manual correction when detection needs attention;
 - expose targeted OCR evidence for difficult cells, including the
   Non-Plastics Type column;
+- queue interactive rereads ahead of bulk extraction, checkpoint the bulk run,
+  and resume it automatically after the priority work finishes;
 - approve figures individually and withhold ambiguous joins;
 - export a clean 25-column research CSV or a complete dataset ZIP.
 
@@ -118,6 +122,16 @@ information where applicable.
 
 Open **Review & Link** and select **Read and Link Tables**. Figures are processed
 one at a time so completed figures can be reviewed while later figures wait.
+The persistent job strip reports queued, running, paused, completed, and failed
+work. A figure or measurement reread can be queued during the bulk run; it starts
+after the current OCR call finishes, then the bulk run resumes from its saved
+checkpoint. Interrupted work is recovered from `metadata_jobs.json` on restart.
+
+The desktop launcher intentionally does not hot-reload Python because doing so
+can initialize the OCR and vision models twice. If backend source files change
+while SherdScope is open, Review & Link blocks new OCR work and asks for a
+restart. Saved boundaries carry an extractor version; figures made by older OCR
+logic are clearly marked for a fresh **Read and Link Tables** run.
 
 For the selected figure:
 
@@ -125,6 +139,8 @@ For the selected figure:
 - correct any unresolved or incorrect vessel number;
 - inspect the detected scale or rim diameter only when it needs attention;
 - edit table cells, add or delete rows, and undo deletions;
+- select **Adjust columns** when a page is marked for column review, drag any of
+  the 23 lines (or use the arrow keys), then choose **Save and re-read**;
 - use the group shortcuts to move between Identity, Fabric, Non-Plastics,
   Voids, Surface, and Finish;
 - approve the figure when the readiness checklist confirms a unique join.
@@ -135,18 +151,54 @@ or rereading one figure, are available from **More**.
 
 ### 3. Diagnose a difficult OCR cell
 
-If the small Non-Plastics Type code is missing or suspicious:
+If any value is missing, suspicious, or appears to come from a neighboring
+column:
 
 1. open the figure in **Review & Link**;
-2. expand **Inspect Non-Plastics Typ OCR**;
+2. expand the OCR diagnostic inspector;
 3. compare the exact crop, raw OCR token, confidence, overlapping page tokens,
-   and accepted value;
+   page geometry, accepted value, and the reason that source won;
 4. correct the cell manually if the printed page and OCR disagree;
 5. use **More -> Re-read this figure** after an OCR improvement or page
    reassignment.
 
-The diagnostic is saved with the linkage draft, so an empty cell can be
-investigated rather than treated as an unexplained failure.
+The diagnostic is saved in a per-page sidecar and loaded only when this inspector
+opens, so an empty cell can be investigated without placing the complete corpus
+evidence in every status poll.
+
+Whole-page OCR and focused-cell OCR are deliberately not trusted blindly. A
+clear whole-page token remains useful when a focused crop is noisy or blank, but
+it is accepted only when its printed box safely belongs to that cell. A token
+that crosses a column boundary is withheld instead of being copied into the
+neighboring column. The focused crop therefore does not automatically win; safe
+geometry is considered first, then recognition quality.
+
+The application also checks that PaddleOCR can actually be imported and its
+shared local model can be initialized. When the local installation is broken,
+Review & Link displays the real startup error rather than saying only that OCR
+is unavailable.
+
+### Hesban column profile
+
+`catalog/profiles.py` is the single editable source for extraction, review
+headings, grouping, and CSV labels. Each `ColumnSpec` declares a stable storage
+key, accepted OCR aliases, header tier, group, UI label, and CSV label. The
+ordered Hesban anchors are:
+
+```text
+No. Type Sq|Area Loc Pail Reg
+Exterior Core Interior Typ Siz Shap Den Ty/Sz Den
+Man
+Ext Color Int Color
+Decor Fire
+```
+
+`Fabric Color`, `Non-Plastics`, `Voids`, and `Surface Treatment` are validation
+and display groups, not boundary anchors. All 22 anchors are required. The left
+edge and each internal edge are placed a DPI-scaled lead distance before the
+corresponding heading; the detected table-rule endpoint supplies the final edge.
+Saved manual edges take precedence on every later reread. Internal projects keep
+the stable `table_square` key, while exports call the field `Sq/Area`.
 
 ### 4. Export the research dataset
 
@@ -183,7 +235,7 @@ The fixed export fields are:
 3. No.
 4. Vessel Type
 5. Rim Diameter (cm)
-6. Square (Sq)
+6. Sq/Area
 7. Locus (Loc)
 8. Pail
 9. Registration (Reg)
@@ -220,14 +272,19 @@ projects/<project-id>/
 |-- cards/
 |   |-- mask_info.csv
 |   |-- mask_info_annots.csv
-|   `-- metadata_linkage.json
+|   |-- metadata_linkage.json
+|   |-- metadata_jobs.json
+|   `-- metadata_diagnostics/<figure>/<page>.json
 |-- export_settings.json
 `-- exports/
 ```
 
 The internal `mask_info.csv` remains backward compatible. Approved linkage,
 measurement evidence, reviewer edits, and warnings are staged in
-`metadata_linkage.json`; the clean public schema is generated only at export.
+`metadata_linkage.json`; large per-cell evidence lives in page sidecars, and the
+resumable queue lives in `metadata_jobs.json`. Schema-v1 linkage files are
+migrated atomically with one recovery backup. The clean public schema is
+generated only at export.
 
 ## Validation
 

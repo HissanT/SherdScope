@@ -31,9 +31,13 @@ class TableEngine:
 
     def recognize(self, image):
         if image.height < 220:
-            headings = ["No.", "Type", "Sq", "Loc", "Fabric Color", "Non-Plastics",
-                        "Voids", "Surface Treatment", "Exterior", "Core", "Interior", "Typ", "Den"]
-            return [OCRToken(text, .99, (10 + index*45, 10, 45 + index*45, 28))
+            headings = ["No.", "Type", "Sq", "Loc", "Pail", "Reg", "Exterior",
+                        "Core", "Interior", "Typ", "Siz", "Shap", "Den", "Ty/Sz",
+                        "Den", "Man", "Ext", "Color", "Int", "Color", "Decor", "Fire"]
+            primary = {0, 1, 2, 3, 4, 5, 15, 20, 21}
+            return [OCRToken(text, .99,
+                             (5 + index*35, 20 if index in primary else 110,
+                              30 + index*35, 40 if index in primary else 130))
                     for index, text in enumerate(headings)]
         if image.width > 500:
             return [
@@ -106,7 +110,7 @@ class PageAuthorityEngine(TableEngine):
         result = super().recognize(image)
         if image.height >= 220 and image.width > 500:
             index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
-            left, right = PaddleOCRStructuredExtractor._column_bounds(image.width)[index]
+            left, right = index * 35, (index + 1) * 35
             result.append(OCRToken("**", .95, (left + 2, 60, right - 2, 82)))
         return result
 
@@ -124,11 +128,10 @@ class MergedRowTypeEngine(TableEngine):
     def recognize(self, image):
         result = super().recognize(image)
         if image.height >= 220 and image.width > 500:
-            bounds = PaddleOCRStructuredExtractor._column_bounds(image.width)
             result = [item for item in result if item.text not in {"1", "Pithos"}]
             result.append(OCRToken(
                 "1 Pithos", .98,
-                (bounds[0][0], 60, bounds[1][1] - 2, 82)))
+                (1, 60, 69, 82)))
         return result
 
     def recognize_many(self, images):
@@ -145,7 +148,7 @@ class BlankCellPageEngine(TableEngine):
         result = super().recognize(image)
         if image.height >= 220 and image.width > 500:
             index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
-            left, right = PaddleOCRStructuredExtractor._column_bounds(image.width)[index]
+            left, right = index * 35, (index + 1) * 35
             result.append(OCRToken("**", .95, (left - 10, 60, right + 10, 82)))
         return result
 
@@ -156,6 +159,15 @@ class BoundaryNoisyCellEngine(BlankCellPageEngine):
         if len(output) == 22:
             index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
             output[index] = [OCRToken("noise*", .45, (10, 10, 60, 35))]
+        return output
+
+
+class BoundaryCleanCellEngine(BlankCellPageEngine):
+    def recognize_many(self, images):
+        output = super().recognize_many(images)
+        if len(output) == 22:
+            index = list(HESBAN_TABLE_COLUMNS).index("surface_exterior_color")
+            output[index] = [OCRToken("**", .97, (10, 10, 35, 35))]
         return output
 
 
@@ -308,7 +320,7 @@ def test_merged_row_anchor_is_removed_from_page_cell_candidate(tmp_path):
     assert cell["accepted_source"] == "page_pass_blank_cell"
 
 
-def test_strong_page_value_fills_blank_cell_despite_boundary_contact(tmp_path):
+def test_cross_column_page_value_is_withheld_when_cell_is_blank(tmp_path):
     image_path = tmp_path / "table.jpg"
     make_table_image(image_path)
     result = PaddleOCRStructuredExtractor(BlankCellPageEngine()).extract_table(
@@ -318,11 +330,13 @@ def test_strong_page_value_fills_blank_cell_despite_boundary_contact(tmp_path):
     assert cell["focused_text"] == ""
     assert cell["safe_initial_text"] == ""
     assert cell["initial_text"] == "**"
-    assert cell["accepted_text"] == "**"
-    assert cell["accepted_source"] == "page_pass_blank_cell"
+    assert cell["accepted_text"] == ""
+    assert cell["accepted_source"] == "cross_column_page_withheld"
+    assert cell["page_geometry_reliable"] is False
+    assert "crossed a cell boundary" in cell["decision_reason"]
 
 
-def test_boundary_uncertainty_does_not_let_weak_cell_beat_strong_page(tmp_path):
+def test_cross_column_page_value_does_not_beat_noisy_cell_reading(tmp_path):
     image_path = tmp_path / "table.jpg"
     make_table_image(image_path)
     result = PaddleOCRStructuredExtractor(BoundaryNoisyCellEngine()).extract_table(
@@ -334,8 +348,23 @@ def test_boundary_uncertainty_does_not_let_weak_cell_beat_strong_page(tmp_path):
     assert cell["initial_confidence"] == .95
     assert cell["focused_text"] == "noise*"
     assert cell["focused_confidence"] == .45
+    assert cell["accepted_text"] == "noise*"
+    assert cell["accepted_source"] == "cell_pass"
+    assert cell["page_geometry_reliable"] is False
+
+
+def test_cross_column_page_value_does_not_replace_clear_cell_reading(tmp_path):
+    image_path = tmp_path / "table.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(BoundaryCleanCellEngine()).extract_table(
+        image_path, None, "2.1", ["1"], {"figure_id": "2.1"})
+    cell = next(item for item in result["boundary"]["cell_diagnostics"]
+                if item["field"] == "surface_exterior_color")
+    assert cell["initial_text"] == "**"
+    assert cell["safe_initial_text"] == ""
+    assert cell["focused_text"] == "**"
     assert cell["accepted_text"] == "**"
-    assert cell["accepted_source"] == "page_pass"
+    assert cell["accepted_source"] == "cell_pass"
 
 
 def test_firing_zero_is_strictly_normalized_to_letter_o(tmp_path):
@@ -395,6 +424,39 @@ def test_merged_header_words_follow_visible_ink_valleys():
     assert [(token.bbox[0], token.bbox[2]) for token in split] == expected
 
 
+def test_long_merged_nonplastics_and_voids_header_is_split():
+    merged = OCRToken("Typ Siz Shap Den Ty/Sz Den", .99, (10, 10, 610, 58))
+    split = PaddleOCRStructuredExtractor._split_header_tokens([merged])
+    assert [token.text for token in split] == [
+        "Typ", "Siz", "Shap", "Den", "Ty/Sz", "Den"]
+    assert all(left.center_x < right.center_x for left, right in zip(split, split[1:]))
+
+
+def test_full_header_accepts_merged_second_half_groups():
+    primary_labels = ["No", "Type", "Sq", "Loc", "Pail", "Reg"]
+    tokens = [OCRToken(label, .98, (20 + index * 75, 20,
+                                    60 + index * 75, 55))
+              for index, label in enumerate(primary_labels)]
+    tokens.extend([
+        OCRToken("Exterior", .98, (500, 95, 570, 130)),
+        OCRToken("Core", .98, (600, 95, 650, 130)),
+        OCRToken("Interior", .98, (690, 95, 760, 130)),
+        OCRToken("Typ Siz Shap Den Ty/Sz Den", .98, (790, 95, 1110, 130)),
+        OCRToken("Man", .98, (1135, 20, 1175, 55)),
+        OCRToken("Ext Color Int Color", .98, (1190, 95, 1390, 130)),
+        OCRToken("Decor", .98, (1410, 20, 1470, 55)),
+        OCRToken("Fire", .98, (1500, 20, 1545, 55)),
+    ])
+
+    bounds, source, evidence = (
+        PaddleOCRStructuredExtractor._column_bounds_from_header(
+            tokens, 1580, upper_rule_y=70))
+
+    assert source == "header_detected"
+    assert len(bounds) == 22
+    assert [item["column"] for item in evidence] == HESBAN_TABLE_COLUMNS
+
+
 def test_single_header_token_is_not_changed_by_visual_splitter():
     image = Image.new("L", (120, 50), 255)
     token = OCRToken("Typ", .99, (10, 10, 60, 35))
@@ -438,24 +500,112 @@ def test_columns_follow_this_pages_header_positions():
               for index, (center, label) in enumerate(zip(centers, labels))]
     bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
         tokens, 1260, upper_rule_y=75)
-    assert source == "header_ocr"
+    assert source == "header_detected"
     assert len(bounds) == 22
     assert len(evidence) == 22
     # A boundary approaches the next heading instead of splitting the gap in
     # half, so long Type values retain the whitespace before Sq.
-    assert bounds[0][1] == 69
-    assert bounds[1] == (69, 152)
+    assert bounds[0] == (4, 74)
+    assert bounds[1] == (74, 160)
     assert bounds[-1][1] == 1260
 
 
-def test_damaged_header_uses_explicitly_flagged_fallback():
+def test_repeated_headers_follow_left_to_right_order_not_confidence():
+    centers = [18 + index * 52 for index in range(22)]
+    labels = ["No.", "Type", "Sq", "Loc", "Pail", "Reg", "Exterior", "Core",
+              "Interior", "Typ", "Siz", "Shap", ")Den", "Ty/Sz", "Den", "Man",
+              "Ext", "Color", "Int", "Color", "Decor", "Fire"]
+    primary = {0, 1, 2, 3, 4, 5, 15, 20, 21}
+    confidence = [0.99] * 22
+    confidence[12] = .72
+    confidence[14] = .999
+    confidence[17] = .71
+    confidence[19] = .999
+    tokens = [OCRToken(label, confidence[index],
+                       (center - 12, 20 if index in primary else 105,
+                        center + 18, 42 if index in primary else 127))
+              for index, (center, label) in enumerate(zip(centers, labels))]
+
+    bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        tokens, 1200, upper_rule_y=75)
+
+    assert source == "header_detected"
+    assert len(bounds) == 22
+    anchors = {item["column"]: item for item in evidence}
+    assert anchors["nonplastics_density"]["text"] == ")Den"
+    assert anchors["voids_density"]["bbox"][0] > anchors["nonplastics_density"]["bbox"][0]
+    assert anchors["surface_exterior_color"]["bbox"][0] < anchors["surface_interior_color"]["bbox"][0]
+
+
+def test_area_alias_replaces_sq_without_changing_storage_column():
+    centers = [18 + index * 52 for index in range(22)]
+    labels = ["No.", "Type", "Area", "Loc", "Pail", "Reg", "Exterior", "Core",
+              "Interior", "Typ", "Siz", "Shap", "Den", "Ty/Sz", "Den", "Man",
+              "Ext", "Color", "Int", "Color", "Decor", "Fire"]
+    primary = {0, 1, 2, 3, 4, 5, 15, 20, 21}
+    tokens = [OCRToken(label, .99, (center - 12, 20 if index in primary else 105,
+                                    center + 18, 42 if index in primary else 127))
+              for index, (center, label) in enumerate(zip(centers, labels))]
+    bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        tokens, 1160, upper_rule_y=75)
+    assert source == "header_detected"
+    assert len(bounds) == 22
+    assert evidence[2]["column"] == "table_square"
+    assert evidence[2]["text"] == "Area"
+
+
+def test_header_lead_offset_scales_with_rendered_text_height():
+    labels = ["No.", "Type", "Sq", "Loc", "Pail", "Reg", "Exterior", "Core",
+              "Interior", "Typ", "Siz", "Shap", "Den", "Ty/Sz", "Den", "Man",
+              "Ext", "Color", "Int", "Color", "Decor", "Fire"]
+    primary = {0, 1, 2, 3, 4, 5, 15, 20, 21}
+    small = [OCRToken(label, .99, (8 + index * 50,
+                                   20 if index in primary else 105,
+                                   32 + index * 50,
+                                   40 if index in primary else 125))
+             for index, label in enumerate(labels)]
+    large = [OCRToken(label, .99, (16 + index * 100,
+                                   40 if index in primary else 210,
+                                   64 + index * 100,
+                                   80 if index in primary else 250))
+             for index, label in enumerate(labels)]
+    small_bounds, _, _ = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        small, 1120, upper_rule_y=75)
+    large_bounds, _, _ = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        large, 2240, upper_rule_y=150)
+    assert large_bounds[0][0] == small_bounds[0][0] * 2
+    assert large_bounds[1][0] == small_bounds[1][0] * 2
+
+
+def test_group_headings_never_become_column_anchors():
+    centers = [18 + index * 52 for index in range(22)]
+    labels = ["No.", "Type", "Sq", "Loc", "Pail", "Reg", "Exterior", "Core",
+              "Interior", "Typ", "Siz", "Shap", "Den", "Ty/Sz", "Den", "Man",
+              "Ext", "Color", "Int", "Color", "Decor", "Fire"]
+    primary = {0, 1, 2, 3, 4, 5, 15, 20, 21}
+    tokens = [OCRToken(label, .99, (center - 10, 20 if index in primary else 105,
+                                    center + 16, 42 if index in primary else 127))
+              for index, (center, label) in enumerate(zip(centers, labels))]
+    tokens += [OCRToken("Fabric Color", .99, (300, 12, 500, 34)),
+               OCRToken("Non-Plastics", .99, (510, 12, 720, 34)),
+               OCRToken("Voids", .99, (720, 12, 820, 34)),
+               OCRToken("Surface Treatment", .99, (830, 12, 1050, 34))]
+    bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
+        tokens, 1160, upper_rule_y=75)
+    assert source == "header_detected"
+    assert len(bounds) == len(evidence) == 22
+    assert not {"Fabric Color", "Non-Plastics", "Voids", "Surface Treatment"} & {
+        item["text"] for item in evidence}
+
+
+def test_damaged_header_fails_closed_for_manual_review():
     tokens = [OCRToken("No.", .99, (5, 10, 20, 30)),
               OCRToken("Type", .99, (30, 10, 70, 30))]
     bounds, source, evidence = PaddleOCRStructuredExtractor._column_bounds_from_header(
         tokens, 1000, upper_rule_y=60)
-    assert source == "fixed_fallback"
-    assert bounds == PaddleOCRStructuredExtractor._column_bounds(1000)
-    assert evidence == []
+    assert source == "headers_incomplete"
+    assert bounds == []
+    assert [item["column"] for item in evidence] == ["table_no", "table_type"]
 
 
 def test_row_anchor_recovers_number_merged_with_type():
@@ -466,6 +616,33 @@ def test_row_anchor_recovers_number_merged_with_type():
                       (bounds[0][0], 80, bounds[1][1], 105))
     anchors = extractor._row_anchors(image, ["14"], [merged])
     assert [number for number, _ in anchors] == ["14"]
+
+
+def test_conflicting_row_numbers_at_same_height_create_only_one_row(monkeypatch):
+    extractor = PaddleOCRStructuredExtractor(TableEngine())
+    image = Image.new("RGB", (800, 500), "white")
+    bounds = extractor._column_bounds(image.width)
+    page_tokens = [
+        OCRToken("11", .98, (bounds[0][0] + 2, 80, bounds[0][1] - 2, 104)),
+        OCRToken("Cooking pot", .98, (bounds[1][0] + 2, 80,
+                                      bounds[1][1] - 2, 104)),
+        OCRToken("12", .98, (bounds[0][0] + 2, 170, bounds[0][1] - 2, 194)),
+        OCRToken("Cooking pot", .98, (bounds[1][0] + 2, 170,
+                                      bounds[1][1] - 2, 194)),
+    ]
+    monkeypatch.setattr(extractor, "_number_component_tokens", lambda *_: [
+        OCRToken("1", .99, (bounds[0][0], 81, bounds[0][1], 103)),
+        OCRToken("2", .99, (bounds[0][0], 171, bounds[0][1], 193)),
+    ])
+    conflicts = []
+
+    anchors = extractor._row_anchors(
+        image, ["1", "2", "11", "12"], page_tokens,
+        bounds=bounds, conflicts_out=conflicts)
+
+    assert [number for number, _ in anchors] == ["11", "12"]
+    assert [item["chosen"] for item in conflicts] == ["11", "12"]
+    assert [bottom - top for _, top, bottom in extractor._row_bounds(anchors, 400)] == [167, 233]
 
 
 def test_row_bounds_start_at_data_rule_and_split_before_next_number():
@@ -512,6 +689,46 @@ def test_page_without_verified_header_is_not_a_table(tmp_path):
         image_path, None, "2.1", ["1", "2"], {"figure_id": "2.1"})
     assert result["is_table"] is False
     assert result["warnings"][0]["code"] == "table_header_not_found"
+
+
+class MissingHeaderEngine(TableEngine):
+    def recognize(self, image):
+        result = super().recognize(image)
+        if image.height < 220:
+            return [token for token in result if token.text != "Core"]
+        return result
+
+
+def test_incomplete_page_header_is_flagged_without_guessing_rows(tmp_path):
+    image_path = tmp_path / "incomplete.jpg"
+    make_table_image(image_path)
+    result = PaddleOCRStructuredExtractor(MissingHeaderEngine()).extract_table(
+        image_path, None, "2.1", ["1", "2"], {"figure_id": "2.1"})
+    assert result["is_table"] is False
+    assert result["needs_column_review"] is True
+    assert result["rows"] == []
+    assert result["warnings"][0]["code"] == "column_headers_incomplete"
+    assert len(result["boundary"]["header_anchors"]) == 21
+    assert result["boundary"]["image_size"] == [1000, 900]
+    status = result["boundary"]["diagnostic_status"]
+    assert status["found_count"] == 21
+    assert status["required_count"] == 22
+    assert status["missing_labels"] == ["Core"]
+    assert "did not start" in status["message"]
+
+
+def test_saved_manual_edges_override_detected_header_edges(tmp_path):
+    image_path = tmp_path / "manual.jpg"
+    make_table_image(image_path)
+    page_edges = [100 + index * 36 for index in range(22)] + [900]
+    result = PaddleOCRStructuredExtractor(TableEngine()).extract_table(
+        image_path, None, "2.1", ["1", "2"], {
+            "figure_id": "2.1",
+            "manual_column_edges": [edge / 1000 for edge in page_edges],
+        })
+    assert result["is_table"] is True
+    assert result["boundary"]["column_source"] == "manual"
+    assert result["boundary"]["column_edges"] == page_edges
 
 
 def test_missing_closing_rule_is_recorded_as_continuation(tmp_path):

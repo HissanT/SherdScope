@@ -12,17 +12,96 @@ from catalog.linkage import (
     Hesban11Profile,
     MetadataLinker,
     StructuredExtractor,
+    apply_reviewer_row_overrides,
     apply_approved_figures,
     invalidate_linkage_for_card_changes,
     normalize_figure_id,
     normalize_vessel_number,
+    order_figure_table_rows,
     MetadataLinkError,
     ReviewerRevisionConflict,
     save_linkage_state,
     validate_figure,
     load_linkage_state,
+    load_page_diagnostics,
     migrate_linkage_columns,
 )
+
+
+def test_table_rows_are_naturally_ordered_after_targeted_page_replacement():
+    figure = {
+        "table_pages": [
+            {"image_name": "page_3.jpg", "logical_index": 3},
+            {"image_name": "page_4.jpg", "logical_index": 4},
+        ],
+        # This is the order produced when page 3 is reread while page 4's
+        # already-extracted rows are retained.
+        "table_rows": [
+            {"table_no": "25", "source_image": "page_4.jpg"},
+            {"table_no": "31", "source_image": "page_4.jpg"},
+            {"table_no": "1", "source_image": "page_3.jpg"},
+            {"table_no": "10", "source_image": "page_3.jpg"},
+            {"table_no": "2", "source_image": "page_3.jpg"},
+        ],
+    }
+
+    order_figure_table_rows(figure)
+
+    assert [row["table_no"] for row in figure["table_rows"]] == [
+        "1", "2", "10", "25", "31",
+    ]
+
+
+def test_table_row_order_uses_page_order_for_duplicate_or_blank_labels():
+    figure = {
+        "table_pages": [
+            {"image_name": "later.jpg", "logical_index": 8},
+            {"image_name": "earlier.jpg", "logical_index": 7},
+        ],
+        "table_rows": [
+            {"table_no": "1", "source_image": "later.jpg", "value": "later"},
+            {"table_no": "", "source_image": "later.jpg", "value": "blank later"},
+            {"table_no": "1", "source_image": "earlier.jpg", "value": "earlier"},
+            {"table_no": "", "source_image": "earlier.jpg", "value": "blank earlier"},
+        ],
+    }
+
+    order_figure_table_rows(figure)
+
+    assert [row["value"] for row in figure["table_rows"]] == [
+        "earlier", "later", "blank earlier", "blank later",
+    ]
+
+
+def test_loading_existing_state_repairs_rows_appended_by_a_page_reread(tmp_path):
+    project = tmp_path / "project"
+    cards = project / "cards"
+    cards.mkdir(parents=True)
+    (cards / "metadata_linkage.json").write_text(json.dumps({
+        "schema_version": 2,
+        "profile": "hesban11",
+        "status": "complete",
+        "figures": [{
+            "figure_id": "3.22",
+            "table_pages": [
+                {"image_name": "page_3.jpg", "logical_index": 3},
+                {"image_name": "page_4.jpg", "logical_index": 4},
+            ],
+            "table_rows": [
+                {"table_no": "25", "source_image": "page_4.jpg"},
+                {"table_no": "26", "source_image": "page_4.jpg"},
+                {"table_no": "1", "source_image": "page_3.jpg"},
+                {"table_no": "2", "source_image": "page_3.jpg"},
+            ],
+            "drawings": [],
+        }],
+    }), encoding="utf-8")
+
+    loaded = load_linkage_state(project)
+
+    assert [row["table_no"] for row in loaded["figures"][0]["table_rows"]] == [
+        "1", "2", "25", "26",
+    ]
 
 
 class FakeExtractor(StructuredExtractor):
@@ -519,3 +598,58 @@ def test_bbox_formatting_change_does_not_invalidate_geometry(tmp_path):
     invalidate_linkage_for_card_changes(project / "cards", old, new)
     unchanged = load_linkage_state(project)
     assert unchanged["figures"][0]["status"] == "ready"
+
+
+def test_reviewer_override_layer_survives_fresh_ocr_rows():
+    figure = {
+        "review_overrides": {
+            "cells": {"page.jpg|1": {"table_type": "Corrected jar"}},
+            "deleted": ["page.jpg|2"],
+            "added": [{
+                "review_override_id": "added-a", "table_no": "3",
+                "table_type": "Researcher-added bowl", "source_image": "page.jpg",
+            }],
+        },
+        "table_rows": [
+            {"table_no": "1", "table_type": "OCR jar", "source_image": "page.jpg"},
+            {"table_no": "2", "table_type": "OCR bowl", "source_image": "page.jpg"},
+        ],
+    }
+    unmatched = apply_reviewer_row_overrides(figure, Hesban11Profile())
+    assert unmatched == []
+    assert [(row["table_no"], row["table_type"]) for row in figure["table_rows"]] == [
+        ("1", "Corrected jar"), ("3", "Researcher-added bowl")]
+
+
+def test_schema_v1_diagnostics_migrate_to_lazy_atomic_sidecar(tmp_path):
+    project = tmp_path / "project"
+    cards = project / "cards"
+    cards.mkdir(parents=True)
+    state_path = cards / "metadata_linkage.json"
+    state_path.write_text(json.dumps({
+        "schema_version": 1, "profile": "hesban11", "status": "complete",
+        "figures": [{
+            "figure_id": "2.1", "figure_key": "figure-a", "drawings": [],
+            "table_rows": [], "table_pages": [{
+                "image_name": "page_1.jpg",
+                "boundary": {
+                    "diagnostic_status": {"code": "cell_grid_ready"},
+                    "row_anchor_conflicts": [{"chosen": "11"}],
+                    "cell_diagnostics": [{"row": "1", "field": "table_type"}],
+                },
+                "ocr_diagnostics": [{"row": "1", "field": "nonplastics_type"}],
+            }],
+        }],
+    }), encoding="utf-8")
+
+    migrated = load_linkage_state(project)
+    page = migrated["figures"][0]["table_pages"][0]
+    assert migrated["schema_version"] == 2
+    assert "cell_diagnostics" not in page["boundary"]
+    assert "ocr_diagnostics" not in page
+    assert (cards / "metadata_linkage.v1.backup.json").exists()
+    diagnostics = load_page_diagnostics(project, migrated["figures"][0], "page_1.jpg")
+    assert diagnostics["cell_diagnostics"][0]["field"] == "table_type"
+    assert diagnostics["ocr_diagnostics"][0]["field"] == "nonplastics_type"
+    assert diagnostics["status"]["code"] == "cell_grid_ready"
+    assert diagnostics["row_anchor_conflicts"][0]["chosen"] == "11"

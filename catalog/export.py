@@ -17,7 +17,8 @@ import zipfile
 
 import pandas as pd
 
-from catalog.linkage import load_linkage_state, migrate_linkage_columns
+from catalog.linkage import PUBLIC_LINKAGE_MAP, load_linkage_state, migrate_linkage_columns
+from catalog.profiles import HESBAN_COLUMN_SPECS
 
 
 EXPORT_SCHEMA_VERSION = 1
@@ -25,41 +26,18 @@ EXPORT_SETTINGS_NAME = "export_settings.json"
 
 EXPORT_COLUMNS = [
     "Image Filename", "Figure", "No.", "Vessel Type", "Rim Diameter (cm)",
-    "Square (Sq)", "Locus (Loc)", "Pail",
-    "Registration (Reg)", "Fabric Color - Exterior", "Fabric Color - Core",
-    "Fabric Color - Interior", "Non-Plastics - Type", "Non-Plastics - Size",
-    "Non-Plastics - Shape", "Non-Plastics - Density", "Voids - Type/Size",
-    "Voids - Density", "Manufacture", "Surface Treatment - Exterior",
-    "Surface Treatment - Exterior Color", "Surface Treatment - Interior",
-    "Surface Treatment - Interior Color", "Decoration", "Firing",
-]
+] + [spec.csv_label for spec in HESBAN_COLUMN_SPECS[2:]]
 
 SOURCE_COLUMNS = {
     "Figure": "Figure",
     "No.": "No.",
     "Vessel Type": "Type",
     "Rim Diameter (cm)": "Rim Diameter (cm)",
-    "Square (Sq)": "Sq",
-    "Locus (Loc)": "Loc",
-    "Pail": "Pail",
-    "Registration (Reg)": "Reg",
-    "Fabric Color - Exterior": "Fabric Color - Exterior",
-    "Fabric Color - Core": "Fabric Color - Core",
-    "Fabric Color - Interior": "Fabric Color - Interior",
-    "Non-Plastics - Type": "Non-Plastics - Typ",
-    "Non-Plastics - Size": "Non-Plastics - Siz",
-    "Non-Plastics - Shape": "Non-Plastics - Shap",
-    "Non-Plastics - Density": "Non-Plastics - Den",
-    "Voids - Type/Size": "Voids - Ty/Sz",
-    "Voids - Density": "Voids - Den",
-    "Manufacture": "Man",
-    "Surface Treatment - Exterior": "Surface Treatment - Ext",
-    "Surface Treatment - Exterior Color": "Surface Treatment - Exterior Color",
-    "Surface Treatment - Interior": "Surface Treatment - Int",
-    "Surface Treatment - Interior Color": "Surface Treatment - Interior Color",
-    "Decoration": "Decor",
-    "Firing": "Fire",
 }
+SOURCE_COLUMNS.update({
+    spec.csv_label: PUBLIC_LINKAGE_MAP[spec.key]
+    for spec in HESBAN_COLUMN_SPECS[2:]
+})
 
 DATA_DICTIONARY = {
     "Image Filename": "Filename of the matching vessel mask in the images folder.",

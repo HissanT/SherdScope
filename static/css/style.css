@@ -621,6 +621,7 @@ body {
     background: rgba(0, 0, 0, 0.9);
     justify-content: center;
     align-items: center;
+    overflow: auto;
 }
 
 .image-modal.active {
@@ -631,7 +632,17 @@ body {
     max-width: 90%;
     max-height: 90%;
     object-fit: contain;
+    cursor: zoom-in;
+    transition: width .18s ease, height .18s ease;
 }
+
+.image-modal img.zoomed {
+    max-width: none;
+    max-height: none;
+    margin: 3vh;
+    cursor: zoom-out;
+}
+.image-modal.zoom-active { align-items: flex-start; justify-content: flex-start; }
 
 .image-modal .close-modal {
     position: absolute;
@@ -2068,6 +2079,40 @@ body {
     border-top: 0;
 }
 
+.metadata-link-jobs {
+    display: grid;
+    grid-template-columns: minmax(180px, 1fr) auto;
+    gap: .35rem 1rem;
+    padding: .7rem 1.15rem;
+    color: #344054;
+    background: #eff8ff;
+    border: 1px solid #b2ddff;
+    border-top: 0;
+    font-size: .82rem;
+}
+.metadata-link-jobs[hidden] { display: none; }
+.metadata-link-jobs span { color: #475467; text-align: right; }
+.metadata-link-jobs .done { color: #18794e; font-weight: 700; }
+.metadata-link-jobs .failed { color: #b42318; font-weight: 700; }
+
+#tabular-tab .metadata-primary-layout { display: block; }
+#tabular-tab .metadata-primary-layout > .tabular-table { width: 100%; min-width: 0; }
+.metadata-advanced-tools {
+    margin: 1rem 0;
+    border: 1px solid #d9dee8;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+.metadata-advanced-tools > summary {
+    padding: .75rem 1rem;
+    color: #475467;
+    font-weight: 700;
+    cursor: pointer;
+}
+.metadata-advanced-tools > div { display: grid; gap: 1rem; padding: 0 1rem 1rem; }
+.metadata-advanced-tools .tabular-sidebar,
+.metadata-advanced-tools .tabular-image { width: 100%; max-width: none; }
+
 .metadata-link-figures {
     display: grid;
     grid-template-columns: 190px minmax(0, 1fr);
@@ -2174,7 +2219,46 @@ body {
     border: 0 !important;
     border-radius: 2px !important;
     box-shadow: 0 1px 4px #1018281f;
+    cursor: zoom-in;
 }
+
+.metadata-column-dialog {
+    width: min(1580px, 96vw);
+    max-width: none;
+    padding: 0;
+    color: #172033;
+    background: #fff;
+    border: 1px solid #98a2b3;
+    border-radius: 10px;
+}
+.metadata-column-dialog::backdrop { background: rgba(15, 23, 42, .72); }
+.metadata-column-dialog form { display: grid; max-height: 96vh; }
+.metadata-column-dialog header,
+.metadata-column-dialog footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: .75rem;
+    padding: .7rem 1rem;
+    background: #f8fafc;
+}
+.metadata-column-dialog header div { display: grid; }
+.metadata-column-dialog header span,
+.metadata-column-dialog > form > p,
+.metadata-column-dialog output { color: #667085; font-size: .82rem; }
+.metadata-column-dialog > form > p { margin: 0; padding: .55rem 1rem; }
+.metadata-column-dialog footer > div { display: flex; gap: .5rem; }
+.metadata-column-dialog button {
+    padding: .48rem .72rem;
+    color: #344054;
+    background: #fff;
+    border: 1px solid #cfd6e1;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.metadata-column-dialog [data-column-save] { color: #fff; background: #2563eb; border-color: #2563eb; }
+.metadata-column-canvas-wrap { overflow: auto; background: #e4e7ec; }
+.metadata-column-canvas-wrap canvas { display: block; max-width: none; background: #fff; cursor: col-resize; touch-action: none; }
 
 .metadata-scale-workspace,
 .metadata-link-number-workspace,
@@ -2254,6 +2338,9 @@ body {
     .research-export-heading { flex-direction: column; gap: .75rem; }
     .research-export-summary { grid-template-columns: repeat(2, 1fr); }
     .research-export-toolbar { flex-wrap: wrap; }
+    .metadata-link-jobs { grid-template-columns: 1fr; }
+    .metadata-link-jobs span { text-align: left; }
+    .metadata-column-dialog footer { align-items: stretch; flex-direction: column; }
 }
 /* Figure-to-table metadata linkage */
 .metadata-link-panel { margin: 1rem 0; padding: 1rem; border: 1px solid #334155; border-radius: 10px; background: #0f172a; }

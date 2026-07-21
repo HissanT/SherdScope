@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-07-21
+
+### Added
+
+- Added one readable Hesban column profile shared by OCR, Review & Link, and CSV export, including the `Sq`/`Area` alias and repeated `Den`/`Color` sequencing.
+- Added a full-resolution 23-line column editor with dragging, keyboard adjustment, reset, persistence, and priority page rereading.
+- Added a persistent single-worker linkage queue with priority ordering, duplicate coalescing, safe checkpoint preemption, restart recovery, failure isolation, and automatic bulk resumption.
+- Added lazy selected-figure and page-diagnostic endpoints, persistent job feedback, figure status badges, and one-click 2× publication-image zoom.
+- Added a reviewer override layer that preserves edited cells and added/deleted rows across OCR rereads.
+
+### Changed
+
+- Replaced proportional and midpoint column fallback with strict detection of all 22 ordered anchors and exactly 23 edges. Incomplete or invalid headers now fail closed, skip row OCR, and request manual adjustment without stopping later figures.
+- Moved per-cell OCR evidence from the main linkage state into atomic page sidecars and reduced frequent state polling to lightweight figure summaries.
+- Changed linkage reread and boundary APIs to persistent asynchronous `202` jobs, and simplified Review & Link by placing legacy extraction controls in a collapsed Advanced section.
+- Renamed the public square export field to `Sq/Area` while retaining the internal `table_square` key for existing projects.
+
+### Fixed
+
+- Made repeated headings such as `Den` and `Color` follow their physical left-to-right order instead of OCR confidence, preventing later columns from stealing earlier labels.
+- Split long merged header tokens containing up to nine headings, including the real `Typ Siz Shap Den Ty/Sz Den` pattern found in the supplied Hesban PDF.
+- Resolved duplicate vessel-number readings that occupy the same printed row, so page-number fragments such as `1` beside `11` no longer create one-pixel rows or empty records.
+- Changed page-versus-cell OCR selection to geometry-first arbitration. A clean whole-page token can still beat a noisy focused crop, but a token crossing a column boundary cannot overwrite a safer cell reading or leak into a neighboring column.
+- Added exact incomplete-header, row-conflict, page-geometry, accepted-source, and decision-reason information to lazy page diagnostics.
+- Reused one thread-safe PaddleOCR engine per process and added an actual import/model health check so the UI reports the real local OCR problem instead of merely checking whether the package name exists.
+- Kept the Review & Link layout free of horizontal page overflow at a 390-pixel viewport and verified the desktop and narrow layouts without browser console errors.
+- Prevented a long-running desktop server from starting table OCR after its Python source files change. Review & Link now asks for a restart instead of silently using the older in-memory header splitter.
+- Added an extractor version to saved page boundaries and marks figures produced by older OCR logic for rereading.
+- Kept table rows in natural printed-number order after targeted page rereads. Existing saved states are also ordered when loaded, with publication-page order used only to resolve duplicate or blank labels.
+
+### Tests
+
+- Added deterministic coverage for strict header sequencing, aliases, repeated labels, group exclusion, scaled offsets, incomplete-page handling, manual overrides, priority/preemption, restart recovery, failure isolation, schema migration, and lightweight API responses.
+- Real-corpus diagnostics on `Hesban Corpus-pages-split-4.pdf` detected all 22 anchors on 9 of 10 table pages. Page 16 now fails closed only because its printed `Sq` heading is not readable by OCR, and remains available for manual adjustment.
+- A complete Figure 3.47 reread produced exactly rows 1-21, no one-pixel rows, no blank extracted cells, and no accepted cross-column page tokens.
+- The current extractor found all 22 headings on all 13 table pages in `Hesban_Corpus-pages-split-3.pdf`, including merged Non-Plastics/Voids and Surface Treatment headings.
+- Full Python suite: 114 tests passed; Python compilation, Ruff, JavaScript syntax, and desktop/narrow-width visual acceptance also passed.
+
 ## 2026-07-19
 
 ### Changed

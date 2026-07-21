@@ -53,11 +53,13 @@ from catalog.linkage import (
     ReviewerRevisionConflict,
     MetadataLinker,
     StructuredExtractor,
+    apply_reviewer_row_overrides,
     apply_approved_figures,
     ensure_page_manifest,
     get_profile,
     linkage_totals,
     load_linkage_state,
+    load_page_diagnostics,
     natural_key,
     normalize_figure_id,
     migrate_linkage_columns,
@@ -65,7 +67,12 @@ from catalog.linkage import (
     save_linkage_state,
     validate_figure,
 )
-from processors.ocr import PaddleOCRStructuredExtractor
+from catalog.profiles import hesban_profile_payload
+from processors.ocr import (
+    OCR_EXTRACTOR_VERSION,
+    PaddleOCRStructuredExtractor,
+    local_ocr_runtime_health,
+)
 from catalog.measurements import (
     manual_calibration,
     measure_figure,
@@ -73,6 +80,7 @@ from catalog.measurements import (
     verified_measurement,
 )
 from routes.research_export import register_research_export_routes
+from services.linkage_jobs import LinkageJobCoordinator
 
 # Stable aliases used by the shared JSON-repair helpers below.
 _re = re
@@ -92,6 +100,64 @@ register_research_export_routes(app, lambda: project_manager)
 _gemma_model = None
 _gemma_processor = None
 _gemma_model_lock = threading.Lock()
+
+_ocr_health_lock = threading.Lock()
+_ocr_health_status = None
+
+# The desktop launcher deliberately disables Flask's reloader because loading
+# the vision and OCR models twice is unsafe and expensive. Detect edited Python
+# sources instead, then prevent a still-running process from producing results
+# with an older in-memory extractor.
+_BACKEND_SOURCE_SNAPSHOT = {
+    path.resolve(): path.stat().st_mtime_ns
+    for path in (
+        Path(__file__),
+        Path(__file__).parent / "processors" / "ocr.py",
+        Path(__file__).parent / "catalog" / "profiles.py",
+        Path(__file__).parent / "catalog" / "linkage.py",
+        Path(__file__).parent / "services" / "linkage_jobs.py",
+    )
+    if path.exists()
+}
+
+
+def get_backend_reload_status():
+    """Tell the UI when source changed after this server process started."""
+    changed = []
+    for path, started_mtime in _BACKEND_SOURCE_SNAPSHOT.items():
+        try:
+            if path.stat().st_mtime_ns != started_mtime:
+                changed.append(path.name)
+        except OSError:
+            changed.append(path.name)
+    required = bool(changed)
+    return {
+        'required': required,
+        'changed_files': sorted(set(changed)),
+        'message': ('SherdScope code changed while this server was open. Restart '
+                    'SherdScope before reading or rereading tables.' if required else ''),
+    }
+
+
+def _restart_required_response():
+    status = get_backend_reload_status()
+    if not status['required']:
+        return None
+    return jsonify({'success': False, 'restart_required': True,
+                    'error': status['message'], 'backend_reload': status}), 409
+
+
+def get_local_ocr_health(initialize_models=False):
+    """Report real OCR import/model health instead of package presence alone."""
+    global _ocr_health_status
+    with _ocr_health_lock:
+        if (_ocr_health_status is None or
+                (initialize_models and not _ocr_health_status.get('models_initialized'))):
+            status = local_ocr_runtime_health(initialize_models=initialize_models)
+            status['models_initialized'] = bool(
+                initialize_models and status.get('available'))
+            _ocr_health_status = status
+        return dict(_ocr_health_status)
 
 def load_gemma_model(hf_token=None):
     """Lazy-load google/gemma-4-E2B-it for vision-based bibliographic extraction."""
@@ -2773,8 +2839,26 @@ def _read_numbers_from_crops(original_image_path, image_annots, current_image_na
 # Figure-to-table metadata linkage
 # --------------------------------------------------------------------------
 
-_metadata_link_jobs = {}
-_metadata_link_jobs_lock = threading.Lock()
+def _dispatch_linkage_job(project_id, project_path, job, should_pause):
+    kind = job.get('kind')
+    if kind in {'bulk_link', 'figure_reread', 'boundary_reread'}:
+        status = get_backend_reload_status()
+        if status['required']:
+            raise MetadataLinkError(status['message'])
+    if kind == 'bulk_link':
+        return _perform_bulk_link_job(project_id, project_path, job, should_pause)
+    if kind == 'figure_reread':
+        return _perform_figure_reread(project_id, job.get('payload', {}).get('figure_key', ''))
+    if kind == 'measurement_reread':
+        return _perform_measurement_reread(project_id, job.get('payload', {}).get('figure_key', ''))
+    if kind == 'boundary_reread':
+        return _perform_figure_reread(
+            project_id, job.get('payload', {}).get('figure_key', ''),
+            job.get('payload', {}).get('image_name'))
+    raise MetadataLinkError(f'Unknown linkage job: {kind}')
+
+
+linkage_job_coordinator = LinkageJobCoordinator(_dispatch_linkage_job)
 
 
 def _resize_for_vision(image, max_side=3200):
@@ -2894,6 +2978,41 @@ class AppStructuredExtractor(StructuredExtractor):
                                       self.api_key, self.model_name, 8192)
 
 
+def _perform_bulk_link_job(project_id, project_path, job, should_pause):
+    payload = job.get('payload', {})
+    backend = payload.get('backend', 'ocr')
+    if backend == 'ocr':
+        health = get_local_ocr_health(initialize_models=True)
+        if not health.get('available'):
+            raise MetadataLinkError(
+                f"{health.get('message')} {health.get('error', '')}".strip())
+    extractor = (PaddleOCRStructuredExtractor() if backend == 'ocr' else
+                 AppStructuredExtractor(backend=backend,
+                                        api_key=payload.get('openrouter_api_key', ''),
+                                        model_name=payload.get('openrouter_model', '')))
+    linker = MetadataLinker(Path(project_path), extractor, Hesban11Profile(),
+                            payload.get('source_pdf') or None)
+    try:
+        state = linker.run(
+            progress=lambda current, total, message:
+                linkage_job_coordinator.update_progress(
+                    Path(project_path), job['id'], current, total, message),
+            resume=bool(payload.get('resume')), should_pause=should_pause)
+        if state.get('status') == 'complete':
+            project_manager.update_workflow_status(project_id, linkage_totals(state))
+        return {'paused': state.get('status') == 'paused',
+                'progress': state.get('progress', {}),
+                'resume_cursor': state.get('progress', {}),
+                'totals': linkage_totals(state)}
+    except Exception as exc:
+        state = load_linkage_state(Path(project_path))
+        state['status'] = 'error'
+        state['error'] = str(exc)
+        state['progress'] = {**state.get('progress', {}), 'message': str(exc)}
+        save_linkage_state(Path(project_path), state)
+        raise
+
+
 @app.route('/api/projects/<project_id>/metadata-link/run', methods=['POST'])
 def run_project_metadata_link(project_id):
     project = project_manager.get_project(project_id)
@@ -2902,60 +3021,42 @@ def run_project_metadata_link(project_id):
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return jsonify({'error': 'Request body must be a JSON object', 'success': False}), 400
+    restart_response = _restart_required_response()
+    if restart_response:
+        return restart_response
     backend = str(data.get('backend') or data.get('ai_backend') or 'ocr').lower()
     if backend not in {'ocr', 'local', 'openrouter'}:
         return jsonify({'error': 'Backend must be ocr, local, or openrouter', 'success': False}), 400
     if backend == 'ocr':
-        import importlib.util
-        if not importlib.util.find_spec('paddleocr') or not importlib.util.find_spec('paddle'):
+        ocr_health = get_local_ocr_health()
+        if not ocr_health.get('available'):
             return jsonify({
-                'error': 'Local OCR is not installed. Run: pip install -r requirements-ocr.txt',
+                'error': ocr_health.get('message'),
+                'technical_detail': ocr_health.get('error', ''),
                 'success': False, 'ocr_unavailable': True,
             }), 503
-    with _metadata_link_jobs_lock:
-        if _metadata_link_jobs.get(project_id):
-            return jsonify({'error': 'A metadata-linking run is already active', 'success': False}), 409
-        _metadata_link_jobs[project_id] = True
     project_path = project_manager.get_project_path(project_id)
     source_pdf = data.get('source_pdf') or None
     if source_pdf is not None:
         submitted_source = str(source_pdf)
         source_pdf = Path(submitted_source).name
         if source_pdf != submitted_source:
-            with _metadata_link_jobs_lock:
-                _metadata_link_jobs[project_id] = False
             return jsonify({'error': 'source_pdf must be a filename, not a path',
                             'success': False}), 400
         available_sources = {path.name for path in (project_path / 'pdf_source').glob('*.pdf')}
         if source_pdf not in available_sources:
-            with _metadata_link_jobs_lock:
-                _metadata_link_jobs[project_id] = False
             return jsonify({'error': 'Selected source PDF was not found', 'success': False}), 400
     api_key = str(data.get('openrouter_api_key', ''))
     model_name = str(data.get('openrouter_model', ''))
 
-    def worker():
-        try:
-            extractor = (PaddleOCRStructuredExtractor() if backend == 'ocr' else
-                         AppStructuredExtractor(backend=backend, api_key=api_key,
-                                                model_name=model_name))
-            linker = MetadataLinker(project_path, extractor, Hesban11Profile(), source_pdf)
-            state = linker.run()
-            project_manager.update_workflow_status(project_id, linkage_totals(state))
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            state = load_linkage_state(project_path)
-            state['status'] = 'error'
-            state['error'] = str(exc)
-            state['progress'] = {**state.get('progress', {}), 'message': str(exc)}
-            save_linkage_state(project_path, state)
-        finally:
-            with _metadata_link_jobs_lock:
-                _metadata_link_jobs[project_id] = False
-
-    threading.Thread(target=worker, daemon=True).start()
-    return jsonify({'success': True, 'message': 'Metadata linking started'}), 202
+    job = linkage_job_coordinator.enqueue(
+        project_id, project_path, 'bulk_link', 100,
+        {'backend': backend, 'source_pdf': source_pdf,
+         'openrouter_model': model_name},
+        dedupe_key=f'bulk_link:{source_pdf or "default"}:{backend}',
+        private_payload={'openrouter_api_key': api_key})
+    return jsonify({'success': True, 'message': 'Metadata linking queued',
+                    'job': job}), 202
 
 
 @app.route('/api/projects/<project_id>/metadata-link/state', methods=['GET'])
@@ -2965,11 +3066,170 @@ def get_project_metadata_link_state(project_id):
         return jsonify({'error': 'Project not found', 'success': False}), 404
     state = load_linkage_state(project_path)
     sources = [p.name for p in sorted((project_path / 'pdf_source').glob('*.pdf'))]
-    import importlib.util
-    ocr_available = bool(importlib.util.find_spec('paddleocr') and importlib.util.find_spec('paddle'))
-    return jsonify({'success': True, 'state': state, 'sources': sources,
-                    'ocr_available': ocr_available,
-                    'active': bool(_metadata_link_jobs.get(project_id))})
+    jobs = linkage_job_coordinator.snapshot(project_id, project_path, ensure_worker=False)
+    if (state.get('status') in {'running', 'paused'} and not jobs.get('active') and
+            not jobs.get('paused') and not jobs.get('queued')):
+        source = state.get('run_source_pdf') or (sources[0] if len(sources) == 1 else None)
+        linkage_job_coordinator.enqueue(
+            project_id, project_path, 'bulk_link', 100,
+            {'backend': 'ocr', 'source_pdf': source, 'resume': True},
+            dedupe_key=f'bulk_link:{source or "default"}:ocr')
+        jobs = linkage_job_coordinator.snapshot(project_id, project_path)
+    else:
+        jobs = linkage_job_coordinator.snapshot(project_id, project_path)
+    ocr_health = get_local_ocr_health()
+    ocr_available = bool(ocr_health.get('available'))
+    summaries = []
+    stale_figure_count = 0
+    for figure in state.get('figures', []):
+        warnings = figure.get('warnings', [])
+        stale_boundary_count = sum(
+            bool(page.get('boundary')) and
+            page.get('boundary', {}).get('extractor_version') != OCR_EXTRACTOR_VERSION
+            for page in figure.get('table_pages', [])
+        )
+        stale_figure_count += bool(stale_boundary_count)
+        summaries.append({
+            'figure_key': figure.get('figure_key'), 'figure_id': figure.get('figure_id'),
+            'status': figure.get('status'), 'review_status': figure.get('review_status'),
+            'processing_status': figure.get('processing_status'),
+            'reviewer_revision': figure.get('reviewer_revision', 0),
+            'drawing_count': len(figure.get('drawings', [])),
+            'row_count': len(figure.get('table_rows', [])),
+            'match_count': len(figure.get('matches', [])),
+            'unresolved_count': sum(item.get('status') != 'ready'
+                                    for item in figure.get('matches', [])),
+            'blocking_count': sum(bool(item.get('blocking')) for item in warnings),
+            'needs_column_review': any(
+                item.get('code') in {'column_headers_incomplete', 'manual_column_bounds_invalid'}
+                for item in warnings),
+            'stale_boundary_count': stale_boundary_count,
+        })
+    summary_state = {key: value for key, value in state.items()
+                     if key not in {'figures', 'card_index'}}
+    summary_state['figures'] = summaries
+    summary_state['jobs'] = jobs
+    return jsonify({'success': True, 'state': summary_state, 'sources': sources,
+                     'profile': hesban_profile_payload(), 'jobs': jobs,
+                     'ocr_extractor_version': OCR_EXTRACTOR_VERSION,
+                     'stale_figure_count': stale_figure_count,
+                     'backend_reload': get_backend_reload_status(),
+                     'ocr_available': ocr_available,
+                     'ocr_health': ocr_health,
+                     'active': bool(jobs.get('active'))})
+
+
+@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>', methods=['GET'])
+def get_project_metadata_link_figure(project_id, figure_id):
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    state = load_linkage_state(project_path)
+    target = normalize_figure_id(figure_id)
+    figure = next((candidate for candidate in state.get('figures', [])
+                   if str(candidate.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(candidate.get('figure_id')) == target), None)
+    if not figure:
+        return jsonify({'error': 'Figure not found', 'success': False}), 404
+    return jsonify({'success': True, 'figure': figure,
+                    'profile': hesban_profile_payload()})
+
+
+@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/diagnostics/<path:filename>', methods=['GET'])
+def get_project_metadata_link_diagnostics(project_id, figure_id, filename):
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    state = load_linkage_state(project_path)
+    target = normalize_figure_id(figure_id)
+    figure = next((candidate for candidate in state.get('figures', [])
+                   if str(candidate.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(candidate.get('figure_id')) == target), None)
+    if not figure:
+        return jsonify({'error': 'Figure not found', 'success': False}), 404
+    return jsonify({'success': True,
+                    'diagnostics': load_page_diagnostics(project_path, figure,
+                                                         Path(filename).name)})
+
+
+@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/pages/<path:filename>/columns',
+           methods=['PUT', 'DELETE'])
+def update_project_metadata_link_columns(project_id, figure_id, filename):
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    restart_response = _restart_required_response()
+    if restart_response:
+        return restart_response
+    state = load_linkage_state(project_path)
+    target = normalize_figure_id(figure_id)
+    figure = next((candidate for candidate in state.get('figures', [])
+                   if str(candidate.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(candidate.get('figure_id')) == target), None)
+    if not figure:
+        return jsonify({'error': 'Figure not found', 'success': False}), 404
+    page_name = Path(filename).name
+    page = next((candidate for candidate in figure.get('table_pages', [])
+                 if candidate.get('image_name') == page_name), None)
+    if not page:
+        return jsonify({'error': 'Assigned table page not found', 'success': False}), 404
+    data = request.get_json(silent=True) or {}
+    current_revision = int(figure.get('reviewer_revision', 0) or 0)
+    try:
+        submitted_revision = int(data.get('reviewer_revision', current_revision))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'reviewer_revision must be a whole number',
+                        'success': False}), 400
+    if submitted_revision != current_revision:
+        return jsonify({'error': 'This figure has a newer saved draft',
+                        'success': False, 'conflict': True,
+                        'reviewer_revision': current_revision}), 409
+    if request.method == 'DELETE':
+        page.pop('manual_column_edges', None)
+        action = 'column_override_reset'
+    else:
+        edges = data.get('normalized_column_edges')
+        if not isinstance(edges, list) or len(edges) != len(HESBAN_TABLE_COLUMNS) + 1:
+            return jsonify({'error': 'Exactly 23 normalized column edges are required',
+                            'success': False}), 400
+        try:
+            edges = [round(float(value), 8) for value in edges]
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Column edges must be numbers',
+                            'success': False}), 400
+        if (edges[0] < 0 or edges[-1] > 1 or
+                any(edges[index + 1] - edges[index] < .0015
+                    for index in range(len(edges) - 1))):
+            return jsonify({'error': 'Column edges must be ordered, separated, and inside the page',
+                            'success': False}), 400
+        page['manual_column_edges'] = edges
+        boundary = page.setdefault('boundary', {})
+        if (boundary.get('column_source') == 'header_detected' and
+                boundary.get('normalized_column_edges')):
+            boundary['detected_normalized_column_edges'] = list(
+                boundary['normalized_column_edges'])
+        boundary['normalized_column_edges'] = edges
+        boundary['column_source'] = 'manual_pending'
+        action = 'column_override_saved'
+    figure['reviewer_revision'] = current_revision + 1
+    figure['review_status'] = 'pending'
+    figure['processing_status'] = 'queued'
+    figure['draft_saved_at'] = __import__('datetime').datetime.now(
+        __import__('datetime').timezone.utc).isoformat()
+    figure.setdefault('review_history', []).append({
+        'action': action, 'at': figure['draft_saved_at'], 'page': page_name,
+    })
+    save_linkage_state(project_path, state, expected_revisions={
+        str(figure.get('figure_key', '')): current_revision,
+    })
+    key = str(figure.get('figure_key') or figure.get('figure_id'))
+    job = linkage_job_coordinator.enqueue(
+        project_id, project_path, 'boundary_reread', 0,
+        {'figure_key': key, 'image_name': page_name},
+        dedupe_key=f'boundary:{key}:{page_name}')
+    return jsonify({'success': True, 'job': job,
+                    'reviewer_revision': figure['reviewer_revision'],
+                    'message': 'Column reprocessing queued'}), 202
 
 
 @app.route('/api/projects/<project_id>/metadata-link/evidence/<path:filename>', methods=['GET'])
@@ -3033,11 +3293,19 @@ def get_project_metadata_link_evidence(project_id, filename):
             image = image.crop((max(0, x1-pad), max(0, y1-pad),
                                 min(image.width, x2+pad), min(image.height, y2+pad)))
         elif request.args.get('cell_row') and request.args.get('cell_field'):
+            diagnostic_payload = load_page_diagnostics(
+                project_path, figure, Path(filename).name)
             diagnostic = next((
                 item for item in boundary.get('cell_diagnostics', [])
                 if str(item.get('row', '')) == str(request.args.get('cell_row', ''))
                 and str(item.get('field', '')) == str(request.args.get('cell_field', ''))
             ), None)
+            if diagnostic is None:
+                diagnostic = next((
+                    item for item in diagnostic_payload.get('cell_diagnostics', [])
+                    if str(item.get('row', '')) == str(request.args.get('cell_row', ''))
+                    and str(item.get('field', '')) == str(request.args.get('cell_field', ''))
+                ), None)
             if not diagnostic or len(diagnostic.get('crop', [])) != 4:
                 return jsonify({'error': 'Development cell crop not found',
                                 'success': False}), 404
@@ -3060,8 +3328,11 @@ def get_project_metadata_link_evidence(project_id, filename):
                     from processors.ocr import _prepare_image
                     image = _prepare_image(image, min_height=100)
         elif request.args.get('ocr_row') and request.args.get('ocr_field'):
+            diagnostic_payload = load_page_diagnostics(
+                project_path, figure, Path(filename).name)
             diagnostic = next((
-                item for item in (page or {}).get('ocr_diagnostics', [])
+                item for item in ((page or {}).get('ocr_diagnostics', []) or
+                                  diagnostic_payload.get('ocr_diagnostics', []))
                 if str(item.get('row', '')) == str(request.args.get('ocr_row', ''))
                 and str(item.get('field', '')) == str(request.args.get('ocr_field', ''))
             ), None)
@@ -3071,7 +3342,7 @@ def get_project_metadata_link_evidence(project_id, filename):
             from processors.ocr import _prepare_compact_cell
             image = _prepare_compact_cell(image.crop(tuple(
                 int(value) for value in diagnostic['crop'])))
-        elif page and page.get('crop'):
+        elif page and page.get('crop') and request.args.get('full') != '1':
             image = image.crop(tuple(int(value) for value in page['crop']))
     else:
         draw = ImageDraw.Draw(image)
@@ -3139,7 +3410,8 @@ def get_project_metadata_link_evidence(project_id, filename):
                 if centreline:
                     draw.line(tuple(centreline), fill=(168, 85, 247),
                               width=measurement_line_width)
-    image.thumbnail((1800, 1800), PILImage.Resampling.LANCZOS)
+    if request.args.get('full') != '1':
+        image.thumbnail((1800, 1800), PILImage.Resampling.LANCZOS)
     buffer = BytesIO()
     image.save(buffer, format='PNG')
     buffer.seek(0)
@@ -3161,8 +3433,7 @@ def update_project_metadata_link_figure(project_id, figure_id):
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return jsonify({'error': 'Request body must be a JSON object', 'success': False}), 400
-    if (_metadata_link_jobs.get(project_id) and
-            figure.get('processing_status') not in {'reviewable', 'ready', 'approved'}):
+    if figure.get('processing_status') not in {'reviewable', 'ready', 'approved'}:
         return jsonify({'error': 'This figure is still being extracted',
                         'success': False, 'processing': True}), 409
     submitted_revision = data.get('reviewer_revision')
@@ -3297,11 +3568,81 @@ def update_project_metadata_link_figure(project_id, figure_id):
         if not isinstance(data['table_rows'], list) or not all(
                 isinstance(row, dict) for row in data['table_rows']):
             return jsonify({'error': 'table_rows must be a list of objects', 'success': False}), 400
-        figure['table_rows'] = [
-            {column: '' if row.get(column) is None else str(row.get(column, ''))
-             for column in HESBAN_TABLE_COLUMNS}
-            for row in data['table_rows']
-        ]
+        old_rows = [dict(row) for row in figure.get('table_rows', [])]
+        overrides = figure.setdefault('review_overrides', {})
+        cells = overrides.setdefault('cells', {})
+        deleted = {str(value) for value in overrides.setdefault('deleted', [])}
+        added = [dict(row) for row in overrides.setdefault('added', [])
+                 if isinstance(row, dict)]
+        profile = get_profile(state.get('profile', 'hesban11'))
+        def row_key(row, index):
+            manual_id = str(row.get('review_override_id', '')).strip()
+            if manual_id:
+                return f'manual:{manual_id}'
+            number = profile.normalize_number(
+                row.get('normalized_table_no') or row.get('table_no')) or f'row-{index}'
+            return f"{row.get('source_image', '')}|{number}"
+        old_by_key = {row_key(row, index): row for index, row in enumerate(old_rows)}
+        submitted_keys = set()
+        uses_review_keys = any(str(row.get('_review_key', '')).strip()
+                               for row in data['table_rows'])
+        cleaned_rows = []
+        for index, submitted in enumerate(data['table_rows']):
+            submitted_key = str(submitted.get('_review_key', '')).strip()
+            old = old_by_key.get(submitted_key)
+            if (old is None and not submitted_key and not uses_review_keys and
+                    index < len(old_rows)):
+                old = old_rows[index]
+                submitted_key = row_key(old, index)
+            old = old or {}
+            clean = {
+                column: '' if submitted.get(column) is None else
+                str(submitted.get(column, ''))
+                for column in HESBAN_TABLE_COLUMNS
+            }
+            for metadata_key in ('source_image', 'source_printed_page',
+                                 'normalized_table_no', 'review_override_id',
+                                 'review_override_source_key'):
+                if old.get(metadata_key) is not None:
+                    clean[metadata_key] = old.get(metadata_key)
+            if submitted_key and submitted_key in old_by_key:
+                submitted_keys.add(submitted_key)
+                deleted.discard(submitted_key)
+                if submitted_key.startswith('manual:'):
+                    manual_id = submitted_key.partition(':')[2]
+                    if clean.get('review_override_source_key'):
+                        deleted.discard(str(clean['review_override_source_key']))
+                    clean['review_override_id'] = manual_id
+                    added = [row for row in added
+                             if str(row.get('review_override_id', '')) != manual_id]
+                    added.append(dict(clean))
+                else:
+                    for column in HESBAN_TABLE_COLUMNS:
+                        old_value = '' if old.get(column) is None else str(old.get(column, ''))
+                        if clean[column] != old_value:
+                            cells.setdefault(submitted_key, {})[column] = clean[column]
+            else:
+                manual_id = secrets.token_hex(8)
+                clean['review_override_id'] = manual_id
+                submitted_key = f'manual:{manual_id}'
+                submitted_keys.add(submitted_key)
+                added.append(dict(clean))
+            cleaned_rows.append(clean)
+        for index, old in enumerate(old_rows):
+            key = row_key(old, index)
+            if key in submitted_keys:
+                continue
+            if key.startswith('manual:'):
+                manual_id = key.partition(':')[2]
+                added = [row for row in added
+                         if str(row.get('review_override_id', '')) != manual_id]
+                if old.get('review_override_source_key'):
+                    deleted.add(str(old['review_override_source_key']))
+            else:
+                deleted.add(key)
+        overrides['deleted'] = sorted(deleted)
+        overrides['added'] = added
+        figure['table_rows'] = cleaned_rows
         changed_fields.append('table_rows')
     elif isinstance(data.get('row_operations'), list):
         rows = [dict(row) for row in figure.get('table_rows', [])]
@@ -3427,8 +3768,7 @@ def update_project_metadata_link_figure(project_id, figure_id):
                     'reviewer_revision': figure.get('reviewer_revision', 0)})
 
 
-@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/measure', methods=['POST'])
-def measure_project_metadata_link_figure(project_id, figure_id):
+def _measure_project_metadata_link_figure_now(project_id, figure_id):
     """Redetect the page ruler and rim-diameter suggestions for one figure."""
     project_path = project_manager.get_project_path(project_id)
     if not project_path:
@@ -3497,12 +3837,8 @@ def measure_project_metadata_link_figure(project_id, figure_id):
                     'reviewer_revision': figure.get('reviewer_revision', 0)})
 
 
-@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/rerun', methods=['POST'])
-def rerun_project_metadata_link_figure(project_id, figure_id):
+def _rerun_project_metadata_link_figure_now(project_id, figure_id):
     """Rerun deterministic local OCR for one figure's assigned table pages."""
-    if _metadata_link_jobs.get(project_id):
-        return jsonify({'error': 'Wait for metadata linking to finish before rerunning OCR',
-                        'success': False}), 409
     project_path = project_manager.get_project_path(project_id)
     if not project_path:
         return jsonify({'error': 'Project not found', 'success': False}), 404
@@ -3516,16 +3852,14 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
     if not figure.get('table_pages'):
         return jsonify({'error': 'Assign at least one table page before rerunning OCR',
                         'success': False}), 409
-    import importlib.util
-    if not importlib.util.find_spec('paddleocr') or not importlib.util.find_spec('paddle'):
-        return jsonify({'error': 'Local OCR is not installed. Run: pip install -r requirements-ocr.txt',
+    data = request.get_json(silent=True) or {}
+    only_page = Path(str(data.get('image_name'))).name if data.get('image_name') else None
+    ocr_health = get_local_ocr_health()
+    if not ocr_health.get('available'):
+        return jsonify({'error': ocr_health.get('message'),
+                        'technical_detail': ocr_health.get('error', ''),
                         'success': False, 'ocr_unavailable': True}), 503
 
-    with _metadata_link_jobs_lock:
-        if _metadata_link_jobs.get(project_id):
-            return jsonify({'error': 'Metadata linking is already running for this project',
-                            'success': False}), 409
-        _metadata_link_jobs[project_id] = True
     try:
         # Persist this before the synchronous OCR work starts. Other Flask
         # requests can now display the correct state and must not edit the same
@@ -3539,11 +3873,16 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
                            for drawing in figure.get('drawings', [])
                            if drawing.get('vessel_number')}, key=natural_key)
         extractor = PaddleOCRStructuredExtractor()
-        rows = []
+        rows = [dict(row) for row in figure.get('table_rows', [])
+                if only_page and row.get('source_image') != only_page]
         warnings = []
         updated_pages = []
-        seen = set()
+        seen = {(profile.normalize_number(row.get('table_no')), row.get('source_image'))
+                for row in rows if profile.normalize_number(row.get('table_no'))}
         for assigned in figure.get('table_pages', []):
+            if only_page and assigned.get('image_name') != only_page:
+                updated_pages.append(assigned)
+                continue
             page = manifest_pages.get(assigned.get('image_name'))
             if not page:
                 warnings.append({'code': 'page_not_in_manifest',
@@ -3554,11 +3893,19 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
             context.update(page)
             context['figure_id'] = figure.get('figure_id', '')
             context['figure_caption'] = figure.get('figure_caption', '')
+            context['manual_column_edges'] = assigned.get('manual_column_edges')
             table = extractor.extract_table(
                 project_path / 'images' / page['image_name'],
                 tuple(assigned['crop']) if assigned.get('crop') else None,
                 figure.get('figure_id', ''), expected, context) or {}
             boundary = table.get('boundary', {}) if isinstance(table.get('boundary'), dict) else {}
+            if assigned.get('manual_column_edges'):
+                previous_boundary = assigned.get('boundary', {})
+                detected = previous_boundary.get('detected_normalized_column_edges')
+                if not detected and previous_boundary.get('column_source') == 'header_detected':
+                    detected = previous_boundary.get('normalized_column_edges')
+                if detected:
+                    boundary['detected_normalized_column_edges'] = detected
             updated = {**assigned, 'logical_index': page.get('logical_index'),
                        'printed_page': table.get('printed_page') or page.get('printed_page', ''),
                        'source_pdf': page.get('source_pdf', ''), 'boundary': boundary,
@@ -3603,6 +3950,10 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
 
         figure['table_pages'] = updated_pages
         figure['table_rows'] = rows
+        unmatched_overrides = apply_reviewer_row_overrides(figure, profile)
+        for override_key in unmatched_overrides:
+            warnings.append({'code': 'review_override_unmatched',
+                             'message': f'A saved table correction no longer matches an OCR row: {override_key}'})
         figure['extraction_warnings'] = warnings
         figure['review_status'] = 'pending'
         figure.setdefault('review_history', []).append({
@@ -3629,8 +3980,61 @@ def rerun_project_metadata_link_figure(project_id, figure_id):
                 save_linkage_state(project_path, latest_state)
         except Exception:
             app.logger.exception('Could not restore figure review state after OCR rerun')
-        with _metadata_link_jobs_lock:
-            _metadata_link_jobs[project_id] = False
+        pass
+
+
+def _response_payload(result):
+    response, status = result if isinstance(result, tuple) else (result, 200)
+    payload = response.get_json() if hasattr(response, 'get_json') else response
+    if int(status) >= 400 or not payload.get('success'):
+        raise MetadataLinkError(payload.get('error', 'Linkage operation failed'))
+    return payload
+
+
+def _perform_figure_reread(project_id, figure_id, image_name=None):
+    with app.test_request_context(json={'backend': 'ocr', 'image_name': image_name}):
+        return _response_payload(
+            _rerun_project_metadata_link_figure_now(project_id, figure_id))
+
+
+def _perform_measurement_reread(project_id, figure_id):
+    project_path = project_manager.get_project_path(project_id)
+    state = load_linkage_state(project_path)
+    target = normalize_figure_id(figure_id)
+    figure = next((candidate for candidate in state.get('figures', [])
+                   if str(candidate.get('figure_key', '')) == figure_id or
+                   normalize_figure_id(candidate.get('figure_id')) == target), None)
+    revision = int(figure.get('reviewer_revision', 0) or 0) if figure else 0
+    with app.test_request_context(json={'reviewer_revision': revision}):
+        return _response_payload(
+            _measure_project_metadata_link_figure_now(project_id, figure_id))
+
+
+@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/measure', methods=['POST'])
+def measure_project_metadata_link_figure(project_id, figure_id):
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    job = linkage_job_coordinator.enqueue(
+        project_id, project_path, 'measurement_reread', 10,
+        {'figure_key': figure_id}, dedupe_key=f'measurement:{figure_id}')
+    return jsonify({'success': True, 'job': job,
+                    'message': 'Measurement reread queued'}), 202
+
+
+@app.route('/api/projects/<project_id>/metadata-link/figures/<path:figure_id>/rerun', methods=['POST'])
+def rerun_project_metadata_link_figure(project_id, figure_id):
+    project_path = project_manager.get_project_path(project_id)
+    if not project_path:
+        return jsonify({'error': 'Project not found', 'success': False}), 404
+    restart_response = _restart_required_response()
+    if restart_response:
+        return restart_response
+    job = linkage_job_coordinator.enqueue(
+        project_id, project_path, 'figure_reread', 10,
+        {'figure_key': figure_id}, dedupe_key=f'figure_reread:{figure_id}')
+    return jsonify({'success': True, 'job': job,
+                    'message': 'Figure reread queued'}), 202
 
 
 @app.route('/api/projects/<project_id>/metadata-link/apply', methods=['POST'])

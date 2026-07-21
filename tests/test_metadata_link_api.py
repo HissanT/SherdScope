@@ -13,7 +13,10 @@ pytest.importorskip("fitz")
 os.environ["PYPOTTERYLENS_SKIP_INIT"] = "1"
 
 import app as app_module
-from catalog.linkage import Hesban11Profile, load_linkage_state, save_linkage_state, validate_figure
+from catalog.linkage import (
+    Hesban11Profile, apply_reviewer_row_overrides, load_linkage_state,
+    save_linkage_state, validate_figure,
+)
 from services.projects import ProjectManager
 from catalog.export import EXPORT_COLUMNS
 
@@ -42,11 +45,27 @@ def test_state_edit_and_apply_endpoints(tmp_path, monkeypatch):
         "progress": {}, "figures": [figure], "warnings": [],
     })
     monkeypatch.setattr(app_module, "project_manager", manager)
+    monkeypatch.setattr(app_module, "get_local_ocr_health", lambda **_: {
+        "available": False,
+        "message": "Local OCR is installed but could not start.",
+        "error": "broken optional dependency",
+        "models_initialized": False,
+    })
     client = app_module.app.test_client()
 
     state_response = client.get(f"/api/projects/{project_id}/metadata-link/state")
     assert state_response.status_code == 200
-    assert state_response.get_json()["state"]["figures"][0]["status"] == "ready"
+    state_payload = state_response.get_json()
+    assert state_payload["state"]["figures"][0]["status"] == "ready"
+    assert "table_rows" not in state_payload["state"]["figures"][0]
+    assert state_payload["profile"]["columns"][2]["csv_label"] == "Sq/Area"
+    assert state_payload["ocr_available"] is False
+    assert state_payload["ocr_health"]["error"] == "broken optional dependency"
+    assert state_payload["backend_reload"]["required"] is False
+    assert state_payload["stale_figure_count"] == 0
+    detail = client.get(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1").get_json()["figure"]
+    assert detail["table_rows"][0]["table_type"] == "Pithos"
 
     edit_response = client.patch(
         f"/api/projects/{project_id}/metadata-link/figures/2.1",
@@ -70,6 +89,34 @@ def _make_api_project(tmp_path, name="API Extra"):
     manager = ProjectManager(tmp_path / "projects")
     project = manager.create_project(name)
     return manager, project["project_id"], manager.get_project_path(project["project_id"])
+
+
+def test_backend_reload_status_detects_source_changed_after_start(tmp_path, monkeypatch):
+    source = tmp_path / "ocr.py"
+    source.write_text("before", encoding="utf-8")
+    started = source.stat().st_mtime_ns
+    monkeypatch.setattr(app_module, "_BACKEND_SOURCE_SNAPSHOT", {source: started})
+    os.utime(source, ns=(started + 1_000_000, started + 1_000_000))
+
+    status = app_module.get_backend_reload_status()
+
+    assert status["required"] is True
+    assert status["changed_files"] == ["ocr.py"]
+    assert "Restart SherdScope" in status["message"]
+
+
+def _wait_linkage_job(project_id, project_path, job_id, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = app_module.linkage_job_coordinator.snapshot(
+            project_id, project_path, ensure_worker=False)
+        completed = next((item for item in state.get("recent", [])
+                          if item.get("id") == job_id), None)
+        if completed:
+            assert completed["status"] == "succeeded", completed.get("error")
+            return completed
+        time.sleep(.01)
+    raise AssertionError(f"job {job_id} did not finish")
 
 
 def test_edit_rejects_cross_pdf_table_page_and_allows_figure_correction(tmp_path, monkeypatch):
@@ -112,7 +159,7 @@ def test_run_endpoint_prevents_concurrent_project_job(tmp_path, monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def run(self):
+        def run(self, **kwargs):
             release.wait(5)
             return {"figures": [], "status": "complete"}
 
@@ -124,13 +171,10 @@ def test_run_endpoint_prevents_concurrent_project_job(tmp_path, monkeypatch):
     assert first.status_code == 202
     second = client.post(f"/api/projects/{project_id}/metadata-link/run",
                          json={"backend": "local"})
-    assert second.status_code == 409
+    assert second.status_code == 202
+    assert second.get_json()["job"]["id"] == first.get_json()["job"]["id"]
     release.set()
-    for _ in range(100):
-        if not app_module._metadata_link_jobs.get(project_id):
-            break
-        time.sleep(.01)
-    assert not app_module._metadata_link_jobs.get(project_id)
+    _wait_linkage_job(project_id, project_path, first.get_json()["job"]["id"])
 
 
 def test_failed_renderer_does_not_overwrite_existing_pdf_or_images(tmp_path, monkeypatch):
@@ -374,6 +418,10 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
 
     monkeypatch.setattr(app_module, "project_manager", manager)
     monkeypatch.setattr(app_module, "PaddleOCRStructuredExtractor", FakeRerunOCR)
+    monkeypatch.setattr(app_module, "get_local_ocr_health", lambda **_: {
+        "available": True, "message": "Local OCR is ready.", "error": "",
+        "models_initialized": True,
+    })
     import importlib.util
     real_find_spec = importlib.util.find_spec
     monkeypatch.setattr(importlib.util, "find_spec",
@@ -383,12 +431,17 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
     response = client.post(
         f"/api/projects/{project_id}/metadata-link/figures/2.1/rerun",
         json={"backend": "ocr"})
-    assert response.status_code == 200
-    updated = response.get_json()["figure"]
+    assert response.status_code == 202
+    _wait_linkage_job(project_id, project_path, response.get_json()["job"]["id"])
+    updated = client.get(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1").get_json()["figure"]
     assert updated["status"] == "ready"
     assert updated["table_rows"][0]["table_type"] == "Pithos"
     assert updated["table_pages"][0]["boundary"]["closing_rule_y"] == 760
-    assert updated["table_pages"][0]["ocr_diagnostics"][0]["accepted_value"] == "L"
+    diagnostics = client.get(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1/diagnostics/page_1.jpg")
+    assert diagnostics.status_code == 200
+    assert diagnostics.get_json()["diagnostics"]["ocr_diagnostics"][0]["accepted_value"] == "L"
     assert observed_processing_states == ["processing"]
 
     evidence = client.get(
@@ -410,6 +463,93 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
         "?figure=2.1&kind=table&cell_row=1&cell_field=table_type&cell_view=focused")
     assert focused_cell.status_code == 200
     assert focused_cell.mimetype == "image/png"
+
+
+def test_manual_column_edges_persist_reset_and_queue_priority_zero(tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Manual Columns")
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable", "reviewer_revision": 0,
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Jar"}],
+        "table_pages": [{
+            "image_name": "page_1.jpg", "source_pdf": "hesban.pdf",
+            "boundary": {
+                "column_source": "header_detected",
+                "normalized_column_edges": [index / 22 for index in range(23)],
+            },
+        }],
+    }
+    validate_figure(figure, Hesban11Profile())
+    save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
+                                      "figures": [figure]})
+    queued = []
+
+    class FakeCoordinator:
+        def enqueue(self, project_id, project_path, kind, priority, payload=None,
+                    dedupe_key=None, **kwargs):
+            queued.append((kind, priority, payload, dedupe_key))
+            return {"id": f"job-{len(queued)}", "kind": kind, "status": "queued"}
+
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    monkeypatch.setattr(app_module, "linkage_job_coordinator", FakeCoordinator())
+    client = app_module.app.test_client()
+    key = figure["figure_key"]
+    edges = [.1 + index * .035 for index in range(22)] + [.9]
+    saved = client.put(
+        f"/api/projects/{project_id}/metadata-link/figures/{key}/pages/page_1.jpg/columns",
+        json={"reviewer_revision": 0, "normalized_column_edges": edges})
+    assert saved.status_code == 202
+    persisted = load_linkage_state(project_path)["figures"][0]
+    assert persisted["table_pages"][0]["manual_column_edges"] == [
+        round(value, 8) for value in edges]
+    assert persisted["review_status"] == "pending"
+    assert queued[0][0:2] == ("boundary_reread", 0)
+
+    reset = client.delete(
+        f"/api/projects/{project_id}/metadata-link/figures/{key}/pages/page_1.jpg/columns",
+        json={"reviewer_revision": 1})
+    assert reset.status_code == 202
+    assert "manual_column_edges" not in load_linkage_state(
+        project_path)["figures"][0]["table_pages"][0]
+
+
+def test_row_add_delete_and_cell_edit_are_retained_across_reread(tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(tmp_path, "Row Overrides")
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable", "reviewer_revision": 0,
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x", "vessel_number": "1"}],
+        "table_rows": [
+            {"table_no": "1", "table_type": "OCR jar", "source_image": "page.jpg",
+             "normalized_table_no": "1"},
+            {"table_no": "2", "table_type": "OCR bowl", "source_image": "page.jpg",
+             "normalized_table_no": "2"},
+        ],
+    }
+    validate_figure(figure, Hesban11Profile())
+    save_linkage_state(project_path, {"profile": "hesban11", "status": "complete",
+                                      "figures": [figure]})
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+    edited = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}",
+        json={"reviewer_revision": 0, "table_rows": [
+            {"_review_key": "page.jpg|1", "table_no": "1",
+             "table_type": "Researcher jar"},
+            {"table_no": "3", "table_type": "Added bowl"},
+        ]})
+    assert edited.status_code == 200
+    saved = load_linkage_state(project_path)["figures"][0]
+    assert saved["review_overrides"]["cells"]["page.jpg|1"]["table_type"] == "Researcher jar"
+    assert saved["review_overrides"]["deleted"] == ["page.jpg|2"]
+    assert saved["review_overrides"]["added"][0]["table_no"] == "3"
+
+    saved["table_rows"] = [
+        {"table_no": "1", "table_type": "New OCR jar", "source_image": "page.jpg"},
+        {"table_no": "2", "table_type": "New OCR bowl", "source_image": "page.jpg"},
+    ]
+    assert apply_reviewer_row_overrides(saved, Hesban11Profile()) == []
+    assert [(row["table_no"], row["table_type"]) for row in saved["table_rows"]] == [
+        ("1", "Researcher jar"), ("3", "Added bowl")]
 
 
 def test_tabular_boxes_use_staged_vessel_number_not_mask_suffix(tmp_path, monkeypatch):
@@ -463,26 +603,22 @@ def test_reviewable_figure_autosaves_during_later_ocr_and_rejects_stale_revision
         "figures": [figure], "warnings": [],
     })
     monkeypatch.setattr(app_module, "project_manager", manager)
-    app_module._metadata_link_jobs[project_id] = True
-    try:
-        client = app_module.app.test_client()
-        saved = client.patch(
-            f"/api/projects/{project_id}/metadata-link/figures/2.1",
-            json={"reviewer_revision": 0,
-                  "table_rows": [{"table_no": "1", "table_type": "Manual value"}]},
-        )
-        assert saved.status_code == 200
-        assert saved.get_json()["reviewer_revision"] == 1
-        stale = client.patch(
-            f"/api/projects/{project_id}/metadata-link/figures/2.1",
-            json={"reviewer_revision": 0,
-                  "table_rows": [{"table_no": "1", "table_type": "Lost value"}]},
-        )
-        assert stale.status_code == 409
-        assert stale.get_json()["conflict"] is True
-        assert stale.get_json()["figure"]["table_rows"][0]["table_type"] == "Manual value"
-    finally:
-        app_module._metadata_link_jobs.pop(project_id, None)
+    client = app_module.app.test_client()
+    saved = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1",
+        json={"reviewer_revision": 0,
+              "table_rows": [{"table_no": "1", "table_type": "Manual value"}]},
+    )
+    assert saved.status_code == 200
+    assert saved.get_json()["reviewer_revision"] == 1
+    stale = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1",
+        json={"reviewer_revision": 0,
+              "table_rows": [{"table_no": "1", "table_type": "Lost value"}]},
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["conflict"] is True
+    assert stale.get_json()["figure"]["table_rows"][0]["table_type"] == "Manual value"
 
 
 def test_processing_figure_cannot_be_edited_during_ocr(tmp_path, monkeypatch):
@@ -495,16 +631,12 @@ def test_processing_figure_cannot_be_edited_during_ocr(tmp_path, monkeypatch):
         }],
     })
     monkeypatch.setattr(app_module, "project_manager", manager)
-    app_module._metadata_link_jobs[project_id] = True
-    try:
-        response = app_module.app.test_client().patch(
-            f"/api/projects/{project_id}/metadata-link/figures/2.1",
-            json={"reviewer_revision": 0, "figure_caption": "Changed"},
-        )
-        assert response.status_code == 409
-        assert response.get_json()["processing"] is True
-    finally:
-        app_module._metadata_link_jobs.pop(project_id, None)
+    response = app_module.app.test_client().patch(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1",
+        json={"reviewer_revision": 0, "figure_caption": "Changed"},
+    )
+    assert response.status_code == 409
+    assert response.get_json()["processing"] is True
 
 
 def test_row_operations_and_safe_warning_override_are_audited_in_csv(
@@ -655,39 +787,35 @@ def test_completed_figure_can_be_approved_while_another_figure_is_processing(
     })
     stale_background = load_linkage_state(project_path)
     monkeypatch.setattr(app_module, "project_manager", manager)
-    app_module._metadata_link_jobs[project_id] = True
-    try:
-        client = app_module.app.test_client()
-        blocked = client.post(
-            f"/api/projects/{project_id}/metadata-link/apply",
-            json={"figure_ids": ["2.2"]},
-        )
-        assert blocked.status_code == 409
-        assert "still being extracted" in blocked.get_json()["error"]
-        response = client.post(
-            f"/api/projects/{project_id}/metadata-link/apply",
-            json={"figure_ids": ["2.1"], "replace_imported": True},
-        )
-        assert response.status_code == 200
-        approved = load_linkage_state(project_path)["figures"][0]
-        assert approved["review_status"] == "approved"
-        assert approved["reviewer_revision"] == 1
-        assert approved["matches"][0]["applied_values"]["Type"] == "Pithos"
+    client = app_module.app.test_client()
+    blocked = client.post(
+        f"/api/projects/{project_id}/metadata-link/apply",
+        json={"figure_ids": ["2.2"]},
+    )
+    assert blocked.status_code == 409
+    assert "still being extracted" in blocked.get_json()["error"]
+    response = client.post(
+        f"/api/projects/{project_id}/metadata-link/apply",
+        json={"figure_ids": ["2.1"], "replace_imported": True},
+    )
+    assert response.status_code == 200
+    approved = load_linkage_state(project_path)["figures"][0]
+    assert approved["review_status"] == "approved"
+    assert approved["reviewer_revision"] == 1
+    assert approved["matches"][0]["applied_values"]["Type"] == "Pithos"
 
-        # Simulate the long-running linker saving its pre-approval in-memory
-        # state. The newer reviewer revision must survive this stale progress
-        # write, including approval and feature-owned CSV evidence.
-        save_linkage_state(project_path, stale_background)
-        after_background = load_linkage_state(project_path)["figures"][0]
-        assert after_background["review_status"] == "approved"
-        assert after_background["processing_status"] == "approved"
-        assert after_background["reviewer_revision"] == 1
-        assert after_background["matches"][0]["applied_values"]["Type"] == "Pithos"
-        csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
-                          dtype=str, keep_default_na=False)
-        assert csv.loc[0, "Type"] == "Pithos"
-    finally:
-        app_module._metadata_link_jobs.pop(project_id, None)
+    # Simulate the long-running linker saving its pre-approval in-memory
+    # state. The newer reviewer revision must survive this stale progress
+    # write, including approval and feature-owned CSV evidence.
+    save_linkage_state(project_path, stale_background)
+    after_background = load_linkage_state(project_path)["figures"][0]
+    assert after_background["review_status"] == "approved"
+    assert after_background["processing_status"] == "approved"
+    assert after_background["reviewer_revision"] == 1
+    assert after_background["matches"][0]["applied_values"]["Type"] == "Pithos"
+    csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
+                      dtype=str, keep_default_na=False)
+    assert csv.loc[0, "Type"] == "Pithos"
 
 
 def test_measurement_review_exports_only_verified_diameter(tmp_path, monkeypatch):
@@ -730,8 +858,10 @@ def test_measurement_review_exports_only_verified_diameter(tmp_path, monkeypatch
     measured = client.post(
         f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}/measure",
         json={"reviewer_revision": 0})
-    assert measured.status_code == 200
-    payload = measured.get_json()["figure"]
+    assert measured.status_code == 202
+    _wait_linkage_job(project_id, project_path, measured.get_json()["job"]["id"])
+    payload = client.get(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}").get_json()["figure"]
     assert payload["drawings"][0]["measurement"]["status"] == "verified_automatic"
 
     # A structurally valid automatic measurement is accepted without an extra click.
@@ -743,8 +873,8 @@ def test_measurement_review_exports_only_verified_diameter(tmp_path, monkeypatch
     assert float(csv.loc[0, "Rim Diameter (cm)"]) > 0
     assert csv.loc[0, "Diameter Status"] == "verified_automatic"
 
-    state = client.get(f"/api/projects/{project_id}/metadata-link/state").get_json()["state"]
-    saved = state["figures"][0]
+    saved = client.get(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}").get_json()["figure"]
     corrected = client.patch(
         f"/api/projects/{project_id}/metadata-link/figures/{saved['figure_key']}",
         json={"reviewer_revision": saved["reviewer_revision"],

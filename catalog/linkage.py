@@ -16,34 +16,33 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import threading
 from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
 
+from catalog.profiles import HESBAN_TABLE_COLUMNS
+
 
 SCHEMA_VERSION = 1
+LINKAGE_SCHEMA_VERSION = 2
 MANIFEST_NAME = "page_manifest.json"
 STATE_NAME = "metadata_linkage.json"
+DIAGNOSTICS_DIR_NAME = "metadata_diagnostics"
 
 IDENTITY_COLUMNS = [
     "figure_id", "figure_caption", "vessel_number", "drawing_printed_page",
     "table_printed_pages", "source_pdf", "link_status",
 ]
 
-HESBAN_TABLE_COLUMNS = [
-    "table_no", "table_type", "table_square", "table_locus", "table_pail",
-    "table_registration", "fabric_exterior", "fabric_core", "fabric_interior",
-    "nonplastics_type", "nonplastics_size", "nonplastics_shape",
-    "nonplastics_density", "voids_type_size", "voids_density", "manufacture",
-    "surface_exterior", "surface_exterior_color", "surface_interior",
-    "surface_interior_color", "decor", "fire",
-]
-
 MEASUREMENT_COLUMNS = ["rim_diameter_cm", "diameter_status"]
 LINKAGE_COLUMNS = IDENTITY_COLUMNS + HESBAN_TABLE_COLUMNS + MEASUREMENT_COLUMNS
-NON_BLOCKING_WARNING_CODES = {"low_ocr_confidence"}
+NON_BLOCKING_WARNING_CODES = {
+    "low_ocr_confidence", "row_anchor_conflict_resolved",
+    "cross_column_ocr_withheld",
+}
 HIDDEN_REVIEW_WARNING_CODES = {"missing_table_end"}
 OVERRIDABLE_WARNING_CODES = {
     "missing_required_value", "column_header_fallback",
@@ -56,7 +55,7 @@ REVIEWER_OWNED_FIGURE_FIELDS = {
     "figure_id", "figure_caption", "table_rows", "table_pages",
     "warning_overrides", "reviewer_revision", "draft_saved_at",
     "review_history", "review_status", "processing_status", "matches",
-    "scale_calibrations",
+    "scale_calibrations", "review_overrides",
 }
 _LINKAGE_STATE_LOCK = threading.RLock()
 
@@ -73,7 +72,7 @@ PUBLIC_LINKAGE_MAP = {
     "table_type": "Type",
     "rim_diameter_cm": "Rim Diameter (cm)",
     "diameter_status": "Diameter Status",
-    "table_square": "Sq",
+    "table_square": "Sq/Area",
     "table_locus": "Loc",
     "table_pail": "Pail",
     "table_registration": "Reg",
@@ -123,6 +122,48 @@ def natural_key(value: str) -> list[Any]:
             for part in re.split(r"(\d+)", str(value))]
 
 
+def order_figure_table_rows(figure: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep extracted and reviewed rows in natural printed-number order.
+
+    Targeted page rereads retain rows from the other table pages and replace
+    only the selected page.  Without a shared ordering step, the replacement
+    rows are appended after the retained rows.  Sorting here makes ordering a
+    state invariant for fresh extraction, retries, rereads, and legacy state.
+    Page order is a stable tie-breaker for duplicate printed row labels.
+    """
+    rows = figure.get("table_rows", [])
+    if not isinstance(rows, list) or len(rows) < 2:
+        return rows if isinstance(rows, list) else []
+
+    table_pages = figure.get("table_pages", [])
+    page_order = {
+        str(page.get("image_name", "")): index
+        for index, page in enumerate(sorted(
+            (page for page in table_pages if isinstance(page, dict)),
+            key=lambda page: (
+                int(page.get("logical_index", 10**9))
+                if str(page.get("logical_index", "")).lstrip("-").isdigit()
+                else 10**9,
+                natural_key(str(page.get("image_name", ""))),
+            ),
+        ))
+    }
+    unknown_page = len(page_order) + 1
+
+    def row_key(item: tuple[int, dict[str, Any]]) -> tuple[Any, ...]:
+        original_index, row = item
+        number = str(row.get("normalized_table_no") or
+                     row.get("table_no") or "").strip()
+        source_rank = page_order.get(str(row.get("source_image", "")), unknown_page)
+        if number:
+            return (0, natural_key(number), source_rank, original_index)
+        return (1, [], source_rank, original_index)
+
+    ordered = [row for _, row in sorted(enumerate(rows), key=row_key)]
+    figure["table_rows"] = ordered
+    return ordered
+
+
 def normalize_figure_id(value: Any) -> str:
     if value is None:
         return ""
@@ -160,6 +201,14 @@ def migrate_linkage_columns(frame: pd.DataFrame, drop_legacy: bool = True) -> pd
     already supply it.
     """
     frame = frame.copy()
+    if "Sq" in frame.columns:
+        if "Sq/Area" not in frame.columns:
+            frame["Sq/Area"] = ""
+        current = frame["Sq/Area"].fillna("").astype(str)
+        legacy = frame["Sq"].fillna("").astype(str)
+        frame.loc[current.eq(""), "Sq/Area"] = legacy[current.eq("")]
+        if drop_legacy:
+            frame = frame.drop(columns=["Sq"])
     for internal, public in PUBLIC_LINKAGE_MAP.items():
         if public not in frame.columns and internal not in frame.columns:
             continue
@@ -309,6 +358,60 @@ def read_json(path: Path, default: Optional[dict[str, Any]] = None) -> dict[str,
         return json.load(handle)
 
 
+def _diagnostic_path(project_path: Path, figure_key: str, image_name: str) -> Path:
+    safe_figure = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(figure_key or "figure"))
+    safe_page = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(str(image_name)).stem)
+    return (Path(project_path) / "cards" / DIAGNOSTICS_DIR_NAME /
+            safe_figure / f"{safe_page}.json")
+
+
+def externalize_linkage_diagnostics(project_path: Path,
+                                    state: dict[str, Any]) -> bool:
+    """Move large per-cell evidence out of the frequently rewritten state."""
+    changed = False
+    cards_path = Path(project_path) / "cards"
+    for figure in state.get("figures", []):
+        figure_key = _figure_key(figure)
+        for page in figure.get("table_pages", []):
+            boundary = page.get("boundary") if isinstance(page.get("boundary"), dict) else {}
+            cells = boundary.pop("cell_diagnostics", None)
+            ocr = page.pop("ocr_diagnostics", None)
+            if cells is None and ocr is None:
+                continue
+            diagnostic_path = _diagnostic_path(
+                project_path, figure_key, str(page.get("image_name", "page")))
+            existing = read_json(diagnostic_path, {})
+            payload = {
+                "schema_version": LINKAGE_SCHEMA_VERSION,
+                "figure_key": figure_key,
+                "image_name": page.get("image_name", ""),
+                "status": boundary.get("diagnostic_status", existing.get("status", {})),
+                "row_anchor_conflicts": boundary.get(
+                    "row_anchor_conflicts", existing.get("row_anchor_conflicts", [])),
+                "cell_diagnostics": cells if cells is not None else existing.get(
+                    "cell_diagnostics", []),
+                "ocr_diagnostics": ocr if ocr is not None else existing.get(
+                    "ocr_diagnostics", []),
+                "updated_at": utc_now(),
+            }
+            _atomic_json_write(diagnostic_path, payload)
+            page["diagnostics_ref"] = diagnostic_path.relative_to(cards_path).as_posix()
+            changed = True
+    return changed
+
+
+def load_page_diagnostics(project_path: Path, figure: dict[str, Any],
+                          image_name: str) -> dict[str, Any]:
+    page = next((candidate for candidate in figure.get("table_pages", [])
+                 if candidate.get("image_name") == Path(image_name).name), None)
+    if not page:
+        return {}
+    reference = str(page.get("diagnostics_ref", ""))
+    path = ((Path(project_path) / "cards" / reference) if reference else
+            _diagnostic_path(project_path, _figure_key(figure), image_name))
+    return read_json(path, {})
+
+
 def _page_image_name(base_name: str, index: int, split_part: Optional[str]) -> str:
     return f"{base_name}_page_{index}{split_part or ''}.jpg"
 
@@ -428,7 +531,7 @@ class StructuredExtractor(ABC):
 
 def _empty_state(profile: str) -> dict[str, Any]:
     return {
-        "schema_version": SCHEMA_VERSION, "profile": profile, "status": "idle",
+        "schema_version": LINKAGE_SCHEMA_VERSION, "profile": profile, "status": "idle",
         "progress": {"current": 0, "total": 0, "message": ""},
         "figures": [], "card_index": {}, "warnings": [], "approval_history": [],
         "created_at": utc_now(), "updated_at": utc_now(),
@@ -457,7 +560,7 @@ def _warning_id(warning: dict[str, Any]) -> str:
 
 
 def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
-    state.setdefault("schema_version", SCHEMA_VERSION)
+    state["schema_version"] = LINKAGE_SCHEMA_VERSION
     state.setdefault("figures", [])
     for figure in state.get("figures", []):
         figure["figure_key"] = _figure_key(figure)
@@ -468,16 +571,37 @@ def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
             figure["reviewer_revision"] = 0
         figure.setdefault("warning_overrides", {})
         figure.setdefault("scale_calibrations", {})
+        override_layer = figure.setdefault("review_overrides", {})
+        override_layer.setdefault("cells", {})
+        override_layer.setdefault("deleted", [])
+        override_layer.setdefault("added", [])
         figure.setdefault("draft_saved_at", "")
         figure.setdefault("processing_status", (
             "reviewable" if figure.get("matches") or state.get("status") == "complete"
             else "processing"))
+        order_figure_table_rows(figure)
     return state
 
 
 def load_linkage_state(project_path: Path) -> dict[str, Any]:
     with _LINKAGE_STATE_LOCK:
-        state = read_json(Path(project_path) / "cards" / STATE_NAME, _empty_state("hesban11"))
+        state_path = Path(project_path) / "cards" / STATE_NAME
+        state = read_json(state_path, _empty_state("hesban11"))
+        needs_migration = int(state.get("schema_version", 1) or 1) < LINKAGE_SCHEMA_VERSION
+        inline = any(
+            isinstance(page.get("boundary"), dict) and
+            "cell_diagnostics" in page.get("boundary", {})
+            for figure in state.get("figures", [])
+            for page in figure.get("table_pages", [])
+        )
+        if needs_migration or inline:
+            backup = state_path.with_name("metadata_linkage.v1.backup.json")
+            if state_path.exists() and not backup.exists():
+                shutil.copy2(state_path, backup)
+            externalize_linkage_diagnostics(project_path, state)
+            state["schema_version"] = LINKAGE_SCHEMA_VERSION
+            state["updated_at"] = utc_now()
+            _atomic_json_write(state_path, state)
     state = _ensure_review_defaults(state)
     profile = get_profile(str(state.get("profile", "hesban11")))
     for figure in state.get("figures", []):
@@ -494,6 +618,7 @@ def save_linkage_state(project_path: Path, state: dict[str, Any],
     # completed figure. Merge any newer reviewer revision before every write so
     # later progress updates cannot restore stale OCR values over manual work.
     with _LINKAGE_STATE_LOCK:
+        externalize_linkage_diagnostics(project_path, state)
         current = _ensure_review_defaults(read_json(state_path, _empty_state(
             str(state.get("profile", "hesban11")))))
         current_by_key = {figure.get("figure_key"): figure
@@ -680,6 +805,61 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
     return figure
 
 
+def apply_reviewer_row_overrides(figure: dict[str, Any],
+                                 profile: PublicationProfile) -> list[str]:
+    """Reapply edited cells and row additions/deletions after fresh OCR."""
+    layer = figure.get("review_overrides", {})
+    cells = layer.get("cells", {}) if isinstance(layer.get("cells"), dict) else {}
+    deleted = {str(value) for value in layer.get("deleted", [])}
+    added = layer.get("added", []) if isinstance(layer.get("added"), list) else []
+    matched: set[str] = set()
+    kept_rows = []
+    seen_manual: set[str] = set()
+    for index, row in enumerate(figure.get("table_rows", [])):
+        number = profile.normalize_number(row.get("table_no")) or f"row-{index}"
+        key = f"{row.get('source_image', '')}|{number}"
+        if key in deleted:
+            matched.add(key)
+            continue
+        values = cells.get(key)
+        if isinstance(values, dict):
+            for column, value in values.items():
+                if column in HESBAN_TABLE_COLUMNS:
+                    row[column] = "" if value is None else str(value)
+            matched.add(key)
+        kept_rows.append(row)
+    for saved in added:
+        if not isinstance(saved, dict):
+            continue
+        manual_id = str(saved.get("review_override_id", ""))
+        manual_key = f"manual:{manual_id}" if manual_id else ""
+        if manual_key and manual_key in seen_manual:
+            continue
+        candidate = dict(saved)
+        number = profile.normalize_number(candidate.get("table_no"))
+        source = str(candidate.get("source_image", ""))
+        # If a later OCR pass finds the formerly missing row, keep the OCR
+        # provenance and layer the researcher's values onto that row.
+        existing = next((row for row in kept_rows
+                         if profile.normalize_number(row.get("table_no")) == number
+                         and (not source or row.get("source_image", "") == source)), None)
+        if existing is not None:
+            for column in HESBAN_TABLE_COLUMNS:
+                existing[column] = "" if candidate.get(column) is None else str(
+                    candidate.get(column, ""))
+            if manual_id:
+                existing["review_override_id"] = manual_id
+                existing["review_override_source_key"] = (
+                    f"{existing.get('source_image', '')}|{number}")
+        else:
+            kept_rows.append(candidate)
+        if manual_key:
+            seen_manual.add(manual_key)
+    figure["table_rows"] = kept_rows
+    unmatched = (set(cells) | deleted) - matched
+    return sorted(unmatched)
+
+
 class MetadataLinker:
     def __init__(self, project_path: Path, extractor: StructuredExtractor,
                  profile: Optional[PublicationProfile] = None,
@@ -689,7 +869,9 @@ class MetadataLinker:
         self.profile = profile or Hesban11Profile()
         self.source_pdf = source_pdf
 
-    def run(self, progress: Optional[Callable[[int, int, str], None]] = None) -> dict[str, Any]:
+    def run(self, progress: Optional[Callable[[int, int, str], None]] = None,
+            resume: bool = False,
+            should_pause: Optional[Callable[[], bool]] = None) -> dict[str, Any]:
         previous_state = load_linkage_state(self.project_path)
         previous_figures = {
             self.profile.normalize_figure(figure.get("figure_id")): figure
@@ -711,17 +893,32 @@ class MetadataLinker:
         page_pos = {Path(p["image_name"]).stem: i for i, p in enumerate(pages)}
         grouped = _annotations_by_image(self.project_path)
         drawing_pages = sorted(grouped, key=lambda name: page_pos.get(name, 10**9))
-        state = _empty_state(self.profile.slug)
+        can_resume = bool(
+            resume and previous_state.get("status") in {"running", "paused", "error"}
+            and previous_state.get("run_source_pdf", self.source_pdf or "") ==
+            (self.source_pdf or ""))
+        state = previous_state if can_resume else _empty_state(self.profile.slug)
         state["approval_history"] = list(previous_state.get("approval_history", []))
         state["status"] = "running"
-        state["progress"] = {"current": 0, "total": len(drawing_pages), "message": "Starting"}
+        state["run_source_pdf"] = self.source_pdf or ""
+        state["progress"] = {**state.get("progress", {}),
+                             "total": len(drawing_pages), "message": "Starting"}
         save_linkage_state(self.project_path, state)
 
-        figures: dict[str, dict[str, Any]] = {}
+        figures: dict[str, dict[str, Any]] = {
+            self.profile.normalize_figure(figure.get("figure_id")): figure
+            for figure in state.get("figures", [])
+        } if can_resume else {}
+        processed_drawing_pages = {
+            page.get("image_name") for figure in figures.values()
+            for page in figure.get("drawing_pages", [])
+        }
         for index, image_stem in enumerate(drawing_pages, 1):
             page = page_by_stem.get(image_stem)
             if not page:
                 state["warnings"].append({"code": "page_not_in_manifest", "message": image_stem})
+                continue
+            if page.get("image_name") in processed_drawing_pages:
                 continue
             image_path = self.project_path / "images" / page["image_name"]
             context = self.profile.detect_figure_context(page.get("page_text", ""))
@@ -749,6 +946,8 @@ class MetadataLinker:
                 "reviewer_revision": int(previous_figure.get("reviewer_revision", 0) or 0),
                 "warning_overrides": dict(previous_figure.get("warning_overrides", {})),
                 "scale_calibrations": dict(previous_figure.get("scale_calibrations", {})),
+                "review_overrides": dict(previous_figure.get(
+                    "review_overrides", {"cells": {}})),
                 "draft_saved_at": previous_figure.get("draft_saved_at", ""),
             })
             figure["drawing_pages"].append({
@@ -782,15 +981,29 @@ class MetadataLinker:
             save_linkage_state(self.project_path, {**state, "figures": list(figures.values())})
             if progress:
                 progress(index, len(drawing_pages), state["progress"]["message"])
+            if should_pause and should_pause():
+                state["status"] = "paused"
+                state["figures"] = list(figures.values())
+                state["progress"]["message"] = "Paused for priority work"
+                save_linkage_state(self.project_path, state)
+                return state
 
         # Extract candidate table pages once per figure after all continued drawing pages are grouped.
         total_work = len(drawing_pages) + len(figures)
         state["progress"] = {"current": len(drawing_pages), "total": total_work,
                              "message": "Starting table extraction"}
         for queued_figure in figures.values():
-            queued_figure["processing_status"] = "queued"
+            if not can_resume or queued_figure.get("processing_status") in {"processing", "queued"}:
+                queued_figure["processing_status"] = "queued"
         save_linkage_state(self.project_path, {**state, "figures": list(figures.values())})
         for figure_index, figure in enumerate(figures.values(), 1):
+            if (can_resume and figure.get("processing_status") not in
+                    {"processing", "queued"}):
+                continue
+            if can_resume and figure.get("processing_status") == "processing":
+                figure["table_pages"] = []
+                figure["table_rows"] = []
+                figure["extraction_warnings"] = []
             figure["processing_status"] = "processing"
             state["progress"] = {
                 "current": len(drawing_pages) + figure_index - 1,
@@ -823,8 +1036,13 @@ class MetadataLinker:
                     from PIL import Image
                     with Image.open(image_path) as image:
                         crop = (0, min(image.height, bottom + 20), image.width, image.height)
+                saved_page = next((item for item in previous_figures.get(
+                    figure["figure_id"], {}).get("table_pages", [])
+                    if item.get("image_name") == candidate["image_name"]), {})
                 table = self.extractor.extract_table(image_path, crop, figure["figure_id"], expected,
-                                                     {**candidate, **candidate_context}) or {}
+                                                     {**candidate, **candidate_context,
+                                                      "manual_column_edges": saved_page.get(
+                                                          "manual_column_edges")}) or {}
                 rows = table.get("rows", []) if table.get("is_table", bool(table.get("rows"))) else []
                 normalized_rows = []
                 for row in rows:
@@ -852,7 +1070,12 @@ class MetadataLinker:
                     }
                     if warning not in figure.setdefault("extraction_warnings", []):
                         figure["extraction_warnings"].append(warning)
-                accepted = bool(normalized_rows) and (table_figure == figure["figure_id"] or (not table_figure and overlap))
+                needs_columns = bool(table.get("needs_column_review"))
+                accepted = ((bool(normalized_rows) and
+                             (table_figure == figure["figure_id"] or
+                              (not table_figure and overlap))) or
+                            (needs_columns and
+                             (not table_figure or table_figure == figure["figure_id"])))
                 if accepted:
                     boundary = table.get("boundary") if isinstance(table.get("boundary"), dict) else {}
                     figure["table_pages"].append({
@@ -861,6 +1084,7 @@ class MetadataLinker:
                         "source_pdf": candidate.get("source_pdf", ""), "crop": list(crop) if crop else None,
                         "figure_caption": raw_table_caption or candidate.get("figure_caption", ""),
                         "boundary": boundary,
+                        "manual_column_edges": saved_page.get("manual_column_edges"),
                         "ocr_diagnostics": [
                             item for item in table.get("ocr_diagnostics", [])
                             if isinstance(item, dict)
@@ -956,6 +1180,12 @@ class MetadataLinker:
                 figure.setdefault("measurement_warnings", []).append({
                     "code": "measurement_failed", "message": str(exc),
                 })
+            unmatched_overrides = apply_reviewer_row_overrides(figure, self.profile)
+            for override_key in unmatched_overrides:
+                figure.setdefault("extraction_warnings", []).append({
+                    "code": "review_override_unmatched",
+                    "message": f"A saved table correction no longer matches an OCR row: {override_key}",
+                })
             validate_figure(figure, self.profile)
             figure["processing_status"] = (
                 "ready" if figure.get("status") == "ready" else "reviewable")
@@ -967,6 +1197,12 @@ class MetadataLinker:
             save_linkage_state(self.project_path, {**state, "figures": list(figures.values())})
             if progress:
                 progress(current, total_work, state["progress"]["message"])
+            if should_pause and should_pause():
+                state["figures"] = list(figures.values())
+                state["status"] = "paused"
+                state["progress"]["message"] = "Paused for priority work"
+                save_linkage_state(self.project_path, state)
+                return state
 
         state["figures"] = sorted(figures.values(), key=lambda f: natural_key(f["figure_id"]))
         state["status"] = "complete"

@@ -247,20 +247,49 @@ function setupImageModal() {
     const closeBtn = modal?.querySelector('.close-modal');
     
     if (!modal || !modalImg || !closeBtn) return;
+    const resetZoom = () => {
+        modalImg.classList.remove('zoomed');
+        modal.classList.remove('zoom-active');
+        modalImg.style.removeProperty('width');
+        modalImg.style.removeProperty('height');
+    };
     
     closeBtn.addEventListener('click', () => {
         modal.classList.remove('active');
+        resetZoom();
     });
     
     modal.addEventListener('click', (e) => {
         if (e.target === modal) {
             modal.classList.remove('active');
+            resetZoom();
         }
+    });
+    modalImg.addEventListener('click', event => {
+        event.stopPropagation();
+        if (modalImg.classList.contains('zoomed')) {
+            resetZoom();
+            modal.scrollTo(0, 0);
+            return;
+        }
+        const rect = modalImg.getBoundingClientRect();
+        const ratioX = (event.clientX - rect.left) / Math.max(1, rect.width);
+        const ratioY = (event.clientY - rect.top) / Math.max(1, rect.height);
+        modalImg.style.width = `${rect.width * 2}px`;
+        modalImg.style.height = `${rect.height * 2}px`;
+        modalImg.classList.add('zoomed');
+        modal.classList.add('zoom-active');
+        requestAnimationFrame(() => modal.scrollTo({
+            left: Math.max(0, ratioX * modalImg.offsetWidth - event.clientX),
+            top: Math.max(0, ratioY * modalImg.offsetHeight - event.clientY),
+            behavior: 'instant'
+        }));
     });
     
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && modal.classList.contains('active')) {
             modal.classList.remove('active');
+            resetZoom();
         }
     });
 }
@@ -271,6 +300,11 @@ function showImageModal(imageUrl) {
     
     if (modal && modalImg) {
         modalImg.src = imageUrl;
+        modalImg.classList.remove('zoomed');
+        modal.classList.remove('zoom-active');
+        modalImg.style.removeProperty('width');
+        modalImg.style.removeProperty('height');
+        modal.scrollTo(0, 0);
         modal.classList.add('active');
     }
 }

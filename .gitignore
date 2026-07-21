@@ -19,6 +19,9 @@ outputs/
 pdf2img_outputs/
 uploads/
 logs/
+!logs/
+logs/*
+!logs/*.md
 *.log
 
 # Downloaded model weights and caches
@@ -41,4 +44,3 @@ models_llm/
 Thumbs.db
 .vscode/
 .idea/
-
