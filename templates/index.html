@@ -522,7 +522,14 @@
                             <!-- Image List with Checkboxes -->
                             <div class="control-group"
                                 style="flex: 1; overflow: hidden; display: flex; flex-direction: column;">
-                                <h3>🖼️ Images (<span id="annotation-image-count">0</span>)</h3>
+                                <div class="annotation-list-heading">
+                                    <h3>🖼️ Images (<span id="annotation-image-count">0</span>)</h3>
+                                    <label class="annotation-vessels-filter"
+                                        title="Show only pages whose mask contains a vessel or which have a manually drawn vessel">
+                                        <input type="checkbox" id="annotation-vessels-only">
+                                        <span>Vessels only</span>
+                                    </label>
+                                </div>
                                 <div class="annotation-image-list" id="annotation-image-list">
                                     <!-- Empty state will be populated by JavaScript -->
                                 </div>

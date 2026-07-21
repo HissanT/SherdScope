@@ -768,6 +768,37 @@ body {
 }
 
 /* Annotation Image List */
+.annotation-list-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.annotation-list-heading h3 {
+    margin: 0;
+}
+
+.annotation-vessels-filter {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.annotation-vessels-filter input {
+    margin: 0;
+}
+
 .annotation-image-list {
     flex: 1;
     overflow-y: auto;

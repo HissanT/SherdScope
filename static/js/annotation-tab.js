@@ -25,6 +25,7 @@ const annotationState = {
     currentPolygon: [],      // in-progress polygon (ORIGINAL coords)
     mousePreview: null,      // {x, y} display coords for rubber-band line
     vesselsSummary: {},      // base -> count of drawn vessels
+    showVesselsOnly: false,  // restrict list and navigation to pages with vessels
     canvasZoom: 1,           // CSS zoom multiplier over the canvas buffer
     brushCursor: null,       // {x, y} buffer coords for brush/eraser size ring
     colorize: false,         // colour each separate mask differently
@@ -52,6 +53,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeExtractButton();
     initializeZoomControls();
     initializeScalePopup();
+    initializeVesselsOnlyFilter();
 
     window.addEventListener('projectChanged', handleProjectChanged);
     loadCurrentProject();
@@ -273,6 +275,42 @@ function resetAnnotationTab() {
     showEmptyState('No project selected', 'Select a project');
 }
 
+function imageHasVessels(img) {
+    return Boolean(img && (img.hasVesselMask || annotationState.vesselsSummary[img.baseName] > 0));
+}
+
+function getVisibleImageIndices() {
+    return annotationState.images
+        .map((img, index) => ({ img, index }))
+        .filter(({ img }) => !annotationState.showVesselsOnly || imageHasVessels(img))
+        .map(({ index }) => index);
+}
+
+function initializeVesselsOnlyFilter() {
+    const toggle = document.getElementById('annotation-vessels-only');
+    if (!toggle) return;
+    toggle.checked = annotationState.showVesselsOnly;
+    toggle.addEventListener('change', async () => {
+        annotationState.showVesselsOnly = toggle.checked;
+        const visibleIndices = getVisibleImageIndices();
+        renderImageList();
+
+        if (visibleIndices.length === 0) {
+            annotationState.currentIndex = -1;
+            showEmptyState('No vessel images', 'Turn off “Vessels only” to review every image.');
+            updateNavigationButtons();
+            return;
+        }
+
+        if (!visibleIndices.includes(annotationState.currentIndex)) {
+            await selectImage(visibleIndices[0]);
+        } else {
+            updateCurrentImageLabel();
+            updateNavigationButtons();
+        }
+    });
+}
+
 async function loadProjectImages() {
     if (!annotationState.currentProject) return;
     
@@ -297,6 +335,9 @@ async function loadProjectImages() {
         
         const imageUrls = imagesRes.images || [];
         const maskUrls = masksRes.success ? (masksRes.masks || []) : [];
+        const vesselMaskFiles = new Set(
+            masksRes.success ? (masksRes.masks_with_vessels || []) : []
+        );
         
         // Get excluded images from project settings
         const excludedImages = new Set();
@@ -329,14 +370,16 @@ async function loadProjectImages() {
                     maskUrl: maskMap[base] || null,
                     filename: filename,
                     baseName: base,
-                    hasMask: !!maskMap[base]
+                    hasMask: !!maskMap[base],
+                    hasVesselMask: vesselMaskFiles.has(`${base}_mask_layer.png`)
                 };
             });
         
         console.log('[Annotation] Loaded', annotationState.images.length, 'images (after filtering excluded)');
-        updateImageCount(annotationState.images.length);
         renderImageList();
-        if (annotationState.images.length > 0) selectImage(0);
+        const visibleIndices = getVisibleImageIndices();
+        if (visibleIndices.length > 0) selectImage(visibleIndices[0]);
+        else showEmptyState('No vessel images', 'Turn off “Vessels only” to review every image.');
         
     } catch (error) {
         hideLoading();
@@ -348,13 +391,17 @@ async function loadProjectImages() {
 function renderImageList() {
     const container = document.getElementById('annotation-image-list');
     if (!container) return;
-    
-    if (annotationState.images.length === 0) {
-        container.innerHTML = '<div class="empty-list">No images</div>';
+
+    const visibleIndices = getVisibleImageIndices();
+    updateImageCount(visibleIndices.length);
+
+    if (visibleIndices.length === 0) {
+        container.innerHTML = `<div class="empty-list">${annotationState.showVesselsOnly ? 'No vessel images' : 'No images'}</div>`;
         return;
     }
     
-    const html = annotationState.images.map((img, i) => {
+    const html = visibleIndices.map((i) => {
+        const img = annotationState.images[i];
         const icon = img.hasMask ? '✅' : '⚪';
         const active = i === annotationState.currentIndex ? 'active' : '';
         const vCount = annotationState.vesselsSummary[img.baseName];
@@ -371,9 +418,18 @@ function renderImageList() {
     }).join('');
     
     container.innerHTML = html;
-    container.querySelectorAll('.annotation-image-item').forEach((item, i) => {
-        item.addEventListener('click', () => selectImage(i));
+    container.querySelectorAll('.annotation-image-item').forEach((item) => {
+        item.addEventListener('click', () => selectImage(parseInt(item.dataset.index, 10)));
     });
+}
+
+function updateCurrentImageLabel() {
+    const img = annotationState.images[annotationState.currentIndex];
+    const label = document.getElementById('annotation-current-image');
+    if (!img || !label) return;
+    const visibleIndices = getVisibleImageIndices();
+    const visiblePosition = visibleIndices.indexOf(annotationState.currentIndex);
+    label.textContent = `${visiblePosition + 1}/${visibleIndices.length} - ${img.filename}`;
 }
 
 async function selectImage(index) {
@@ -386,12 +442,11 @@ async function selectImage(index) {
     annotationState.currentIndex = index;
     const img = annotationState.images[index];
     
-    document.querySelectorAll('.annotation-image-item').forEach((el, i) => {
-        el.classList.toggle('active', i === index);
+    document.querySelectorAll('.annotation-image-item').forEach((el) => {
+        el.classList.toggle('active', parseInt(el.dataset.index, 10) === index);
     });
     
-    const label = document.getElementById('annotation-current-image');
-    if (label) label.textContent = `${index + 1}/${annotationState.images.length} - ${img.filename}`;
+    updateCurrentImageLabel();
     
     try {
         // Load original image
@@ -478,17 +533,21 @@ function loadImage(url) {
 }
 
 function navigateImage(dir) {
-    const newIndex = annotationState.currentIndex + dir;
-    if (newIndex >= 0 && newIndex < annotationState.images.length) {
-        selectImage(newIndex);
+    const visibleIndices = getVisibleImageIndices();
+    const position = visibleIndices.indexOf(annotationState.currentIndex);
+    const newPosition = position + dir;
+    if (newPosition >= 0 && newPosition < visibleIndices.length) {
+        selectImage(visibleIndices[newPosition]);
     }
 }
 
 function updateNavigationButtons() {
     const prev = document.getElementById('annotation-prev-btn');
     const next = document.getElementById('annotation-next-btn');
-    if (prev) prev.disabled = annotationState.currentIndex <= 0;
-    if (next) next.disabled = annotationState.currentIndex >= annotationState.images.length - 1;
+    const visibleIndices = getVisibleImageIndices();
+    const position = visibleIndices.indexOf(annotationState.currentIndex);
+    if (prev) prev.disabled = position <= 0;
+    if (next) next.disabled = position < 0 || position >= visibleIndices.length - 1;
 }
 
 function redrawCanvas() {
@@ -1231,6 +1290,16 @@ async function saveMask() {
         if (result.success) {
             annotationState.isModified = false;
             img.hasMask = true;
+            const pixels = annotationState.maskCtx.getImageData(
+                0, 0, annotationState.maskCanvas.width, annotationState.maskCanvas.height
+            ).data;
+            img.hasVesselMask = false;
+            for (let i = 0; i < pixels.length; i += 4) {
+                if (pixels[i] || pixels[i + 1] || pixels[i + 2] || pixels[i + 3]) {
+                    img.hasVesselMask = true;
+                    break;
+                }
+            }
             // Update maskUrl so it can be reloaded
             img.maskUrl = result.mask_url || `/api/projects/${projectId}/mask/${img.baseName}_mask_layer.png`;
             renderImageList();
