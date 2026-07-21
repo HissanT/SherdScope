@@ -80,7 +80,7 @@ _json = json
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SHERDSCOPE_SECRET_KEY') or secrets.token_hex(32)
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 800 * 1024 * 1024  # 800 MiB maximum request size
 app.config['UPLOAD_FOLDER'] = Path('temp_uploads')
 app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 
