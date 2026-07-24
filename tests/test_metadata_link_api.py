@@ -7,6 +7,7 @@ import zipfile
 
 import pandas as pd
 import pytest
+from PIL import Image
 
 pytest.importorskip("ultralytics")
 pytest.importorskip("fitz")
@@ -19,6 +20,40 @@ from catalog.linkage import (
 )
 from services.projects import ProjectManager
 from catalog.export import EXPORT_COLUMNS
+
+
+def test_vessel_box_review_api_adds_boxes_without_allowing_id_rebinding(
+        tmp_path, monkeypatch):
+    manager = ProjectManager(tmp_path / "projects")
+    project = manager.create_project("Box API Test")
+    project_id = project["project_id"]
+    image_path = manager.get_project_path(project_id, "images") / "page.png"
+    Image.new("RGB", (320, 240), "white").save(image_path)
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    client = app_module.app.test_client()
+
+    initial = client.get(f"/api/projects/{project_id}/vessel-boxes/page")
+    assert initial.status_code == 200
+    assert initial.get_json()["detections"] == []
+    created = client.put(f"/api/projects/{project_id}/vessel-boxes/page", json={
+        "detections": [{"reviewed_bbox": [20, 30, 120, 180], "approved": True}],
+    })
+    assert created.status_code == 200
+    item = created.get_json()["detections"][0]
+    assert item["vessel_id"] == "page_mask_layer_0"
+    assert item["approved"] is True
+
+    mismatch = client.put(f"/api/projects/{project_id}/vessel-boxes/page", json={
+        "detections": [{
+            **item, "vessel_id": "page_mask_layer_999",
+            "reviewed_bbox": [25, 35, 125, 185],
+        }],
+    })
+    assert mismatch.status_code == 200
+    saved = mismatch.get_json()["detections"][0]
+    assert saved["detection_id"] == item["detection_id"]
+    assert saved["vessel_id"] == "page_mask_layer_0"
+    assert saved["reviewed_bbox"] == [25, 35, 125, 185]
 
 
 def test_state_edit_and_apply_endpoints(tmp_path, monkeypatch):
@@ -83,6 +118,48 @@ def test_state_edit_and_apply_endpoints(tmp_path, monkeypatch):
     assert result.loc[0, "Notes"] == "keep me"
     assert result.loc[0, "Type"] == "Pithos"
     assert result.loc[0, "Link Status"] == "approved"
+
+
+def test_state_summary_deduplicates_repeated_stable_figure_keys(
+        tmp_path, monkeypatch):
+    manager = ProjectManager(tmp_path / "projects")
+    project = manager.create_project("Duplicate Summary Test")
+    project_id = project["project_id"]
+    project_path = manager.get_project_path(project_id)
+    figure = {
+        "figure_id": "3.86",
+        "figure_key": "stable-386",
+        "figure_caption": "Figure 3.86",
+        "drawing_pages": [],
+        "table_pages": [],
+        "drawings": [],
+        "table_rows": [],
+        "warnings": [],
+        "review_status": "pending",
+        "processing_status": "reviewable",
+    }
+    save_linkage_state(project_path, {
+        "schema_version": 2,
+        "profile": "hesban11",
+        "status": "complete",
+        "progress": {},
+        "figures": [dict(figure), dict(figure)],
+        "warnings": [],
+    })
+    monkeypatch.setattr(app_module, "project_manager", manager)
+    monkeypatch.setattr(app_module, "get_local_ocr_health", lambda **_: {
+        "available": True, "message": "Ready", "error": "",
+        "models_initialized": True,
+    })
+
+    response = app_module.app.test_client().get(
+        f"/api/projects/{project_id}/metadata-link/state")
+
+    assert response.status_code == 200
+    figures = response.get_json()["state"]["figures"]
+    assert [(item["figure_id"], item["figure_key"]) for item in figures] == [
+        ("3.86", "stable-386")
+    ]
 
 
 def _make_api_project(tmp_path, name="API Extra"):
@@ -332,6 +409,35 @@ def test_clean_export_preview_selection_csv_and_zip(tmp_path, monkeypatch):
         zipped_csv = archive.read("metadata.csv")
     assert zipped_csv == csv_response.data
 
+    streamed = client.get(
+        f"/api/projects/{project_id}/export/dataset?acronym=HES")
+    assert streamed.status_code == 200
+    assert streamed.content_type == "application/zip"
+    assert streamed.data.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(streamed.data)) as archive:
+        assert archive.read("metadata.csv") == csv_response.data
+
+    prepared = client.post(
+        f"/api/projects/{project_id}/export/dataset/prepare",
+        json={"acronym": "HES"},
+    )
+    assert prepared.status_code == 200
+    prepared_payload = prepared.get_json()
+    assert prepared_payload["size"] > 0
+    prepared_download = client.get(prepared_payload["download_url"])
+    assert prepared_download.status_code == 200
+    assert prepared_download.content_type == "application/zip"
+    assert int(prepared_download.headers["Content-Length"]) == len(
+        prepared_download.data)
+    assert prepared_download.headers["Cache-Control"] == "no-store"
+    with zipfile.ZipFile(io.BytesIO(prepared_download.data)) as archive:
+        assert archive.testzip() is None
+        assert archive.read("metadata.csv") == csv_response.data
+    transfer = client.get(prepared_payload["transfer_url"])
+    assert transfer.status_code == 200
+    assert transfer.data == prepared_download.data
+    assert "Content-Disposition" not in transfer.headers
+
 
 def test_export_setting_edit_preserves_hidden_legacy_exclusions(tmp_path, monkeypatch):
     manager, project_id, project_path = _make_api_project(tmp_path, "Legacy Export")
@@ -448,6 +554,11 @@ def test_per_figure_rerun_updates_rows_boundaries_and_evidence(tmp_path, monkeyp
         f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg?figure=2.1&kind=table&overlay=1")
     assert evidence.status_code == 200
     assert evidence.mimetype == "image/png"
+    mandatory_grid = client.get(
+        f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg"
+        "?figure=2.1&kind=table&overlay=0")
+    assert mandatory_grid.status_code == 200
+    assert mandatory_grid.data == evidence.data
     diagnostic = client.get(
         f"/api/projects/{project_id}/metadata-link/evidence/page_1.jpg"
         "?figure=2.1&kind=table&ocr_row=1&ocr_field=nonplastics_type")
@@ -682,6 +793,69 @@ def test_row_operations_and_safe_warning_override_are_audited_in_csv(
     csv = pd.read_csv(project_path / "cards" / "mask_info.csv",
                       dtype=str, keep_default_na=False)
     assert csv.loc[0, "Link Status"] == "approved_with_overrides"
+
+
+def test_warning_autosave_preserves_table_grid_and_manual_columns(
+        tmp_path, monkeypatch):
+    manager, project_id, project_path = _make_api_project(
+        tmp_path, "Warning Grid Preservation")
+    (project_path / "page_manifest.json").write_text(json.dumps({
+        "schema_version": 1, "profile": "hesban11", "pages": [{
+            "image_name": "page_1.jpg", "source_pdf": "hesban.pdf",
+            "logical_index": 1, "printed_page": "20",
+        }],
+    }), encoding="utf-8")
+    boundary = {
+        "table_bounds": [100, 120, 900, 760],
+        "column_bounds": [[100, 140], [140, 220]],
+        "row_bounds": [{"row": "1", "top": 180, "bottom": 260}],
+        "normalized_column_edges": [index / 22 for index in range(23)],
+        "column_source": "manual",
+    }
+    manual_edges = [index / 22 for index in range(23)]
+    figure = {
+        "figure_id": "2.1", "processing_status": "reviewable",
+        "drawing_pages": [{"printed_page": "19", "source_pdf": "hesban.pdf"}],
+        "table_pages": [{
+            "image_name": "page_1.jpg", "source_pdf": "hesban.pdf",
+            "logical_index": 1, "printed_page": "20", "crop": None,
+            "boundary": boundary, "manual_column_edges": manual_edges,
+            "diagnostics_ref": "metadata_link_diagnostics/example.json",
+        }],
+        "drawings": [{"mask_file": "card_0", "fingerprint": "x",
+                      "vessel_number": "1"}],
+        "table_rows": [{"table_no": "1", "table_type": "Pithos"}],
+        "extraction_warnings": [{
+            "code": "column_header_fallback", "message": "Fallback columns",
+        }],
+    }
+    validate_figure(figure, Hesban11Profile())
+    warning_id = next(warning["id"] for warning in figure["warnings"]
+                      if warning["code"] == "column_header_fallback")
+    save_linkage_state(project_path, {
+        "profile": "hesban11", "status": "complete", "figures": [figure],
+    })
+    monkeypatch.setattr(app_module, "project_manager", manager)
+
+    response = app_module.app.test_client().patch(
+        f"/api/projects/{project_id}/metadata-link/figures/{figure['figure_key']}",
+        json={
+            "reviewer_revision": 0,
+            # This mirrors the browser autosave payload that exposed the bug.
+            "table_pages": [{"image_name": "page_1.jpg"}],
+            "warning_overrides": {warning_id: {
+                "reason": "column_alignment_verified",
+            }},
+        },
+    )
+
+    assert response.status_code == 200
+    saved_page = response.get_json()["figure"]["table_pages"][0]
+    assert saved_page["boundary"] == boundary
+    assert saved_page["manual_column_edges"] == manual_edges
+    assert saved_page["diagnostics_ref"] == "metadata_link_diagnostics/example.json"
+    assert app_module.linkage_job_coordinator.snapshot(
+        project_id, project_path, ensure_worker=False)["queued"] == []
 
 
 def test_override_timestamp_is_server_owned_and_stable_across_autosaves(

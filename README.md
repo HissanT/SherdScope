@@ -22,8 +22,12 @@ The Hesban catalogue-digitization MVP is operational and under active
 real-corpus validation. The current workflow can:
 
 - render publication PDFs at configurable high resolution;
-- segment vessel drawings using the PyPotteryLens detection models;
-- preserve each card's source page, bounding box, and stable internal identity;
+- preserve every PyPotteryLens/YOLO detection as a separate vessel, including
+  its box, confidence, stable identity, and optional instance-mask evidence;
+- review vessel boxes directly by adding, deleting, moving, resizing, and
+  approving them without allowing nearby or overlapping detections to merge;
+- create original-resolution rectangular vessel crops with a configurable
+  margin, without using a mask to remove page pixels;
 - recognize printed figure and vessel numbers with local PaddleOCR;
 - locate all 22 configured Hesban headings, exact column boundaries, rows,
   continuation pages, and closing rules using deterministic image processing;
@@ -38,8 +42,13 @@ real-corpus validation. The current workflow can:
   Non-Plastics Type column;
 - queue interactive rereads ahead of bulk extraction, checkpoint the bulk run,
   and resume it automatically after the priority work finishes;
+- recombine multi-page table rows in natural printed-number order after full or
+  targeted rereads, including when an older saved project is loaded;
 - approve figures individually and withhold ambiguous joins;
-- export a clean 25-column research CSV or a complete dataset ZIP.
+- preserve the publication grid and reviewer warning decisions through ordinary
+  saves without unnecessarily rerunning OCR; and
+- export a clean 25-column research CSV or a complete dataset ZIP with visible
+  preparation and byte-transfer progress.
 
 PaddleOCR and OpenCV run locally. Generative AI and paid API calls are not
 required for the normal Hesban workflow.
@@ -112,8 +121,22 @@ original PyPotteryLens Hugging Face repository on first use.
 2. Upload the publication PDF.
 3. Render the PDF pages.
 4. Run vessel detection.
-5. Review the detected masks and correct them when necessary.
-6. Extract the drawing cards.
+5. Review the vessel boxes. Add missed vessels, delete false detections, drag or
+   resize boxes, and approve the vessels that are ready.
+6. Optionally show or edit the mask as supporting evidence. It does not control
+   the vessel identity and is never used to erase crop pixels.
+7. Choose the crop margin and extract the approved rectangular crops.
+
+Each model detection has an immutable internal `detection_id`. The familiar
+`page_mask_layer_N` name remains its stable `vessel_id`, so existing linkage,
+researcher corrections, card metadata, and export selections continue to use
+the same public identity. Rerunning the model matches detections back to these
+records; reviewed, deleted, and unmatched records are retained rather than
+silently renumbered.
+
+This stage only prepares clean bounding-box crops for later diagnostic-profile
+research. Diagnostic-blob separation and profile matching are not implemented
+here.
 
 SherdScope records PDF-page order in `page_manifest.json`, including split-page
 information where applicable.
@@ -139,11 +162,19 @@ For the selected figure:
 - correct any unresolved or incorrect vessel number;
 - inspect the detected scale or rim diameter only when it needs attention;
 - edit table cells, add or delete rows, and undo deletions;
+- review or ignore an individual warning with a saved reason and optional note;
 - select **Adjust columns** when a page is marked for column review, drag any of
   the 23 lines (or use the arrow keys), then choose **Save and re-read**;
 - use the group shortcuts to move between Identity, Fabric, Non-Plastics,
   Voids, Surface, and Finish;
 - approve the figure when the readiness checklist confirms a unique join.
+
+Ordinary review saves never require OCR. Changing a vessel number, editing a
+cell, reviewing a warning, verifying a measurement, or approving a figure keeps
+the saved row and column grid. A reread is required only when extraction
+evidence itself must be rebuilt, such as after changing table-page assignment,
+saving or resetting manual column boundaries, explicitly requesting a reread,
+or loading a page produced by an older extractor version.
 
 For Hesban 11, the default table search window is the drawing page through the
 next two logical pages. Less common actions, including assigning another page
@@ -200,6 +231,12 @@ corresponding heading; the detected table-rule endpoint supplies the final edge.
 Saved manual edges take precedence on every later reread. Internal projects keep
 the stable `table_square` key, while exports call the field `Sq/Area`.
 
+Column widths are intentionally not equal. Each internal edge is placed just
+before the next printed heading, so compact code fields such as Surface
+Treatment `Int` can be narrower than adjacent colour-description fields. The
+publication's heading positions determine that geometry; the width of the
+heading word itself does not.
+
 ### 4. Export the research dataset
 
 Open **Export** after approving the figures you want to use.
@@ -208,6 +245,13 @@ Open **Export** after approving the figures you want to use.
 - Include or exclude individual masks.
 - Select **Download CSV** for metadata only.
 - Select **Download Dataset ZIP** for metadata plus images and documentation.
+
+Dataset ZIP export is deliberately two-stage. SherdScope first creates a
+complete archive atomically inside the project, then transfers that finished
+file with a visible 0--100 percent byte progress bar. The browser save begins
+only after the received byte count matches the prepared archive. This avoids
+zero-byte, interrupted, or unavailable-file downloads when a large project is
+being reviewed in Chrome.
 
 The ZIP contains:
 
@@ -269,22 +313,35 @@ projects/<project-id>/
 |-- pdf_source/
 |-- images/
 |-- masks/
+|   |-- <page>_vessel_boxes.json
+|   |-- <page>_mask_layer.png
+|   `-- .instances/<page>/<detection-id>.png
 |-- cards/
 |   |-- mask_info.csv
 |   |-- mask_info_annots.csv
+|   |-- vessel_crops.json
 |   |-- metadata_linkage.json
 |   |-- metadata_jobs.json
 |   `-- metadata_diagnostics/<figure>/<page>.json
 |-- export_settings.json
 `-- exports/
+    `-- prepared/
 ```
 
-The internal `mask_info.csv` remains backward compatible. Approved linkage,
+The per-page vessel-box sidecar is authoritative. The combined mask and hidden
+instance masks are optional evidence. `vessel_crops.json` records every
+approved crop's original page box, margin-expanded crop box, confidence,
+identity, and evidence provenance. The internal `mask_info.csv` remains
+backward compatible. Approved linkage,
 measurement evidence, reviewer edits, and warnings are staged in
 `metadata_linkage.json`; large per-cell evidence lives in page sidecars, and the
 resumable queue lives in `metadata_jobs.json`. Schema-v1 linkage files are
 migrated atomically with one recovery backup. The clean public schema is
 generated only at export.
+
+Prepared ZIPs are temporary recoverable export artifacts. They do not alter
+reviewed boxes, linkage, measurements, approvals, or corrections. Archives
+older than 24 hours are eligible for cleanup during a later export.
 
 ## Validation
 
@@ -297,16 +354,26 @@ pytest -q
 
 At the current milestone:
 
-- the complete Python test suite passes;
+- the complete Python test suite passes all 131 tests;
 - JavaScript syntax checks pass for the main, Review & Link, and Export scripts;
 - Python compilation and Git diff validation pass;
+- the current extractor finds all 22 required anchors on all 13 table pages in
+  the supplied Split-3 diagnostic corpus;
+- nine of ten table pages in the supplied Split-4 diagnostic corpus find all
+  22 anchors, while the remaining page safely requests manual adjustment
+  because OCR does not provide its required `Sq` heading; and
 - a local PP-OCRv5 acceptance check read all 19 Non-Plastics Type values in
   Hesban Figure 2.1 across its two table pages.
 
 The automated suite covers manifests, table geometry, OCR parsing and retries,
-figure normalization, unique joins, autosave revisions, measurements, warning
-handling, approval, CSV persistence, per-figure rereads, and dataset export.
-Real-corpus results still require researcher review.
+figure normalization, unique joins, autosave revisions, reviewer overrides,
+manual boundaries, priority/preemption and restart recovery, natural row
+ordering, measurements, warning handling, approval, lazy diagnostics, CSV
+persistence, per-figure rereads, separate and overlapping vessel detections,
+box editing and crop geometry, table-grid persistence, prepared ZIP transfer,
+and dataset export. The Split-3 and Split-4
+checks are development diagnostics rather than an independent accuracy
+evaluation; real-corpus results still require researcher review.
 
 ## Repository structure
 

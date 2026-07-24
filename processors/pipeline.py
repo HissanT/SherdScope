@@ -35,6 +35,15 @@ from catalog.sidecars import (
     read_scale_sidecar,
     read_vessels_sidecar,
 )
+from catalog.vessels import (
+    BOX_SIDECAR_SUFFIX,
+    create_approved_crops,
+    migrate_legacy_review,
+    read_vessel_boxes,
+    reconcile_yolo_detections,
+    write_crop_manifest,
+    write_vessel_boxes,
+)
 
 
 
@@ -212,8 +221,48 @@ class ModelProcessor:
                 device=self.config.device
             )[0]
             
-            if len(results) > 0:
-                pred_masks = results.masks.data.cpu().numpy()
+            boxes = results.boxes.xyxy.cpu().numpy() if results.boxes is not None else np.empty((0, 4))
+            confidences = results.boxes.conf.cpu().numpy() if results.boxes is not None else np.empty((0,))
+            pred_masks = (
+                results.masks.data.cpu().numpy()
+                if results.masks is not None else np.empty((0, img.height, img.width))
+            )
+            detections = [
+                {
+                    "bbox": box.tolist(),
+                    "confidence": float(confidences[index]),
+                    "mask_provenance": {
+                        "kind": "yolo_instance",
+                        "result_index": index,
+                        "model_mask_available": index < len(pred_masks),
+                    },
+                }
+                for index, box in enumerate(boxes)
+            ]
+            document = reconcile_yolo_detections(
+                output_folder, Path(image_file).stem, [img.width, img.height], detections)
+
+            # Keep each optional instance mask as evidence tied to the immutable
+            # detection ID.  It is not used to create the downstream crop.
+            instance_dir = output_folder / ".instances" / Path(image_file).stem
+            if len(pred_masks):
+                instance_dir.mkdir(parents=True, exist_ok=True)
+            for index, item in enumerate(document["detections"][:len(detections)]):
+                if index >= len(pred_masks):
+                    continue
+                mask = Image.fromarray((pred_masks[index] > 0.5).astype(np.uint8) * 255, mode="L")
+                if mask.size != img.size:
+                    mask = mask.resize(img.size, Image.Resampling.NEAREST)
+                evidence_path = instance_dir / f"{item['detection_id']}.png"
+                mask.save(evidence_path)
+                item["mask_provenance"] = {
+                    **(item.get("mask_provenance") or {}),
+                    "file": evidence_path.relative_to(output_folder).as_posix(),
+                    "source_image_size": [img.width, img.height],
+                }
+            write_vessel_boxes(output_folder, Path(image_file).stem, document)
+
+            if len(pred_masks) > 0:
                 save_mask(
                     img,
                     pred_masks,
@@ -394,9 +443,6 @@ class MaskExtractor:
         fields are retained only when the card bounding box is unchanged; changed
         geometry invalidates the staged/approved link for human review.
         """
-        if not metadata:
-            return
-
         info_path = output_folder / "mask_info.csv"
         annots_path = output_folder / "mask_info_annots.csv"
         old_info = None
@@ -450,7 +496,6 @@ class MaskExtractor:
             
             metadata = []
             annotations = []
-
             # Get list of files to process
             mask_files = os.listdir(mask_folder)
             total_files = len(mask_files)
@@ -502,8 +547,9 @@ class MaskExtractor:
             traceback.print_exc()
             return f"Error extracting masks: {str(e)}"
 
-    def extract_masks_from_project(self, masks_path: str, cards_path: str) -> str:
-        """Extract cards from masks in a project"""
+    def extract_masks_from_project(self, masks_path: str, cards_path: str,
+                                   crop_margin_pixels: int | None = None) -> str:
+        """Extract authoritative rectangular crops from reviewed vessel boxes."""
         try:
             masks_path = Path(masks_path)
             cards_path = Path(cards_path)
@@ -514,107 +560,101 @@ class MaskExtractor:
             # Create cards folder
             os.makedirs(cards_path, exist_ok=True)
             
-            # Get all mask files
-            mask_files = [f.name for f in masks_path.iterdir() 
-                         if f.name.endswith('_mask_layer.png')]
-            
-            if not mask_files:
-                return "No mask files found. Apply a model first."
+            bases = {
+                f.name.replace("_mask_layer.png", "")
+                for f in masks_path.iterdir() if f.name.endswith("_mask_layer.png")
+            }
+            bases.update(
+                f.name[:-len(BOX_SIDECAR_SUFFIX)]
+                for f in masks_path.iterdir() if f.name.endswith(BOX_SIDECAR_SUFFIX)
+            )
+            if not bases:
+                return "No vessel detections found. Apply a model first."
             
             metadata = []
             annotations = []
+            previous_crop_ids = set()
+            previous_info = cards_path / "mask_info.csv"
+            if previous_info.exists():
+                try:
+                    previous = pd.read_csv(previous_info, dtype=str, keep_default_na=False)
+                    if "mask_file" in previous.columns:
+                        previous_crop_ids = {mask_stem(value) for value in previous["mask_file"]}
+                except Exception as exc:
+                    print(f"Warning: could not inspect previous generated crops: {exc}")
             px_per_cm_map = {}  # mask_file_stem → px_per_cm ratio
 
-            total_files = len(mask_files)
+            crop_manifest = []
+            margin = self.config.crop_margin_pixels if crop_margin_pixels is None else max(
+                0, int(crop_margin_pixels))
+            total_files = len(bases)
             
             # Process each mask file
-            for idx, file in enumerate(mask_files, 1):
-                print(f"Processing mask {idx}/{total_files}: {file}")
-                
-                base_filename = file.replace("_mask_layer.png", "")
-                
-                # Load mask
-                mask_array = np.array(Image.open(masks_path / file))
+            for idx, base_filename in enumerate(sorted(bases), 1):
+                print(f"Processing vessel boxes {idx}/{total_files}: {base_filename}")
                 
                 # Try to find corresponding original image
                 # Look for image in parent's images folder
-                orig_image_path = masks_path.parent / 'images' / f"{base_filename}.jpg"
-                if not orig_image_path.exists():
-                    orig_image_path = masks_path.parent / 'images' / f"{base_filename}.png"
+                images_dir = masks_path.parent / "images"
+                orig_image_path = next((
+                    images_dir / f"{base_filename}{suffix}"
+                    for suffix in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
+                    if (images_dir / f"{base_filename}{suffix}").exists()
+                ), None)
                 
-                if not orig_image_path.exists():
+                if orig_image_path is None:
                     print(f"Warning: Original image not found for {base_filename}")
                     continue
-                
-                orig_array = np.array(Image.open(orig_image_path))
-                
-                # Process mask and get labeled regions
-                label_image = self._process_mask(mask_array)
-                # Pixel area only (mask_array.size counts the 4 RGBA channels,
-                # which inflated the min-area cutoff 4x and dropped small vessels)
-                total_area = mask_array.shape[0] * mask_array.shape[1]
-                
-                # Manually drawn inner vessels and scale calibration for this image
+                with Image.open(orig_image_path) as source_image:
+                    image_size = [source_image.width, source_image.height]
                 drawn_polygons = read_vessels_sidecar(masks_path, base_filename)
                 scales = read_scale_sidecar(masks_path, base_filename)
-
-                # Process each region
-                next_index = 0
-                for i, region in enumerate(regionprops(label_image)):
-                    next_index = i + 1
-                    result = self._extract_region(region, mask_array, orig_array, total_area)
-                    if result is None:
-                        continue
-
-                    cropped, bbox = result
-                    # When a larger vessel contains a hand-drawn inner vessel,
-                    # erase the inner vessel from the larger card (fill white) so
-                    # the two pieces are not duplicated in the big card.
-                    # (region.bbox is in mask coords; valid only when mask and
-                    # original share resolution, which is the normal case.)
-                    if mask_array.shape[:2] == orig_array.shape[:2]:
-                        cropped = _whiteout_inner_polygons(cropped, bbox, region, drawn_polygons)
-                    mask_stem = f"{base_filename}_mask_layer_{i}"
-                    output_filename = f"{mask_stem}.png"
-
-                    # Save cropped image with padding
-                    cropped = np.pad(cropped, ((50, 50), (50, 50), (0, 0)), mode='constant', constant_values=255)
-                    Image.fromarray(cropped).save(cards_path / output_filename)
-
-                    # Store metadata + scale ratio
-                    metadata.append((base_filename, mask_stem))
-                    annotations.append((bbox, output_filename))
+                document = read_vessel_boxes(masks_path, base_filename)
+                if document is None:
+                    # Compatibility only: old projects have one merged page mask
+                    # and no per-detection sidecar. New model runs never use this.
+                    fallback_boxes = []
+                    mask_path = masks_path / f"{base_filename}_mask_layer.png"
+                    if mask_path.exists():
+                        mask_array = np.array(Image.open(mask_path))
+                        labels = self._process_mask(mask_array)
+                        scale_x = image_size[0] / mask_array.shape[1]
+                        scale_y = image_size[1] / mask_array.shape[0]
+                        for region in regionprops(labels):
+                            if region.area < mask_array.shape[0] * mask_array.shape[1] * self.config.min_area_ratio:
+                                continue
+                            min_y, min_x, max_y, max_x = region.bbox
+                            fallback_boxes.append([
+                                round(min_x * scale_x), round(min_y * scale_y),
+                                round(max_x * scale_x), round(max_y * scale_y),
+                            ])
+                    document = migrate_legacy_review(
+                        masks_path, cards_path, base_filename, image_size,
+                        polygons=drawn_polygons, fallback_boxes=fallback_boxes)
+                entries = create_approved_crops(orig_image_path, cards_path, document, margin)
+                crop_manifest.extend(entries)
+                for entry in entries:
+                    vessel_id = entry["vessel_id"]
+                    bbox = entry["page_bbox"]
+                    metadata.append((base_filename, vessel_id))
+                    annotations.append((bbox, entry["crop_file"]))
                     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
                     ratio = assign_px_per_cm(scales, (cx, cy))
                     if ratio is not None:
-                        px_per_cm_map[mask_stem] = ratio
-
-                # Extract manually drawn vessels (e.g. vessels drawn inside other
-                # vessels). Connected-component labelling cannot separate these,
-                # so each operator-drawn polygon is cropped on its own.
-                for polygon in drawn_polygons:
-                    result = extract_polygon_vessel(orig_array, polygon)
-                    if result is None:
-                        continue
-                    cropped, bbox = result
-                    mask_stem = f"{base_filename}_mask_layer_{next_index}"
-                    output_filename = f"{mask_stem}.png"
-                    cropped = np.pad(cropped, ((50, 50), (50, 50), (0, 0)), mode='constant', constant_values=255)
-                    Image.fromarray(cropped).save(cards_path / output_filename)
-                    metadata.append((base_filename, mask_stem))
-                    annotations.append((bbox, output_filename))
-                    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                    ratio = assign_px_per_cm(scales, (cx, cy))
-                    if ratio is not None:
-                        px_per_cm_map[mask_stem] = ratio
-                    next_index += 1
+                        px_per_cm_map[vessel_id] = ratio
 
             # Save metadata
             self._save_metadata(metadata, annotations, cards_path, px_per_cm_map)
+            write_crop_manifest(cards_path, crop_manifest, margin)
+            current_crop_ids = {mask_stem(item[1]) for item in metadata}
+            for obsolete_id in previous_crop_ids - current_crop_ids:
+                obsolete = cards_path / f"{Path(obsolete_id).name}.png"
+                if obsolete.parent == cards_path and obsolete.exists():
+                    obsolete.unlink()
 
             if metadata:
-                return f"Successfully extracted {len(metadata)} cards from project masks"
-            return "No cards were extracted. Check if masks are properly drawn."
+                return f"Successfully extracted {len(metadata)} approved vessel crops"
+            return "No approved vessel boxes are ready to extract."
 
         except Exception as e:
             print(f"Error in mask extraction: {str(e)}")

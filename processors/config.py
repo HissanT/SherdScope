@@ -43,6 +43,7 @@ class MaskExtractionConfig:
     closing_kernel_size: int = 3
     output_suffix: str = "_card"
     mask_suffix: str = "_mask"
+    crop_margin_pixels: int = 24
 
 
 @dataclass

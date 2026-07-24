@@ -16,6 +16,7 @@ import threading
 import shutil
 import tempfile
 import secrets
+from PIL import Image
 
 from processors import (
     AnnotationConfig,
@@ -43,11 +44,18 @@ from catalog.sidecars import (
     write_scale_sidecar,
     write_vessels_sidecar,
 )
+from catalog.vessels import (
+    BOX_SIDECAR_SUFFIX,
+    VesselBoxError,
+    apply_box_review,
+    legacy_mask_component_boxes,
+    migrate_legacy_review,
+    read_vessel_boxes,
+)
 
 from services.projects import ProjectManager
 from catalog.linkage import (
     HESBAN_TABLE_COLUMNS,
-    WARNING_OVERRIDE_REASONS,
     Hesban11Profile,
     MetadataLinkError,
     ReviewerRevisionConflict,
@@ -66,6 +74,7 @@ from catalog.linkage import (
     record_pdf_pages,
     save_linkage_state,
     validate_figure,
+    warning_override_reasons,
 )
 from catalog.profiles import hesban_profile_payload
 from processors.ocr import (
@@ -898,12 +907,20 @@ def extract_project_masks(project_id):
         if not masks_path or not masks_path.exists():
             return jsonify({'error': 'Project masks folder not found', 'success': False}), 404
         
-        # Count mask files for progress
-        mask_files = [f for f in masks_path.iterdir() if f.name.endswith('_mask_layer.png')]
-        total_masks = len(mask_files)
+        data = request.get_json(silent=True) or {}
+        crop_margin = data.get('crop_margin_pixels')
+        candidate_bases = {
+            f.name.replace('_mask_layer.png', '')
+            for f in masks_path.iterdir() if f.name.endswith('_mask_layer.png')
+        }
+        candidate_bases.update(
+            f.name[:-len(BOX_SIDECAR_SUFFIX)]
+            for f in masks_path.iterdir() if f.name.endswith(BOX_SIDECAR_SUFFIX)
+        )
+        total_masks = len(candidate_bases)
         
         if total_masks == 0:
-            return jsonify({'error': 'No mask files found. Apply a model first.', 'success': False}), 404
+            return jsonify({'error': 'No vessel detections found. Apply a model first.', 'success': False}), 404
         
         # Initialize progress
         update_operation_progress('extract_masks', 0, total_masks, 'Starting extraction...')
@@ -915,14 +932,12 @@ def extract_project_masks(project_id):
         
         def progress_print(*args, **kwargs):
             msg = ' '.join(str(arg) for arg in args)
-            # Look for progress pattern "Processing mask X/Y"
-            if 'Processing mask' in msg:
+            match = re.search(r'Processing vessel boxes (\d+)/(\d+)', msg)
+            if match:
                 try:
-                    parts = msg.split()
-                    idx = parts.index('mask') + 1
-                    current = int(parts[idx].split('/')[0])
+                    current = int(match.group(1))
                     update_operation_progress('extract_masks', current, total_masks, 
-                                             f'Extracting mask {current}/{total_masks}')
+                                             f'Extracting approved crops {current}/{total_masks}')
                 except Exception:
                     pass
             original_print(*args, **kwargs)
@@ -933,7 +948,7 @@ def extract_project_masks(project_id):
             # Extract masks using project paths
             result = mask_extractor.extract_masks_from_project(
                 str(masks_path),
-                str(cards_path)
+                str(cards_path), crop_margin_pixels=crop_margin
             )
         finally:
             builtins.print = original_print
@@ -998,11 +1013,72 @@ def save_project_mask(project_id):
 
 
 # ============================================================================
-# MANUALLY DRAWN VESSELS (LabelMe-style polygons)
-# During review the operator draws polygons around vessels the model missed
-# (e.g. a vessel drawn inside another). Each polygon becomes its own card on
-# extraction. Polygons are stored as a JSON sidecar next to the mask.
+# REVIEWED VESSEL BOXES
+# Boxes are authoritative. Legacy polygons and merged masks are migrated once
+# so existing research projects keep their vessel identities and corrections.
 # ============================================================================
+
+def _project_source_image(project_id, base):
+    images_path = project_manager.get_project_path(project_id, 'images')
+    if not images_path or not images_path.exists():
+        return None
+    return next((
+        images_path / f"{base}{suffix}"
+        for suffix in ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
+        if (images_path / f"{base}{suffix}").exists()
+    ), None)
+
+
+def _load_or_migrate_project_boxes(project_id, base):
+    masks_path = project_manager.get_project_path(project_id, 'masks')
+    cards_path = project_manager.get_project_path(project_id, 'cards')
+    source_path = _project_source_image(project_id, base)
+    if not masks_path or source_path is None:
+        raise FileNotFoundError('Project image was not found')
+    document = read_vessel_boxes(masks_path, base)
+    if document is not None:
+        return document
+    with Image.open(source_path) as image:
+        image_size = [image.width, image.height]
+    mask_path = masks_path / f'{base}_mask_layer.png'
+    fallback = legacy_mask_component_boxes(mask_path, image_size) if mask_path.exists() else []
+    return migrate_legacy_review(
+        masks_path, cards_path, base, image_size,
+        polygons=read_vessels_sidecar(masks_path, base), fallback_boxes=fallback)
+
+
+@app.route('/api/projects/<project_id>/vessel-boxes/<base>', methods=['GET'])
+def get_image_vessel_boxes(project_id, base):
+    """Return independently reviewable vessel detections for one page."""
+    try:
+        document = _load_or_migrate_project_boxes(project_id, base)
+        return jsonify({'success': True, **document})
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 404
+    except (VesselBoxError, ValueError) as exc:
+        return jsonify({'error': str(exc), 'success': False}), 422
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/vessel-boxes/<base>', methods=['PUT'])
+def save_image_vessel_boxes(project_id, base):
+    """Save box moves, resizes, additions, deletions, and approvals safely."""
+    try:
+        current = _load_or_migrate_project_boxes(project_id, base)
+        data = request.get_json(silent=True) or {}
+        boxes = data.get('detections')
+        if not isinstance(boxes, list):
+            return jsonify({'error': 'detections must be a list', 'success': False}), 400
+        masks_path = project_manager.get_project_path(project_id, 'masks')
+        document = apply_box_review(masks_path, base, current['image_size'], boxes)
+        return jsonify({'success': True, **document})
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 404
+    except (VesselBoxError, ValueError) as exc:
+        return jsonify({'error': str(exc), 'success': False}), 422
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
 
 @app.route('/api/projects/<project_id>/vessels/<base>', methods=['GET'])
 def get_image_vessels(project_id, base):
@@ -1035,17 +1111,28 @@ def save_image_vessels(project_id, base):
 
 @app.route('/api/projects/<project_id>/vessels-summary', methods=['GET'])
 def get_project_vessels_summary(project_id):
-    """Per-image count of manually drawn vessels (for badges in the image list)."""
+    """Per-image count of active reviewed boxes, with legacy polygon fallback."""
     try:
         masks_path = project_manager.get_project_path(project_id, 'masks')
         summary = {}
         if masks_path and masks_path.exists():
             for f in masks_path.iterdir():
+                if not f.name.endswith(BOX_SIDECAR_SUFFIX):
+                    continue
+                base = f.name[:-len(BOX_SIDECAR_SUFFIX)]
+                document = read_vessel_boxes(masks_path, base)
+                count = len([
+                    item for item in (document or {}).get('detections', [])
+                    if item.get('status') != 'deleted'
+                ])
+                if count:
+                    summary[base] = count
+            for f in masks_path.iterdir():
                 if not f.name.endswith(VESSELS_SIDECAR_SUFFIX):
                     continue
                 base = f.name[:-len(VESSELS_SIDECAR_SUFFIX)]
                 count = len(read_vessels_sidecar(masks_path, base))
-                if count:
+                if count and base not in summary:
                     summary[base] = count
         return jsonify({'success': True, 'summary': summary})
     except Exception as e:
@@ -3081,7 +3168,12 @@ def get_project_metadata_link_state(project_id):
     ocr_available = bool(ocr_health.get('available'))
     summaries = []
     stale_figure_count = 0
+    summarized_figure_keys = set()
     for figure in state.get('figures', []):
+        figure_key = str(figure.get('figure_key') or figure.get('figure_id') or '')
+        if figure_key in summarized_figure_keys:
+            continue
+        summarized_figure_keys.add(figure_key)
         warnings = figure.get('warnings', [])
         stale_boundary_count = sum(
             bool(page.get('boundary')) and
@@ -3097,7 +3189,7 @@ def get_project_metadata_link_state(project_id):
             'drawing_count': len(figure.get('drawings', [])),
             'row_count': len(figure.get('table_rows', [])),
             'match_count': len(figure.get('matches', [])),
-            'unresolved_count': sum(item.get('status') != 'ready'
+            'unresolved_count': sum(item.get('status') not in {'ready', 'ignored'}
                                     for item in figure.get('matches', [])),
             'blocking_count': sum(bool(item.get('blocking')) for item in warnings),
             'needs_column_review': any(
@@ -3255,7 +3347,18 @@ def get_project_metadata_link_evidence(project_id, filename):
         page = next((p for p in figure.get('table_pages', [])
                      if p.get('image_name') == Path(filename).name), None)
         boundary = page.get('boundary', {}) if page else {}
-        if request.args.get('overlay') == '1' and boundary.get('table_bounds'):
+        diagnostic_crop_requested = bool(
+            (request.args.get('cell_row') and request.args.get('cell_field')) or
+            (request.args.get('ocr_row') and request.args.get('ocr_field')))
+        # The table grid is core review evidence, not an optional decoration.
+        # Always draw it in the normal publication viewer regardless of the
+        # vessel-box visibility setting. The full raw image remains available
+        # only to the manual column editor, which draws its own draggable lines.
+        show_table_grid = bool(
+            boundary.get('table_bounds') and
+            not diagnostic_crop_requested and
+            request.args.get('full') != '1')
+        if show_table_grid:
             draw = ImageDraw.Draw(image)
             x1, y1, x2, y2 = [int(value) for value in boundary['table_bounds']]
             line_width = max(5, min(image.size) // 450)
@@ -3693,12 +3796,18 @@ def update_project_metadata_link_figure(project_id, figure_id):
             if drawing_sources and page.get('source_pdf') not in drawing_sources:
                 return jsonify({'error': 'A table page must come from the same source PDF as its drawings',
                                 'success': False}), 400
+            # Page geometry is server-owned extraction evidence. The review UI
+            # submits the selected page names with every autosave (including a
+            # warning-only edit), so rebuilding this record from the manifest
+            # must not discard an existing grid or manual column override.
+            existing_page = old_pages.get(name, {})
             selected_pages.append({
+                **existing_page,
                 'image_name': name,
                 'logical_index': page.get('logical_index'),
                 'printed_page': page.get('printed_page', ''),
                 'source_pdf': page.get('source_pdf', ''),
-                'crop': old_pages.get(name, {}).get('crop'),
+                'crop': existing_page.get('crop'),
             })
         figure['table_pages'] = selected_pages
         changed_fields.append('table_pages')
@@ -3706,8 +3815,9 @@ def update_project_metadata_link_figure(project_id, figure_id):
         figure['review_status'] = data['review_status']
         changed_fields.append('review_status')
     if isinstance(data.get('warning_overrides'), dict):
-        # Validate against the warnings currently produced by this figure. A
-        # client cannot turn an identity error into an overridable warning.
+        # Validate against the warnings currently produced by this figure.
+        # Every decision remains tied to a server-created warning ID and an
+        # allowed audit reason; clients cannot invent or silently delete one.
         validate_figure(figure, get_profile(state.get('profile', 'hesban11')))
         allowed = {warning.get('id'): warning for warning in figure.get('warnings', [])
                    if warning.get('overrideable')}
@@ -3722,7 +3832,7 @@ def update_project_metadata_link_figure(project_id, figure_id):
                 return jsonify({'error': 'Every warning override requires a reason',
                                 'success': False}), 400
             warning_code = str(allowed[warning_id].get('code', ''))
-            if reason not in WARNING_OVERRIDE_REASONS.get(warning_code, set()):
+            if reason not in warning_override_reasons(warning_code):
                 return jsonify({'error': f'Invalid review reason for {warning_code}',
                                 'success': False}), 400
             previous = previous_overrides.get(warning_id, {})

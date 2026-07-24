@@ -339,7 +339,7 @@
                 <button class="tab-button active" data-tab="projects">🗂️ Project Manager</button>
                 <button class="tab-button" data-tab="pdf">1. PDF document processing</button>
                 <button class="tab-button" data-tab="model">2. Apply Model</button>
-                <button class="tab-button" data-tab="annotation">3. Review Annotations and extract masks</button>
+                <button class="tab-button" data-tab="annotation">3. Review Vessel Boxes</button>
                 <button class="tab-button" data-tab="tabular">4. Review &amp; Link</button>
                 <button class="tab-button" data-tab="export">5. Export</button>
             </div>
@@ -525,7 +525,7 @@
                                 <div class="annotation-list-heading">
                                     <h3>🖼️ Images (<span id="annotation-image-count">0</span>)</h3>
                                     <label class="annotation-vessels-filter"
-                                        title="Show only pages whose mask contains a vessel or which have a manually drawn vessel">
+                                        title="Show only pages that contain vessel boxes or legacy vessel evidence">
                                         <input type="checkbox" id="annotation-vessels-only">
                                         <span>Vessels only</span>
                                     </label>
@@ -539,11 +539,15 @@
                             <div class="control-group">
                                 <button class="btn btn-primary btn-block" id="annotation-save"
                                     style="margin-bottom: 8px;">
-                                    💾 Save Current Mask
+                                    Save vessel review
                                 </button>
                                 <button class="btn btn-primary btn-block" id="extract-masks-btn">
-                                    📤 Extract Cards
+                                    Extract approved crops
                                 </button>
+                                <label class="crop-margin-control" for="vessel-crop-margin">
+                                    Crop margin (pixels)
+                                    <input id="vessel-crop-margin" class="form-control" type="number" min="0" max="500" value="24">
+                                </label>
 
                                 <!-- Extraction Progress Bar -->
                                 <div class="progress-container" id="extraction-progress" style="margin-top: 12px;">
@@ -560,8 +564,8 @@
                         <!-- Right Panel - Editor -->
                         <div class="preview-panel">
                             <div id="annotation-empty-msg" class="empty-message">
-                                <h3>🖼️ No Mask Selected</h3>
-                                <p>Select a project with masks and click a mask to review</p>
+                                <h3>🖼️ No Page Selected</h3>
+                                <p>Select a project and choose a page to review its vessel boxes.</p>
                             </div>
                             <div id="annotation-editor" style="display: none;">
                                 <div style="text-align: center; margin-bottom: 10px;">
@@ -585,10 +589,17 @@
                                         <button class="btn btn-tool" id="zoom-fit-btn" title="Fit to view">⤢ Fit</button>
                                     </div>
                                     <div class="control-cluster">
-                                        <button class="btn btn-tool active" id="brush-tool" data-tool="brush">🖌️ Brush</button>
+                                        <button class="btn btn-tool active" id="select-box-tool" data-tool="select-box"
+                                            title="Select a box, then drag it or its corner handles.">Select box</button>
+                                        <button class="btn btn-tool" id="draw-box-tool" data-tool="draw-box"
+                                            title="Drag a rectangle around a missed vessel.">Add box</button>
+                                    </div>
+                                    <div class="control-cluster mask-evidence-controls">
+                                        <label class="mask-evidence-toggle" title="Supporting evidence only; masks never cut pixels from crops.">
+                                            <input type="checkbox" id="mask-evidence-toggle" checked> Show mask evidence
+                                        </label>
+                                        <button class="btn btn-tool" id="brush-tool" data-tool="brush">🖌️ Brush</button>
                                         <button class="btn btn-tool" id="eraser-tool" data-tool="eraser">🧹 Eraser</button>
-                                        <button class="btn btn-tool" id="polygon-tool" data-tool="polygon"
-                                            title="Draw a polygon around a vessel the model missed (e.g. a vessel drawn inside another). Click to add points; click the first point or double-click to close.">📐 Polygon</button>
                                         <button class="btn btn-tool" id="scale-tool" data-tool="scale"
                                             title="Calibrate the graphic scale bar: click two endpoints, then enter the real distance in cm.">📏 Scale</button>
                                         <button class="btn btn-tool" id="clear-tool" data-tool="clear">🗑️ Clear</button>
@@ -604,13 +615,13 @@
                                     </div>
                                 </div>
 
-                                <!-- Manually drawn vessels (polygons) -->
-                                <div id="vessels-panel" class="vessels-panel" style="display: none;">
-                                    <div class="vessels-panel-header">
-                                        <span>📐 Manually drawn vessels (<span id="vessels-count">0</span>)</span>
-                                        <span class="vessels-hint">Each polygon becomes a separate card when you extract.</span>
+                                <div id="vessel-boxes-panel" class="vessels-panel vessel-boxes-panel">
+                                    <div class="vessels-panel-header vessel-boxes-header">
+                                        <span>Vessel boxes (<span id="vessel-boxes-count">0</span>)</span>
+                                        <span class="vessels-hint">Blue boxes need review. Green boxes are approved for original-resolution crops.</span>
+                                        <button type="button" class="btn btn-secondary btn-sm" id="approve-all-boxes">Approve all on this page</button>
                                     </div>
-                                    <div id="vessels-list" class="vessels-list"></div>
+                                    <div id="vessel-boxes-list" class="vessels-list"></div>
                                 </div>
 
                                 <!-- Scale calibration entries -->
@@ -854,11 +865,11 @@
         <div id="extract-confirm-dialog" class="dialog-overlay" style="display: none;">
             <div class="dialog">
                 <div class="dialog-header">
-                    <h2>📤 Extract Cards</h2>
-                    <p>This will extract cards from all annotated masks</p>
+                    <h2>Extract Approved Crops</h2>
+                    <p>This creates rectangular crops from approved vessel boxes.</p>
                 </div>
                 <div class="dialog-body">
-                    <p>Any previously extracted cards will be overwritten. Do you want to continue?</p>
+                    <p>The optional mask stays as evidence, but it never removes pixels from a crop. Continue?</p>
                 </div>
                 <div class="dialog-footer">
                     <button class="btn btn-secondary" id="extract-confirm-cancel">❌ Cancel</button>

@@ -217,7 +217,7 @@ def test_zero_vessel_number_is_unresolved():
     assert figure["drawings"][0]["vessel_number"] == ""
 
 
-def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
+def test_every_visible_warning_can_record_a_reviewer_decision():
     profile = Hesban11Profile()
     figure = {
         "figure_id": "2.1", "processing_status": "reviewable",
@@ -242,7 +242,15 @@ def test_safe_warning_override_allows_ready_but_identity_warning_does_not():
     validate_figure(figure, profile)
     duplicate = next(item for item in figure["warnings"]
                      if item["code"] == "duplicate_drawing_number")
-    assert duplicate["overrideable"] is False
+    assert duplicate["overrideable"] is True
+    figure["warning_overrides"][duplicate["id"]] = {
+        "reason": "reviewer_confirmed", "note": "Checked both drawings"
+    }
+    validate_figure(figure, profile)
+    # Dismissing the warning is auditable, but it does not guess which of two
+    # duplicate drawings owns the row.
+    assert next(item for item in figure["warnings"]
+                if item["code"] == "duplicate_drawing_number")["overridden"] is True
     assert figure["status"] == "needs_review"
 
 
@@ -259,7 +267,7 @@ def test_missing_table_end_is_kept_as_evidence_but_not_shown_or_blocking():
     assert figure["extraction_warnings"][0]["code"] == "missing_table_end"
 
 
-def test_cross_pdf_assignment_in_loaded_sidecar_is_always_blocking():
+def test_cross_pdf_assignment_can_be_explicitly_reviewed_and_accepted():
     figure = {
         "figure_id": "2.1",
         "drawing_pages": [{"source_pdf": "drawings.pdf"}],
@@ -271,9 +279,45 @@ def test_cross_pdf_assignment_in_loaded_sidecar_is_always_blocking():
     validate_figure(figure, Hesban11Profile())
     warning = next(item for item in figure["warnings"]
                    if item["code"] == "cross_pdf_assignment")
-    assert warning["overrideable"] is False
+    assert warning["overrideable"] is True
     assert warning["blocking"] is True
-    assert figure["status"] == "needs_review"
+    figure["warning_overrides"][warning["id"]] = {
+        "reason": "reviewer_confirmed", "note": "Researcher verified provenance"
+    }
+    validate_figure(figure, Hesban11Profile())
+    reviewed = next(item for item in figure["warnings"]
+                    if item["code"] == "cross_pdf_assignment")
+    assert reviewed["overridden"] is True
+    assert reviewed["blocking"] is False
+    assert figure["status"] == "ready"
+
+
+def test_ignored_missing_table_row_allows_partial_figure_approval(tmp_path):
+    project = make_project(tmp_path)
+    state = MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+    figure = state["figures"][0]
+    figure["table_rows"] = [
+        row for row in figure["table_rows"] if row["table_no"] == "1"
+    ]
+    validate_figure(figure, Hesban11Profile())
+    warning = next(item for item in figure["warnings"]
+                   if item["code"] == "missing_table_row")
+    figure["warning_overrides"][warning["id"]] = {
+        "reason": "confirmed_missing_table_row",
+        "note": "Checked the publication; approve the remaining vessel.",
+    }
+    validate_figure(figure, Hesban11Profile())
+
+    assert figure["status"] == "ready"
+    assert [(match["vessel_number"], match["status"])
+            for match in figure["matches"]] == [("1", "ready"), ("2", "ignored")]
+    save_linkage_state(project, state)
+
+    result = apply_approved_figures(project, ["2.1"])
+    frame = pd.read_csv(project / "cards" / "mask_info.csv",
+                        dtype=str, keep_default_na=False)
+    assert result["applied_rows"] == 1
+    assert frame["Link Status"].tolist() == ["approved_with_overrides", ""]
 
 
 def test_newer_reviewer_revision_survives_stale_background_save(tmp_path):

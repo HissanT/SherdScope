@@ -44,13 +44,12 @@ NON_BLOCKING_WARNING_CODES = {
     "cross_column_ocr_withheld",
 }
 HIDDEN_REVIEW_WARNING_CODES = {"missing_table_end"}
-OVERRIDABLE_WARNING_CODES = {
-    "missing_required_value", "column_header_fallback",
-}
 WARNING_OVERRIDE_REASONS = {
     "missing_required_value": {"publication_field_blank"},
     "column_header_fallback": {"column_alignment_verified"},
+    "missing_table_row": {"confirmed_missing_table_row"},
 }
+DEFAULT_WARNING_OVERRIDE_REASONS = {"reviewer_confirmed"}
 REVIEWER_OWNED_FIGURE_FIELDS = {
     "figure_id", "figure_caption", "table_rows", "table_pages",
     "warning_overrides", "reviewer_revision", "draft_saved_at",
@@ -58,6 +57,11 @@ REVIEWER_OWNED_FIGURE_FIELDS = {
     "scale_calibrations", "review_overrides",
 }
 _LINKAGE_STATE_LOCK = threading.RLock()
+
+
+def warning_override_reasons(code: str) -> set[str]:
+    """Return the auditable decisions allowed for any visible warning."""
+    return WARNING_OVERRIDE_REASONS.get(str(code or ""), DEFAULT_WARNING_OVERRIDE_REASONS)
 
 # JSON and extractor code retain the stable technical names above. CSV files
 # and browser-facing tables use publication-style names through this mapping.
@@ -778,16 +782,32 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
         if warning["id"] in seen_warning_ids:
             continue
         seen_warning_ids.add(warning["id"])
-        warning["overrideable"] = warning.get("code") in OVERRIDABLE_WARNING_CODES
+        # Every visible warning is a review decision. Keep safety by recording
+        # a server-validated reason and preserving the warning rather than
+        # deleting it from the evidence.
+        warning["overrideable"] = True
         override = overrides.get(warning["id"])
         warning["overridden"] = bool(
             warning["overrideable"] and isinstance(override, dict) and
-            override.get("reason") in WARNING_OVERRIDE_REASONS.get(
-                str(warning.get("code", "")), set()))
+            override.get("reason") in warning_override_reasons(
+                str(warning.get("code", ""))))
         warning["blocking"] = bool(
             warning.get("code") not in NON_BLOCKING_WARNING_CODES and
             not warning["overridden"])
         unique_warnings.append(warning)
+
+    ignored_missing_rows = {
+        str(warning.get("row", ""))
+        for warning in unique_warnings
+        if warning.get("code") == "missing_table_row" and warning.get("overridden")
+    }
+    for match in matches:
+        if (match.get("status") != "ready"
+                and str(match.get("vessel_number", "")) in ignored_missing_rows
+                and not row_map.get(str(match.get("vessel_number", "")))):
+            match["status"] = "ignored"
+            match["values"] = {}
+            match["review_note"] = "Approved without a linked table row."
 
     figure["matches"] = matches
     figure["warnings"] = unique_warnings
@@ -796,7 +816,7 @@ def validate_figure(figure: dict[str, Any], profile: PublicationProfile) -> dict
     # one row; extra rows are a common sign of a wrong or truncated table page.
     blocking_warnings = [warning for warning in unique_warnings if warning["blocking"]]
     figure["status"] = ("ready" if matches and
-                        all(m["status"] == "ready" for m in matches) and
+                        all(m["status"] in {"ready", "ignored"} for m in matches) and
                         not blocking_warnings else "needs_review")
     if (figure.get("processing_status") not in {"processing", "queued"} and
             figure.get("review_status") != "approved"):
@@ -1219,7 +1239,8 @@ def linkage_totals(state: dict[str, Any]) -> dict[str, int]:
         "linkage_ready": sum(m.get("status") == "ready" for m in matches),
         "linkage_reviewed": sum(len(f.get("matches", [])) for f in figures
                                 if f.get("review_status") == "approved"),
-        "linkage_unresolved": sum(m.get("status") != "ready" for m in matches),
+        "linkage_unresolved": sum(
+            m.get("status") not in {"ready", "ignored"} for m in matches),
     }
 
 
@@ -1276,6 +1297,8 @@ def _apply_approved_figures_locked(project_path: Path, figure_ids: Iterable[str]
         if figure.get("status") != "ready":
             raise MetadataLinkError(f"Figure {figure.get('figure_id')} still has unresolved matches")
         for match in figure.get("matches", []):
+            if match.get("status") == "ignored":
+                continue
             target = frame["mask_file"].map(mask_stem) == mask_stem(match.get("mask_file"))
             count = int(target.sum())
             if count != 1:
@@ -1300,6 +1323,8 @@ def _apply_approved_figures_locked(project_path: Path, figure_ids: Iterable[str]
                             else "approved"),
         }
         for match in figure.get("matches", []):
+            if match.get("status") == "ignored":
+                continue
             target = targets[(figure_id, str(match.get("mask_file")))]
             drawing = next((item for item in figure.get("drawings", [])
                             if mask_stem(item.get("mask_file")) ==

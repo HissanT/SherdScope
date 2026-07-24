@@ -1,5 +1,5 @@
 // Annotation Tab - Rebuilt from scratch
-// Simple implementation for reviewing and editing masks
+// Box-first vessel review. Masks remain optional supporting evidence.
 
 const annotationState = {
     currentProject: null,
@@ -15,7 +15,7 @@ const annotationState = {
     originalHeight: 0,
     displayWidth: 0,
     displayHeight: 0,
-    currentTool: 'brush',
+    currentTool: 'select-box',
     brushSize: 20,
     isDrawing: false,
     isModified: false,
@@ -37,7 +37,13 @@ const annotationState = {
     scaleStep: null,         // null = ruler mode | 'zone' = zone-drag mode
     scaleZoneTargetIdx: null,// which scale entry gets the zone
     scaleZoneDragStart: null,// {x, y} original coords at drag start
-    scaleCursorPos: null     // {x, y} display coords of cursor (live preview)
+    scaleCursorPos: null,    // {x, y} display coords of cursor (live preview)
+    boxes: [],               // independent detections in ORIGINAL coordinates
+    boxesModified: false,
+    selectedBoxId: null,
+    boxDrag: null,
+    draftBox: null,
+    showMaskOverlay: true
 };
 
 const POLYGON_CLOSE_THRESHOLD = 12; // display px to snap-close onto first point
@@ -54,6 +60,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeZoomControls();
     initializeScalePopup();
     initializeVesselsOnlyFilter();
+    initializeBoxControls();
 
     window.addEventListener('projectChanged', handleProjectChanged);
     loadCurrentProject();
@@ -132,7 +139,26 @@ function initializeNavigationButtons() {
 
 function initializeSaveButton() {
     const btn = document.getElementById('annotation-save');
-    if (btn) btn.addEventListener('click', saveMask);
+    if (btn) btn.addEventListener('click', saveReview);
+}
+
+function initializeBoxControls() {
+    document.getElementById('approve-all-boxes')?.addEventListener('click', () => {
+        annotationState.boxes.forEach(box => {
+            if (box.status !== 'deleted') { box.approved = true; box.status = 'approved'; }
+        });
+        annotationState.boxesModified = true;
+        renderBoxesPanel();
+        redrawCanvas();
+    });
+    const maskToggle = document.getElementById('mask-evidence-toggle');
+    if (maskToggle) {
+        maskToggle.checked = annotationState.showMaskOverlay;
+        maskToggle.addEventListener('change', () => {
+            annotationState.showMaskOverlay = maskToggle.checked;
+            redrawCanvas();
+        });
+    }
 }
 
 function initializeExtractButton() {
@@ -268,6 +294,10 @@ function resetAnnotationTab() {
     annotationState.currentPolygon = [];
     annotationState.mousePreview = null;
     annotationState.vesselsSummary = {};
+    annotationState.boxes = [];
+    annotationState.boxesModified = false;
+    annotationState.selectedBoxId = null;
+    renderBoxesPanel();
     renderVesselsPanel();
     updateImageCount(0);
     clearImageList();
@@ -278,7 +308,7 @@ function resetAnnotationTab() {
 function imageHasVessels(img) {
     // The model writes a mask file only when it detects at least one vessel.
     // Manually drawn polygons also make a page eligible even without a model mask.
-    return Boolean(img && (img.hasMask || annotationState.vesselsSummary[img.baseName] > 0));
+    return Boolean(img && (img.hasMask || img.boxCount > 0 || annotationState.vesselsSummary[img.baseName] > 0));
 }
 
 function getVisibleImageIndices() {
@@ -433,8 +463,8 @@ function updateCurrentImageLabel() {
 async function selectImage(index) {
     if (index < 0 || index >= annotationState.images.length) return;
     
-    if (annotationState.isModified && annotationState.currentIndex >= 0) {
-        await saveMask();
+    if ((annotationState.isModified || annotationState.boxesModified) && annotationState.currentIndex >= 0) {
+        await saveReview();
     }
     
     annotationState.currentIndex = index;
@@ -504,6 +534,7 @@ async function selectImage(index) {
         }
         
         annotationState.isModified = false;
+        await loadVesselBoxes(img.baseName);
         await loadVessels(img.baseName);
         await loadScales(img.baseName);
         if (annotationState.colorize) computeColorized();
@@ -558,17 +589,153 @@ function redrawCanvas() {
     ctx.drawImage(annotationState.backgroundImage, 0, 0);
     // Coloured connected-components view (except while actively painting, where
     // we show the live red strokes and recolour on mouse-up).
-    if (annotationState.colorize && annotationState.colorizedCanvas && !annotationState.isDrawing) {
+    if (annotationState.showMaskOverlay && annotationState.colorize && annotationState.colorizedCanvas && !annotationState.isDrawing) {
         ctx.globalAlpha = 0.75;
         ctx.drawImage(annotationState.colorizedCanvas, 0, 0);
-    } else {
+    } else if (annotationState.showMaskOverlay) {
         ctx.globalAlpha = 0.5;
         ctx.drawImage(annotationState.maskCanvas, 0, 0);
     }
     ctx.globalAlpha = 1.0;
     drawPolygons(ctx);
+    drawVesselBoxes(ctx);
     drawScaleLines(ctx);
     drawBrushCursor(ctx);
+}
+
+function boxClientKey(box) {
+    return box.detection_id || box._client_id || box.vessel_id;
+}
+
+function activeBoxes() {
+    return (annotationState.boxes || []).filter(box => box.status !== 'deleted');
+}
+
+function drawVesselBoxes(ctx) {
+    activeBoxes().forEach((box, index) => {
+        const [x1, y1, x2, y2] = box.reviewed_bbox;
+        const [dx1, dy1] = originalToDisplay(x1, y1);
+        const [dx2, dy2] = originalToDisplay(x2, y2);
+        const selected = boxClientKey(box) === annotationState.selectedBoxId;
+        ctx.save();
+        ctx.strokeStyle = box.approved ? '#16a34a' : '#2563eb';
+        ctx.fillStyle = box.approved ? 'rgba(22,163,74,.08)' : 'rgba(37,99,235,.07)';
+        ctx.lineWidth = selected ? 3 : 2;
+        ctx.fillRect(dx1, dy1, dx2 - dx1, dy2 - dy1);
+        ctx.strokeRect(dx1, dy1, dx2 - dx1, dy2 - dy1);
+        ctx.fillStyle = box.approved ? '#15803d' : '#1d4ed8';
+        ctx.font = 'bold 12px sans-serif';
+        const label = box.vessel_id ? box.vessel_id.replace(/^.*_mask_layer_/, '#') : `new ${index + 1}`;
+        ctx.fillText(label, dx1 + 4, Math.max(13, dy1 - 4));
+        if (selected) {
+            [[dx1, dy1], [dx2, dy1], [dx1, dy2], [dx2, dy2]].forEach(([x, y]) => {
+                ctx.fillStyle = '#fff';
+                ctx.strokeStyle = '#1d4ed8';
+                ctx.lineWidth = 2;
+                ctx.fillRect(x - 5, y - 5, 10, 10);
+                ctx.strokeRect(x - 5, y - 5, 10, 10);
+            });
+        }
+        ctx.restore();
+    });
+    if (annotationState.draftBox) {
+        const [x1, y1, x2, y2] = annotationState.draftBox;
+        const [dx1, dy1] = originalToDisplay(Math.min(x1, x2), Math.min(y1, y2));
+        const [dx2, dy2] = originalToDisplay(Math.max(x1, x2), Math.max(y1, y2));
+        ctx.save();
+        ctx.setLineDash([6, 4]);
+        ctx.strokeStyle = '#ea580c';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(dx1, dy1, dx2 - dx1, dy2 - dy1);
+        ctx.restore();
+    }
+}
+
+function boxAtDisplayPoint(x, y) {
+    const boxes = activeBoxes();
+    for (let index = boxes.length - 1; index >= 0; index--) {
+        const box = boxes[index];
+        const [x1, y1, x2, y2] = box.reviewed_bbox;
+        const [dx1, dy1] = originalToDisplay(x1, y1);
+        const [dx2, dy2] = originalToDisplay(x2, y2);
+        const corners = { nw: [dx1, dy1], ne: [dx2, dy1], sw: [dx1, dy2], se: [dx2, dy2] };
+        for (const [corner, point] of Object.entries(corners)) {
+            if (Math.hypot(x - point[0], y - point[1]) <= 10) return { box, mode: corner };
+        }
+        if (x >= dx1 && x <= dx2 && y >= dy1 && y <= dy2) return { box, mode: 'move' };
+    }
+    return null;
+}
+
+function beginBoxInteraction(e) {
+    const display = eventToDisplayXY(e);
+    const [ox, oy] = displayToOriginal(display.x, display.y);
+    if (annotationState.currentTool === 'draw-box') {
+        annotationState.draftBox = [ox, oy, ox, oy];
+        annotationState.isDrawing = true;
+        return;
+    }
+    const hit = boxAtDisplayPoint(display.x, display.y);
+    annotationState.selectedBoxId = hit ? boxClientKey(hit.box) : null;
+    annotationState.boxDrag = hit ? {
+        box: hit.box, mode: hit.mode, start: [ox, oy], initial: [...hit.box.reviewed_bbox]
+    } : null;
+    annotationState.isDrawing = Boolean(hit);
+    renderBoxesPanel();
+    redrawCanvas();
+}
+
+function updateBoxInteraction(e) {
+    if (!annotationState.isDrawing) return;
+    const display = eventToDisplayXY(e);
+    const [ox, oy] = displayToOriginal(display.x, display.y);
+    if (annotationState.currentTool === 'draw-box' && annotationState.draftBox) {
+        annotationState.draftBox[2] = ox;
+        annotationState.draftBox[3] = oy;
+        redrawCanvas();
+        return;
+    }
+    const drag = annotationState.boxDrag;
+    if (!drag) return;
+    let [x1, y1, x2, y2] = drag.initial;
+    const dx = ox - drag.start[0], dy = oy - drag.start[1];
+    if (drag.mode === 'move') {
+        const width = x2 - x1, height = y2 - y1;
+        x1 = Math.max(0, Math.min(annotationState.originalWidth - width, x1 + dx));
+        y1 = Math.max(0, Math.min(annotationState.originalHeight - height, y1 + dy));
+        x2 = x1 + width; y2 = y1 + height;
+    } else {
+        if (drag.mode.includes('w')) x1 = Math.min(x2 - 4, Math.max(0, ox));
+        if (drag.mode.includes('e')) x2 = Math.max(x1 + 4, Math.min(annotationState.originalWidth, ox));
+        if (drag.mode.includes('n')) y1 = Math.min(y2 - 4, Math.max(0, oy));
+        if (drag.mode.includes('s')) y2 = Math.max(y1 + 4, Math.min(annotationState.originalHeight, oy));
+    }
+    drag.box.reviewed_bbox = [Math.round(x1), Math.round(y1), Math.round(x2), Math.round(y2)];
+    annotationState.boxesModified = true;
+    redrawCanvas();
+}
+
+function finishBoxInteraction(e) {
+    if (annotationState.currentTool === 'draw-box' && annotationState.draftBox) {
+        const [ax, ay, bx, by] = annotationState.draftBox;
+        const bbox = [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)];
+        if (bbox[2] - bbox[0] >= 4 && bbox[3] - bbox[1] >= 4) {
+            const box = {
+                _client_id: `manual-${Date.now()}-${Math.random()}`,
+                detection_id: null, vessel_id: null, source: 'manual',
+                detected_bbox: [...bbox], reviewed_bbox: bbox,
+                confidence: null, approved: false, status: 'pending', mask_provenance: null
+            };
+            annotationState.boxes.push(box);
+            annotationState.selectedBoxId = boxClientKey(box);
+            annotationState.boxesModified = true;
+        }
+    }
+    annotationState.draftBox = null;
+    annotationState.boxDrag = null;
+    annotationState.isDrawing = false;
+    renderBoxesPanel();
+    redrawCanvas();
 }
 
 // Toggle the "political-map" colouring of separate masks
@@ -790,6 +957,17 @@ function onCanvasDblClick(e) {
 }
 
 function onPolygonKeyDown(e) {
+    if (annotationState.currentTool === 'select-box' && (e.key === 'Delete' || e.key === 'Backspace')) {
+        const box = annotationState.boxes.find(item => boxClientKey(item) === annotationState.selectedBoxId);
+        if (box) {
+            e.preventDefault();
+            box.approved = false; box.status = 'deleted'; box.deleted = true;
+            annotationState.boxesModified = true;
+            annotationState.selectedBoxId = null;
+            renderBoxesPanel(); redrawCanvas();
+        }
+        return;
+    }
     if (annotationState.currentTool === 'scale') {
         if (e.key === 'Escape') { e.preventDefault(); cancelScaleDraft(); redrawCanvas(); }
         return;
@@ -805,6 +983,10 @@ function onPolygonKeyDown(e) {
 }
 
 function startDrawing(e) {
+    if (annotationState.currentTool === 'select-box' || annotationState.currentTool === 'draw-box') {
+        beginBoxInteraction(e);
+        return;
+    }
     if (annotationState.currentTool === 'polygon') {
         addPolygonVertex(e);
         return;
@@ -818,6 +1000,10 @@ function startDrawing(e) {
 }
 
 function stopDrawing(e) {
+    if (annotationState.currentTool === 'select-box' || annotationState.currentTool === 'draw-box') {
+        finishBoxInteraction(e);
+        return;
+    }
     if (annotationState.currentTool === 'scale' && annotationState.scaleStep === 'zone' && annotationState.isDrawing) {
         handleScaleZoneEnd(e);
         return;
@@ -831,6 +1017,14 @@ function stopDrawing(e) {
 }
 
 function draw(e) {
+    if (annotationState.currentTool === 'select-box' || annotationState.currentTool === 'draw-box') {
+        updateBoxInteraction(e);
+        if (!annotationState.isDrawing && annotationState.currentTool === 'select-box') {
+            const point = eventToDisplayXY(e);
+            annotationState.canvas.style.cursor = boxAtDisplayPoint(point.x, point.y) ? 'move' : 'default';
+        }
+        return;
+    }
     if (annotationState.currentTool === 'polygon') {
         // Rubber-band preview to the cursor while building a polygon
         if (annotationState.currentPolygon.length > 0) {
@@ -872,6 +1066,13 @@ function draw(e) {
 }
 
 function onCanvasMouseLeave() {
+    if ((annotationState.currentTool === 'select-box' || annotationState.currentTool === 'draw-box') && annotationState.isDrawing) {
+        annotationState.isDrawing = false;
+        annotationState.boxDrag = null;
+        annotationState.draftBox = null;
+        renderBoxesPanel(); redrawCanvas();
+        return;
+    }
     const wasDrawing = annotationState.isDrawing;
     annotationState.isDrawing = false;
     annotationState.brushCursor = null;
@@ -894,7 +1095,115 @@ function selectTool(tool) {
         btn.classList.toggle('active', btn.dataset.tool === tool);
     });
     const canvas = annotationState.canvas;
-    if (canvas) canvas.style.cursor = 'crosshair';
+    if (canvas) canvas.style.cursor = tool === 'select-box' ? 'default' : 'crosshair';
+}
+
+// ---- Authoritative vessel boxes ----------------------------------------
+
+async function loadVesselBoxes(baseName) {
+    annotationState.boxes = [];
+    annotationState.boxesModified = false;
+    annotationState.selectedBoxId = null;
+    if (!annotationState.currentProject) { renderBoxesPanel(); return; }
+    const projectId = annotationState.currentProject.project_id;
+    try {
+        const response = await fetch(`/api/projects/${projectId}/vessel-boxes/${encodeURIComponent(baseName)}`);
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Could not load vessel boxes');
+        annotationState.boxes = data.detections || [];
+    } catch (error) {
+        console.warn('[Annotation] Could not load vessel boxes:', error);
+        if (window.PyPotteryUtils) window.PyPotteryUtils.showToast(error.message, 'error');
+    }
+    renderBoxesPanel();
+}
+
+function renderBoxesPanel() {
+    const panel = document.getElementById('vessel-boxes-panel');
+    const list = document.getElementById('vessel-boxes-list');
+    const count = document.getElementById('vessel-boxes-count');
+    if (!panel || !list) return;
+    const boxes = annotationState.boxes || [];
+    const visible = boxes.filter(box => box.status !== 'deleted');
+    if (count) count.textContent = visible.length;
+    panel.style.display = 'block';
+    if (!visible.length) {
+        list.innerHTML = '<div class="empty-list">No boxes yet. Choose Add box and drag around a vessel.</div>';
+        return;
+    }
+    list.innerHTML = visible.map((box, index) => {
+        const key = boxClientKey(box);
+        const confidence = Number.isFinite(Number(box.confidence))
+            ? `${Math.round(Number(box.confidence) * 100)}% model confidence` : 'researcher added';
+        const label = box.vessel_id ? box.vessel_id.replace(/^.*_mask_layer_/, 'Vessel ') : `New vessel ${index + 1}`;
+        return `<div class="vessel-item vessel-box-item ${key === annotationState.selectedBoxId ? 'selected' : ''}" data-key="${key}">
+            <button type="button" class="vessel-box-focus" data-key="${key}">
+                <strong>${label}</strong><small>${confidence}</small>
+            </button>
+            <label class="vessel-box-approval"><input type="checkbox" data-key="${key}" ${box.approved ? 'checked' : ''}> Approved</label>
+            <button type="button" class="vessel-delete" data-key="${key}">Delete</button>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('.vessel-box-focus').forEach(button => {
+        button.addEventListener('click', () => {
+            annotationState.selectedBoxId = button.dataset.key;
+            selectTool('select-box');
+            renderBoxesPanel(); redrawCanvas();
+        });
+    });
+    list.querySelectorAll('.vessel-box-approval input').forEach(input => {
+        input.addEventListener('change', () => {
+            const box = boxes.find(item => boxClientKey(item) === input.dataset.key);
+            if (!box) return;
+            box.approved = input.checked;
+            box.status = input.checked ? 'approved' : 'pending';
+            annotationState.boxesModified = true;
+            redrawCanvas();
+        });
+    });
+    list.querySelectorAll('.vessel-delete').forEach(button => {
+        button.addEventListener('click', () => {
+            const box = boxes.find(item => boxClientKey(item) === button.dataset.key);
+            if (!box) return;
+            box.approved = false; box.status = 'deleted'; box.deleted = true;
+            annotationState.boxesModified = true;
+            if (annotationState.selectedBoxId === button.dataset.key) annotationState.selectedBoxId = null;
+            renderBoxesPanel(); redrawCanvas();
+        });
+    });
+}
+
+async function saveVesselBoxes() {
+    if (!annotationState.currentProject || !annotationState.boxesModified) return true;
+    const image = annotationState.images[annotationState.currentIndex];
+    if (!image) return false;
+    const response = await fetch(`/api/projects/${annotationState.currentProject.project_id}/vessel-boxes/${encodeURIComponent(image.baseName)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ detections: annotationState.boxes })
+    });
+    const data = await response.json();
+    if (!response.ok || !data.success) throw new Error(data.error || 'Could not save vessel boxes');
+    annotationState.boxes = data.detections || [];
+    annotationState.boxesModified = false;
+    annotationState.selectedBoxId = null;
+    renderBoxesPanel(); redrawCanvas();
+    return true;
+}
+
+async function saveReview() {
+    const button = document.getElementById('annotation-save');
+    try {
+        if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); button.textContent = 'Saving…'; }
+        await saveMask();
+        await saveVesselBoxes();
+        if (window.PyPotteryUtils) window.PyPotteryUtils.showToast('Vessel review saved', 'success');
+    } catch (error) {
+        console.error('[Annotation] Review save failed:', error);
+        if (window.PyPotteryUtils) window.PyPotteryUtils.showToast(error.message, 'error');
+        throw error;
+    } finally {
+        if (button) { button.disabled = false; button.removeAttribute('aria-busy'); button.textContent = 'Save vessel review'; }
+    }
 }
 
 // ---- Manually drawn vessels (polygons) ----------------------------------
@@ -1303,12 +1612,13 @@ async function saveMask() {
     } catch (error) {
         console.error('[Annotation] Save error:', error);
         alert('Error: ' + error.message);
+        throw error;
     }
 }
 
 async function extractCards() {
     if (!annotationState.currentProject) return;
-    if (annotationState.isModified) await saveMask();
+    if (annotationState.isModified || annotationState.boxesModified) await saveReview();
 
     // Show custom confirmation dialog instead of native confirm()
     const confirmed = await showExtractConfirmDialog();
@@ -1330,7 +1640,9 @@ async function extractCards() {
                 const res = await fetch(`/api/projects/${projectId}/masks/extract`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({})
+                    body: JSON.stringify({
+                        crop_margin_pixels: Number(document.getElementById('vessel-crop-margin')?.value || 24)
+                    })
                 });
                 
                 const result = await res.json();

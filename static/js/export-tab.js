@@ -51,7 +51,8 @@
         container.innerHTML = visible.map(mask => `
             <label class="research-export-mask ${mask.included ? '' : 'excluded'}">
                 <input type="checkbox" data-export-mask="${escapeHtml(mask.mask_key)}" ${mask.included ? 'checked' : ''}>
-                <img src="${escapeHtml(mask.thumbnail_url)}" alt="Vessel ${escapeHtml(mask.vessel_number)}">
+                <img src="${escapeHtml(mask.thumbnail_url)}" loading="lazy" decoding="async"
+                     alt="Vessel ${escapeHtml(mask.vessel_number)}">
                 <span><strong>Figure ${escapeHtml(mask.figure)}, No. ${escapeHtml(mask.vessel_number)}</strong>
                     <small>${escapeHtml(mask.vessel_type || 'Type not recorded')}</small>
                     <small>${mask.included ? 'Included in export' : 'Excluded from export'}</small></span>
@@ -115,6 +116,60 @@
         element.className = `status-message${kind ? ` ${kind}` : ''}`;
     }
 
+    function showExportProgress(message, percent = null, kind = 'info') {
+        const status = document.getElementById('research-export-status');
+        if (!status) return;
+        status.replaceChildren();
+        status.className = `status-message ${kind} research-export-progress-status`;
+        const label = document.createElement('strong');
+        label.textContent = message;
+        const track = document.createElement('div');
+        track.className = `research-export-progress-track${percent == null ? ' indeterminate' : ''}`;
+        track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', '100');
+        const fill = document.createElement('span');
+        fill.className = 'research-export-progress-fill';
+        if (percent == null) {
+            track.setAttribute('aria-valuetext', message);
+        } else {
+            const safePercent = Math.max(0, Math.min(100, Math.round(percent)));
+            track.setAttribute('aria-valuenow', String(safePercent));
+            fill.style.setProperty('--export-progress', `${safePercent}%`);
+        }
+        track.appendChild(fill);
+        status.append(label, track);
+    }
+
+    function transferPreparedZip(url, expectedSize) {
+        return new Promise((resolve, reject) => {
+            const request = new XMLHttpRequest();
+            request.open('GET', url, true);
+            request.responseType = 'blob';
+            request.onprogress = event => {
+                const total = event.lengthComputable && event.total > 0
+                    ? event.total : expectedSize;
+                const percent = total > 0 ? event.loaded * 100 / total : null;
+                showExportProgress(
+                    percent == null
+                        ? `Downloading ZIP: ${(event.loaded / 1048576).toFixed(1)} MB`
+                        : `Downloading ZIP: ${Math.min(100, Math.round(percent))}%`,
+                    percent);
+            };
+            request.onload = () => {
+                if (request.status < 200 || request.status >= 300) {
+                    reject(new Error(`The prepared ZIP request failed (${request.status}).`));
+                    return;
+                }
+                resolve(request.response);
+            };
+            request.onerror = () => reject(
+                new Error('Chrome could not transfer the prepared ZIP from SherdScope.'));
+            request.onabort = () => reject(new Error('The ZIP transfer was cancelled.'));
+            request.send();
+        });
+    }
+
     function scheduleSave() {
         clearTimeout(state.saveTimer);
         state.settingsDirty = true;
@@ -164,8 +219,12 @@
             return;
         }
         const button = document.getElementById(kind === 'csv' ? 'research-export-csv' : 'research-export-dataset');
+        const originalButtonText = button?.textContent;
         try {
-            if (button) button.disabled = true;
+            if (button) {
+                button.disabled = true;
+                button.setAttribute('aria-busy', 'true');
+            }
             // A fast click immediately after changing a checkbox must export
             // the new selection, not the last server-saved selection.
             if (state.saveTimer) {
@@ -175,6 +234,46 @@
             const saved = state.settingsDirty ? await startSettingsSave()
                 : state.savePromise ? await state.savePromise : true;
             if (!saved) throw new Error('Export choices could not be saved. Please try again.');
+            if (kind === 'dataset') {
+                if (button) button.textContent = 'Preparing ZIP...';
+                showExportProgress('Preparing the dataset ZIP...');
+                const preparedResponse = await fetch(
+                    `/api/projects/${encodeURIComponent(pid)}/export/dataset/prepare`, {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({acronym: acronym()})
+                    });
+                const prepared = await preparedResponse.json().catch(() => ({}));
+                if (!preparedResponse.ok || !prepared.success || !prepared.download_url) {
+                    throw new Error(prepared.error || 'The dataset ZIP could not be prepared.');
+                }
+                if (!Number(prepared.size)) {
+                    throw new Error('The server prepared an empty dataset ZIP.');
+                }
+                if (button) button.textContent = 'Downloading ZIP...';
+                showExportProgress('Downloading ZIP: 0%', 0);
+                const expectedSize = Number(prepared.size);
+                const blob = await transferPreparedZip(
+                    prepared.transfer_url || prepared.download_url, expectedSize);
+                if (!blob.size || (expectedSize > 0 && blob.size !== expectedSize)) {
+                    throw new Error(
+                        `The ZIP transfer was incomplete (${blob.size} of ${expectedSize} bytes).`);
+                }
+                const objectUrl = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = objectUrl;
+                anchor.download = prepared.filename || `${acronym()}.zip`;
+                anchor.hidden = true;
+                document.body.appendChild(anchor);
+                anchor.click();
+                window.setTimeout(() => {
+                    anchor.remove();
+                    URL.revokeObjectURL(objectUrl);
+                }, 5 * 60 * 1000);
+                showExportProgress(
+                    `ZIP ready: ${(blob.size / 1048576).toFixed(1)} MB downloaded`, 100, 'success');
+                window.PyPotteryUtils.showToast('Dataset ZIP downloaded', 'success');
+                return;
+            }
             const response = await fetch(`/api/projects/${encodeURIComponent(pid)}/export/${kind}`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({acronym: acronym()})
@@ -185,16 +284,10 @@
             }
             const blob = await response.blob();
             if (!blob.size) throw new Error('The server returned an empty export. Please try again.');
-            if (kind === 'dataset') {
-                const signature = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-                if (signature[0] !== 0x50 || signature[1] !== 0x4b) {
-                    throw new Error('The downloaded dataset was not a valid ZIP file.');
-                }
-            }
             const url = URL.createObjectURL(blob);
             const anchor = document.createElement('a');
             anchor.href = url;
-            anchor.download = kind === 'csv' ? `${acronym()}_metadata.csv` : `${acronym()}.zip`;
+            anchor.download = `${acronym()}_metadata.csv`;
             document.body.appendChild(anchor);
             anchor.click();
             anchor.remove();
@@ -204,9 +297,15 @@
             window.setTimeout(() => URL.revokeObjectURL(url), 60000);
             window.PyPotteryUtils.showToast('Export downloaded', 'success');
         } catch (error) {
+            const status = document.getElementById('research-export-status');
+            if (status) textStatus(status, error.message, 'error');
             window.PyPotteryUtils.showToast(error.message, 'error');
         } finally {
-            if (button) button.disabled = false;
+            if (button) {
+                button.disabled = false;
+                button.removeAttribute('aria-busy');
+                button.textContent = originalButtonText;
+            }
         }
     }
 

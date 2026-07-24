@@ -1,5 +1,57 @@
 # Changelog
 
+## 2026-07-23
+
+### Fixed
+
+- The manual measurement endpoint editor now shows the first point immediately when automatic measurement found no usable top line. A second click or double-click creates the other endpoint, and a new **Reset endpoints** control lets the researcher start a fresh pair.
+- Row extraction now recovers a missed sequential row number only when the drawing sequence expects it and an abnormally tall physical gap contains room for it. This prevents a missed row 1 from being merged into row 2 while avoiding invented rows on continuation pages.
+- Review & Link now deduplicates figure summaries by their stable figure key in both the API and browser, preventing temporary pause/resume snapshots from displaying the same figure more than once.
+- Fixed a Review & Link request race where clicking a new figure before the previous figure detail finished loading could cache the old figure under the new figure's stable key. Stale responses and mismatched detail records are now discarded instead of replacing another sidebar figure.
+- Every visible Review & Link warning can now be individually marked as reviewed and ignored with a saved reason and optional note. Ignoring a genuinely missing table row approves and exports the remaining resolved vessels while leaving that vessel unlinked instead of writing blank table values.
+- Review & Link sidebar badges now use fresh summary status instead of stale cached figure details and continue updating while a table field is focused or has unsaved edits. The update changes only existing badge text and classes, preserving the selected page, table inputs, scrolling, overlays, and zoom.
+- Fixed completed table rereads leaving an old evidence image without column or row lines. Focus left on the Re-read button no longer freezes evidence refreshes; only focused editable fields and unsaved edits defer workspace replacement.
+- Dataset ZIP downloads now stream directly through the browser instead of first buffering the entire archive into a JavaScript Blob, avoiding intermittent zero-byte exports in embedded desktop browsers.
+- Dataset ZIPs are now completely prepared and verified on disk before Chrome receives a stable download URL. The Export button shows **Preparing ZIP…**, reports preparation errors directly, and keeps the final same-page download target alive for the transfer, preventing Chrome’s “File wasn’t available on site” failure.
+- Export now shows an indeterminate preparation bar followed by real byte-based ZIP download progress. Chrome receives the file only after SherdScope has downloaded and size-checked 100% of the prepared archive; export thumbnails also load lazily so they do not compete with the ZIP transfer.
+- Fixed Chrome exposing an empty JavaScript stream for a prepared ZIP carrying an attachment header. Progress transfers now use a separate non-attachment response and reliable browser progress events before creating the final local download.
+- Vessel-diameter Verify now saves immediately through the existing per-figure save queue. Manual endpoint and scale saves automatically retry once on the newest figure revision, preserving newer unrelated review work without making the researcher place the points again.
+- Table row and column lines are now mandatory publication-viewer evidence and remain visible through number edits, measurement changes, saves, rerenders, and vessel-box visibility changes. Active rereads show a clear recalculation message; incomplete grids show the required next action.
+- Fixed Adjust columns occasionally opening as a blank white canvas when the full-resolution table image loaded before its event handler was attached. The editor now registers loading/error handlers first and displays an explicit loading or failure message.
+- Warning review and other ordinary autosaves now preserve the server-owned table boundary, manual column override, and diagnostic references instead of silently deleting the grid without scheduling a reread.
+
+### Changed
+
+- Removed the bottom-of-screen Advanced legacy tools section from Review & Link. The hidden legacy implementation and saved-project compatibility remain intact; PaddleOCR is the normal reading path.
+
+### Tests
+
+- Full Python suite: 131 tests passed, including a regression test proving warning autosaves preserve table grids and do not queue OCR work.
+
+## 2026-07-22
+
+### Added
+
+- Added persistent per-detection vessel records containing an immutable detection ID, stable legacy-compatible vessel ID, original-page box, confidence, review state, and optional instance-mask provenance.
+- Added box-first vessel review with add, delete, move, resize, individual approval, approve-all, and a separate optional mask-evidence toggle.
+- Added original-resolution rectangular crops for approved boxes, a configurable pixel margin, and `cards/vessel_crops.json` provenance containing page coordinates, crop coordinates, confidence, identity, and mask evidence.
+- Added regression coverage for nearby and overlapping detections, reordered YOLO output, ID mismatch rejection, box editing, coordinate translation, clipped margins, unmasked crop pixels, and legacy reviewed-data migration.
+
+### Changed
+
+- Stopped merging YOLO instances as the source of vessel identity. The combined page mask remains available only as visual evidence; new card extraction reads approved vessel boxes directly.
+- Kept `page_mask_layer_N` identifiers as compatibility aliases for existing linkage, corrections, measurements, and exports while using immutable detection UUIDs internally.
+- Limited connected-component recovery to a one-time migration path for projects created before per-detection sidecars existed.
+
+### Fixed
+
+- Prevented nearby or overlapping vessels from fusing into one card or changing identity because of mask connectivity.
+- Prevented stale browser data from rebinding one detection ID to another vessel ID, and retained omitted, reviewed, deleted, or temporarily unmatched records across model reruns.
+
+### Tests
+
+- Full Python suite: 124 tests passed. Ruff, Python compilation, JavaScript syntax, diff validation, and desktop/narrow-width UI checks also passed.
+
 ## 2026-07-21
 
 ### Added

@@ -27,13 +27,13 @@ let tabularState = {
     metadataRenderedFigureSignatures: new Map(),
     metadataProfile: null,
     metadataFigureDetails: new Map(),
+    metadataLoadSequence: 0,
     metadataBackendReload: null,
     metadataStaleFigureCount: 0
 };
 
 document.addEventListener('DOMContentLoaded', () => {
     setupTabularListeners();
-    organizeAdvancedReviewTools();
     loadCurrentProject();
     
     // Listen for project changes
@@ -47,28 +47,13 @@ document.addEventListener('DOMContentLoaded', () => {
         tabularState.metadataEvidenceState.clear();
         tabularState.metadataRenderedFigureSignatures.clear();
         tabularState.metadataFigureDetails.clear();
+        tabularState.metadataLoadSequence += 1;
         tabularState.metadataSaveTimers.forEach(timer => clearTimeout(timer));
         tabularState.metadataSaveTimers.clear();
         tabularState.metadataSaveQueues.clear();
         loadProjectCards();
     });
 });
-
-function organizeAdvancedReviewTools() {
-    const tab = document.getElementById('tabular-tab');
-    const tablePanel = tab?.querySelector('.tabular-table');
-    const metadataPanel = document.getElementById('metadata-link-panel');
-    if (!tab || !tablePanel || !metadataPanel || tab.querySelector('.metadata-advanced-tools')) return;
-    const details = document.createElement('details');
-    details.className = 'metadata-advanced-tools';
-    details.innerHTML = '<summary>Advanced legacy tools</summary><div></div>';
-    const body = details.querySelector('div');
-    [tab.querySelector('.navigation-bar'), tab.querySelector('.tabular-sidebar'),
-     tab.querySelector('.tabular-image'), ...tablePanel.querySelectorAll(':scope > .form-row, :scope > .collapsible-panel, :scope > #tabular-table-container')]
-        .filter(Boolean).forEach(element => body.appendChild(element));
-    metadataPanel.insertAdjacentElement('afterend', details);
-    tab.querySelector('.tabular-layout')?.classList.add('metadata-primary-layout');
-}
 
 function loadCurrentProject() {
     if (window.projectManager && window.projectManager.getCurrentProject) {
@@ -872,13 +857,27 @@ function linkEscape(value) {
 }
 
 async function loadMetadataLinkState() {
-    if (!tabularState.currentProject?.project_id) return;
+    const projectId = String(tabularState.currentProject?.project_id || '');
+    if (!projectId) return;
+    const loadSequence = ++tabularState.metadataLoadSequence;
+    const isCurrentLoad = () => (
+        loadSequence === tabularState.metadataLoadSequence &&
+        projectId === String(tabularState.currentProject?.project_id || '')
+    );
     try {
         const data = await window.PyPotteryUtils.apiRequest(
-            `/api/projects/${tabularState.currentProject.project_id}/metadata-link/state`);
-        if (!data.success) return;
+            `/api/projects/${projectId}/metadata-link/state`);
+        if (!data.success || !isCurrentLoad()) return;
         applyMetadataProfile(data.profile);
-        const summaries = data.state?.figures || [];
+        // A paused/resumed worker can briefly expose the same stable figure
+        // through more than one in-memory snapshot. The stable key defines
+        // identity, so never render duplicate sidebar cards for that key.
+        const summariesByKey = new Map();
+        (data.state?.figures || []).forEach(figure => {
+            const key = String(figure.figure_key || figure.figure_id || '');
+            if (key) summariesByKey.set(key, figure);
+        });
+        const summaries = [...summariesByKey.values()];
         if (!summaries.some(figure =>
             (figure.figure_key || figure.figure_id) === tabularState.selectedFigureKey)) {
             const attention = summaries.find(figure => figure.needs_column_review ||
@@ -890,18 +889,47 @@ async function loadMetadataLinkState() {
             tabularState.selectedFigureKey = choice ? (choice.figure_key || choice.figure_id) : null;
         }
         if (tabularState.selectedFigureKey) {
+            // Capture the owner before awaiting the request. Selection can
+            // change while the response is in flight; using the mutable
+            // selectedFigureKey afterward used to cache the old figure under
+            // the newly selected figure's key.
+            const requestedFigureKey = String(tabularState.selectedFigureKey);
             try {
                 const detail = await window.PyPotteryUtils.apiRequest(
-                    `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(tabularState.selectedFigureKey)}`);
-                if (detail.success) tabularState.metadataFigureDetails.set(
-                    tabularState.selectedFigureKey, detail.figure);
+                    `/api/projects/${projectId}/metadata-link/figures/${encodeURIComponent(requestedFigureKey)}`);
+                if (!isCurrentLoad()) return;
+                if (detail.success) {
+                    const returnedFigureKey = String(
+                        detail.figure?.figure_key || detail.figure?.figure_id || '');
+                    if (returnedFigureKey === requestedFigureKey) {
+                        tabularState.metadataFigureDetails.set(
+                            requestedFigureKey, detail.figure);
+                    } else {
+                        tabularState.metadataFigureDetails.delete(requestedFigureKey);
+                        console.warn(
+                            'Discarded figure detail returned for the wrong stable key',
+                            {requestedFigureKey, returnedFigureKey});
+                    }
+                }
             } catch (error) {
+                if (!isCurrentLoad()) return;
                 console.warn('Could not load selected figure detail', error);
             }
         }
         const displayState = {...data.state, figures: summaries.map(summary => {
-            const key = summary.figure_key || summary.figure_id;
-            return tabularState.metadataFigureDetails.get(key) || summary;
+            const key = String(summary.figure_key || summary.figure_id || '');
+            const cached = tabularState.metadataFigureDetails.get(key);
+            const cachedKey = String(cached?.figure_key || cached?.figure_id || '');
+            if (cached && cachedKey !== key) {
+                tabularState.metadataFigureDetails.delete(key);
+                return summary;
+            }
+            // Full details are cached so tables and review edits do not need
+            // to be downloaded on every poll. Status fields in the lightweight
+            // summary are newer, however, especially for figures processed in
+            // the background. Overlay the fresh summary without removing the
+            // cached rows, drawings, warnings, or viewer data.
+            return cached ? {...cached, ...summary} : summary;
         })};
         tabularState.metadataLinkState = displayState;
         // The tabular page is commonly already open when the background OCR
@@ -1020,7 +1048,8 @@ function renderMetadataLinkState(state, active) {
         (figure.matches ? figure.matches.filter(match => match.status === 'ready').length :
          Math.max(0, Number(figure.match_count || 0) - Number(figure.unresolved_count || 0))), 0);
     const unresolved = figures.reduce((total, figure) => total +
-        (figure.matches ? figure.matches.filter(match => match.status !== 'ready').length :
+        (figure.matches ? figure.matches.filter(
+            match => !['ready', 'ignored'].includes(match.status)).length :
          Number(figure.unresolved_count || 0)), 0);
     const approved = figures.filter(figure => figure.review_status === 'approved').length;
     if (jobsElement) {
@@ -1104,9 +1133,19 @@ function renderMetadataLinkState(state, active) {
     // viewport afterward still creates a visible jump on every poll.
     const renderProject = String(tabularState.currentProject?.project_id || '');
     const hadPreviousRender = figuresContainer.dataset.renderProject === renderProject;
+    const activeElement = document.activeElement;
+    const focusedEditor = !!(
+        activeElement && figuresContainer.contains(activeElement) &&
+        activeElement.matches('input, textarea, select, [contenteditable="true"]')
+    );
     const editingCurrentFigure = hadPreviousRender && (
-        tabularState.metadataDirty.size > 0 || figuresContainer.contains(document.activeElement));
+        tabularState.metadataDirty.size > 0 || focusedEditor);
     const forcedRender = figuresContainer.dataset.forceRender === '1';
+    // Status polling must remain visible while the researcher is editing.
+    // This updates only text/classes inside existing sidebar buttons and does
+    // not replace the workspace DOM, so no input, scroll, page, overlay, or
+    // zoom state can be reset.
+    if (hadPreviousRender) updateMetadataFigureSidebar(figuresContainer, figures);
     if (editingCurrentFigure && !forcedRender) return;
     const renderedKeys = [...figuresContainer.querySelectorAll('[data-select-figure]')]
         .map(button => button.dataset.selectFigure || '');
@@ -1117,7 +1156,6 @@ function renderMetadataLinkState(state, active) {
         figuresContainer.dataset.activeFigureKey === selectedKey &&
         tabularState.metadataRenderedFigureSignatures.get(selectedKey) === selectedSignature;
     if (sameSelectedFigure) {
-        updateMetadataFigureSidebar(figuresContainer, figures);
         figures.forEach(figure => tabularState.metadataSnapshots.set(
             figure.figure_key || figure.figure_id, structuredClone(figure)));
         return;
@@ -1304,7 +1342,11 @@ function metadataWarningsMarkup(figure, disabled, reviewKey) {
             ? [['visually_confirmed_complete', 'Visually confirmed table ending']]
             : warning.code === 'missing_required_value'
                 ? [['publication_field_blank', 'Publication field is genuinely blank']]
-                : [['column_alignment_verified', 'Column alignment visually verified']];
+                : warning.code === 'column_header_fallback'
+                    ? [['column_alignment_verified', 'Column alignment visually verified']]
+                    : warning.code === 'missing_table_row'
+                        ? [['confirmed_missing_table_row', 'Reviewed — approve without this table row']]
+                        : [['reviewer_confirmed', 'Reviewed and accepted']];
         const override = overrides[warning.id] || {};
         const controls = warning.overrideable ? `<div class="metadata-link-warning-review">
             <select data-warning-reason ${disabled}>${reasonOptions.map(([value, label]) =>
@@ -1549,9 +1591,20 @@ function renderMetadataFigure(figure) {
     const pageHtml = evidencePages.map((page, pageIndex) => {
         const evidenceUrl = `/api/projects/${encodeURIComponent(projectId)}/metadata-link/evidence/${encodeURIComponent(page.image_name)}` +
             `?figure=${encodeURIComponent(reviewKey)}&kind=${page.kind}&overlay=1&measurement=${page.kind === 'drawing' ? '1' : '0'}&v=${encodeURIComponent(tabularState.metadataLinkState?.updated_at || '')}`;
+        const boundary = page.boundary || {};
+        const gridReady = page.kind !== 'table' || (
+            Array.isArray(boundary.column_bounds) && boundary.column_bounds.length > 0 &&
+            Array.isArray(boundary.row_bounds) && boundary.row_bounds.length > 0
+        );
+        const gridMessage = page.kind === 'table' && (processing || waiting || rereadJob)
+            ? 'Recalculating table rows and columns…'
+            : page.kind === 'table' && !gridReady
+                ? 'Table grid is not ready — adjust columns or re-read this figure.'
+                : '';
         return `<a href="${evidenceUrl}" data-evidence-page="${pageIndex}" ${pageIndex ? 'hidden' : ''}>
             <img src="${evidenceUrl}" data-evidence-kind="${page.kind}" alt="${linkEscape(page.image_name)}"
                  title="${linkEscape(page.kind)}: ${linkEscape(page.image_name)}">
+            ${gridMessage ? `<span class="metadata-grid-status" role="status">${linkEscape(gridMessage)}</span>` : ''}
         </a>`;
     }).join('');
     const drawingByNumber = new Map((figure.drawings || []).map(drawing =>
@@ -1603,7 +1656,8 @@ function renderMetadataFigure(figure) {
     const tablePageNames = (figure.table_pages || []).map(page => page.image_name).join(', ');
     const open = figure.status === 'needs_review' ? 'open' : '';
     const blockers = (figure.warnings || []).filter(warning => warning.blocking).length;
-    const unmatched = (figure.matches || []).filter(match => match.status !== 'ready').length;
+    const unmatched = (figure.matches || []).filter(
+        match => !['ready', 'ignored'].includes(match.status)).length;
     const calibrations = Object.entries(figure.scale_calibrations || {});
     const scaleSummary = calibrations.length ? calibrations.map(([imageName, calibration]) =>
         `<article class="metadata-scale-card"><strong>${linkEscape(imageName)}</strong>
@@ -1705,13 +1759,16 @@ function setupMetadataEvidenceViewer(figureElement) {
             const image = page.querySelector('img');
             if (!image) return;
             const url = new URL(image.src, window.location.origin);
-            url.searchParams.set('overlay', visible ? '1' : '0');
+            // Row and column lines are mandatory review evidence. Only vessel
+            // boxes on drawing pages follow the optional visibility control.
+            const isTable = image.dataset.evidenceKind === 'table';
+            url.searchParams.set('overlay', isTable || visible ? '1' : '0');
             image.src = url.pathname + url.search;
             page.href = image.src;
         });
         if (overlayButton) {
             overlayButton.dataset.hidden = visible ? '0' : '1';
-            overlayButton.textContent = visible ? 'Hide boxes' : 'Show boxes';
+            overlayButton.textContent = visible ? 'Hide vessel boxes' : 'Show vessel boxes';
         }
     };
     const showPage = delta => {
@@ -1835,8 +1892,9 @@ async function openMetadataColumnEditor(figureId, imageName) {
     const ctx = canvas.getContext('2d');
     const output = dialog.querySelector('[data-column-output]');
     const image = new Image();
-    image.src = `/api/projects/${tabularState.currentProject.project_id}/metadata-link/evidence/${encodeURIComponent(imageName)}` +
+    const editorImageUrl = `/api/projects/${tabularState.currentProject.project_id}/metadata-link/evidence/${encodeURIComponent(imageName)}` +
         `?figure=${encodeURIComponent(figureId)}&kind=table&overlay=0&full=1&v=${Date.now()}`;
+    output.textContent = 'Loading full-resolution table image…';
     let selected = 0;
     let dragging = false;
     const padding = Math.max(18, imageWidth * .01);
@@ -1859,7 +1917,7 @@ async function openMetadataColumnEditor(figureId, imageName) {
         return view[0] + (event.clientX - rect.left) / rect.width * (view[2] - view[0]);
     };
     const redraw = () => {
-        if (!image.complete) return;
+        if (!image.complete || !image.naturalWidth || !image.naturalHeight) return;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(image, view[0], view[1], view[2] - view[0], view[3] - view[1],
             0, 0, canvas.width, canvas.height);
@@ -1902,7 +1960,16 @@ async function openMetadataColumnEditor(figureId, imageName) {
         const amount = event.shiftKey ? 5 : 1;
         moveSelected(imageX(edges[selected]) + (event.key === 'ArrowLeft' ? -amount : amount));
     });
+    // Register both outcomes before assigning src. A cached/fast local image
+    // can finish synchronously enough that attaching the listener afterward
+    // misses the event and leaves the default white canvas forever.
     image.addEventListener('load', () => { resize(); redraw(); });
+    image.addEventListener('error', () => {
+        output.textContent = 'The table image could not be loaded. Close this editor and try again.';
+        output.classList.add('failed');
+        dialog.querySelector('[data-column-save]').disabled = true;
+    });
+    image.src = editorImageUrl;
     dialog.querySelector('[data-column-save]').addEventListener('click', async event => {
         const button = event.currentTarget;
         try {
@@ -2177,7 +2244,7 @@ function synchronizeDiameterInputs(source, userEdited = true) {
     scheduleMetadataAutosave(figureEl.dataset.linkFigure);
 }
 
-function verifyMetadataDiameter(button) {
+async function verifyMetadataDiameter(button) {
     const figureEl = button.closest('[data-link-figure]');
     const input = figureEl?.querySelector(`[data-link-diameter][data-mask-file="${CSS.escape(button.dataset.maskFile)}"]`);
     if (!input || !Number.isFinite(Number(input.value)) || Number(input.value) <= 0) {
@@ -2188,6 +2255,17 @@ function verifyMetadataDiameter(button) {
     synchronizeDiameterInputs(input, false);
     figureEl.querySelectorAll(`[data-mask-file="${CSS.escape(button.dataset.maskFile)}"] .metadata-measure-status`)
         .forEach(status => { status.textContent = 'Manually corrected'; status.className = 'metadata-measure-status verified_manual'; });
+    const figureId = figureEl.dataset.linkFigure;
+    clearTimeout(tabularState.metadataSaveTimers.get(figureId));
+    tabularState.metadataSaveTimers.delete(figureId);
+    try {
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+        await saveMetadataFigure(figureId, false, true);
+    } finally {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+    }
 }
 
 function setupMetadataTableNavigation(figureEl) {
@@ -2261,13 +2339,13 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
     dialog.className = 'metadata-measure-dialog';
     dialog.innerHTML = `<form method="dialog"><header><div><strong>${mode === 'rim' ? 'Correct rim diameter' : 'Correct 10 cm scale'}</strong>
         <span>${linkEscape(imageName)}</span></div><button value="cancel" aria-label="Close">×</button></header>
-        <p>Drag either endpoint. If no endpoints exist, click twice on the image.</p>
+                    <p>Drag an existing endpoint, or click twice (or double-click) to create a new pair. The first point stays visible while you place the second.</p>
         <div class="metadata-measure-canvas-wrap"><canvas></canvas></div>
         <footer><output data-measure-output></output><div class="metadata-measure-zoom-controls">
             <button type="button" data-measure-zoom-out>Zoom out</button>
             <button type="button" data-measure-fit>Fit evidence</button>
             <button type="button" data-measure-zoom-in>Zoom in</button>
-        </div><button type="button" data-measure-save>Save and verify</button></footer></form>`;
+        </div><button type="button" data-measure-reset>Reset endpoints</button><button type="button" data-measure-save>Save and verify</button></footer></form>`;
     document.body.appendChild(dialog);
     const canvas = dialog.querySelector('canvas');
     const context = canvas.getContext('2d');
@@ -2341,7 +2419,7 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
             view[0] * sourceScaleX, view[1] * sourceScaleY,
             (view[2] - view[0]) * sourceScaleX, (view[3] - view[1]) * sourceScaleY,
             0, 0, canvas.width, canvas.height);
-        if (points.length === 2) {
+        if (points.length) {
             const sx = canvas.width / (view[2] - view[0]);
             const sy = canvas.height / (view[3] - view[1]);
             const screenPoint = point => [(point[0] - view[0]) * sx, (point[1] - view[1]) * sy];
@@ -2349,8 +2427,10 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
             context.strokeStyle = mode === 'scale'
                 ? 'rgba(22, 163, 74, .78)' : 'rgba(14, 165, 233, .78)';
             context.lineWidth = 1.5;
-            context.beginPath(); context.moveTo(...rendered[0]);
-            context.lineTo(...rendered[1]); context.stroke();
+            if (rendered.length === 2) {
+                context.beginPath(); context.moveTo(...rendered[0]);
+                context.lineTo(...rendered[1]); context.stroke();
+            }
             rendered.forEach((point, index) => {
                 context.beginPath();
                 context.arc(point[0], point[1], dragIndex === index ? 6 : 4, 0, Math.PI * 2);
@@ -2374,7 +2454,7 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
         return [view[0] + (event.clientX - rect.left) * (view[2] - view[0]) / rect.width,
                 view[1] + (event.clientY - rect.top) * (view[3] - view[1]) / rect.height];
     };
-    canvas.addEventListener('pointerdown', event => {
+    const placeEndpoint = event => {
         const point = eventPoint(event);
         if (points.length < 2) { points.push(point); dragIndex = points.length - 1; }
         else {
@@ -2382,14 +2462,34 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
             dragIndex = distances[0] <= distances[1] ? 0 : 1;
             points[dragIndex] = point;
         }
-        canvas.setPointerCapture(event.pointerId); redraw();
-    });
+        if (event.pointerId != null && canvas.setPointerCapture) {
+            canvas.setPointerCapture(event.pointerId);
+        }
+        redraw();
+    };
+    canvas.addEventListener('pointerdown', placeEndpoint);
     canvas.addEventListener('pointermove', event => {
         if (dragIndex < 0) return;
         points[dragIndex] = eventPoint(event); redraw();
     });
-    canvas.addEventListener('pointerup', () => { dragIndex = -1; redraw(); });
+    canvas.addEventListener('pointerup', event => {
+        dragIndex = -1;
+        if (event.pointerId != null && canvas.hasPointerCapture?.(event.pointerId)) {
+            canvas.releasePointerCapture(event.pointerId);
+        }
+        redraw();
+    });
     canvas.addEventListener('pointercancel', () => { dragIndex = -1; redraw(); });
+    canvas.addEventListener('dblclick', event => {
+        // Most browsers dispatch two pointer events before dblclick. This
+        // fallback also supports inputs that deliver only a double-click.
+        event.preventDefault();
+        if (points.length < 2) {
+            placeEndpoint(event);
+            dragIndex = -1;
+            redraw();
+        }
+    });
     const zoom = factor => {
         if (!view) return;
         const centreX = (view[0] + view[2]) / 2;
@@ -2406,6 +2506,11 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
         if (!fitView) return;
         view = [...fitView]; resizeCanvas(); redraw();
     });
+    dialog.querySelector('[data-measure-reset]').addEventListener('click', () => {
+        points = [];
+        dragIndex = -1;
+        redraw();
+    });
     dialog.querySelector('[data-measure-save]').addEventListener('click', async () => {
         if (points.length !== 2) return;
         const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
@@ -2416,12 +2521,59 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
         }};
         else body.measurements = {[maskFile]: {rim_endpoints: points}};
         try {
-            const response = await window.PyPotteryUtils.apiRequest(
-                `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}`,
-                {method: 'PATCH', body: JSON.stringify(body)});
+            const saveButton = dialog.querySelector('[data-measure-save]');
+            saveButton.disabled = true;
+            saveButton.setAttribute('aria-busy', 'true');
+            const saveMeasurement = async allowRevisionRetry => {
+                const raw = await fetch(
+                    `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}`, {
+                        method: 'PATCH',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(body)
+                    });
+                const response = await raw.json().catch(() => ({}));
+                if (raw.status === 409 && response.conflict &&
+                        response.figure && allowRevisionRetry) {
+                    // Endpoint/scale edits touch only the submitted
+                    // measurement. Safely layer them onto the newest figure
+                    // revision instead of asking the researcher to reopen the
+                    // editor and place the same points again.
+                    body.reviewer_revision = Number(response.reviewer_revision || 0);
+                    if (figureEl) {
+                        figureEl.dataset.reviewerRevision =
+                            String(body.reviewer_revision);
+                    }
+                    const index = tabularState.metadataLinkState?.figures.findIndex(
+                        item => (item.figure_key || item.figure_id) === figureId);
+                    if (index >= 0) {
+                        tabularState.metadataLinkState.figures[index] = response.figure;
+                    }
+                    tabularState.metadataFigureDetails.set(figureId, response.figure);
+                    tabularState.metadataSnapshots.set(
+                        figureId, structuredClone(response.figure));
+                    return saveMeasurement(false);
+                }
+                if (!raw.ok || !response.success) {
+                    throw new Error(response.error || 'Could not save measurement');
+                }
+                return response;
+            };
+            const response = await saveMeasurement(true);
             if (!response.success) throw new Error(response.error || 'Could not save measurement');
+            if (figureEl) {
+                figureEl.dataset.reviewerRevision =
+                    String(response.reviewer_revision || body.reviewer_revision);
+            }
+            tabularState.metadataFigureDetails.set(figureId, response.figure);
+            tabularState.metadataSnapshots.set(
+                figureId, structuredClone(response.figure));
             dialog.close(); dialog.remove(); await loadMetadataLinkState();
-        } catch (error) { window.PyPotteryUtils.showToast(error.message, 'error'); }
+        } catch (error) {
+            const saveButton = dialog.querySelector('[data-measure-save]');
+            saveButton.disabled = false;
+            saveButton.removeAttribute('aria-busy');
+            window.PyPotteryUtils.showToast(error.message, 'error');
+        }
     });
     dialog.addEventListener('close', () => dialog.remove());
     dialog.showModal();
@@ -2657,7 +2809,8 @@ function updateMetadataReadinessFromFigure(figureId, figure) {
     const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
     if (!figureEl) return;
     const blockers = (figure.warnings || []).filter(warning => warning.blocking).length;
-    const unmatched = (figure.matches || []).filter(match => match.status !== 'ready').length;
+    const unmatched = (figure.matches || []).filter(
+        match => !['ready', 'ignored'].includes(match.status)).length;
     const readiness = figureEl.querySelector('.metadata-link-readiness');
     if (readiness) {
         readiness.classList.toggle('ready', !blockers && !unmatched);
@@ -2758,7 +2911,10 @@ function validateMetadataFigureDom(figureId) {
     });
     drawingInputs.forEach(input => {
         const value = input.value.trim();
-        if (value && !rowCounts.has(value)) hasDraftBlocker = true;
+        const ignoredMissingRow = value && [...figureEl.querySelectorAll(
+            '[data-warning-code="missing_table_row"][data-override-active="1"]'
+        )].some(card => card.dataset.warningRow === value);
+        if (value && !rowCounts.has(value) && !ignoredMissingRow) hasDraftBlocker = true;
     });
     if (hasDraftBlocker) {
         const approve = figureEl.querySelector('[data-link-approve]');

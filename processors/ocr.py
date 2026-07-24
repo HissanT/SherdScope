@@ -34,7 +34,7 @@ from catalog.profiles import HESBAN_COLUMN_SPECS
 
 # Stored with every page boundary so a project can distinguish current OCR
 # results from results produced by an older long-running desktop server.
-OCR_EXTRACTOR_VERSION = "hesban-columns-v3"
+OCR_EXTRACTOR_VERSION = "hesban-columns-v4"
 
 
 class OCRUnavailableError(RuntimeError):
@@ -903,6 +903,124 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
         return selected
 
     @staticmethod
+    def _recover_sequential_row_anchors(
+            anchors: list[tuple[str, OCRToken]],
+            expected_numbers: list[str],
+            data_height: int,
+            ) -> tuple[list[tuple[str, OCRToken]], list[dict[str, Any]]]:
+        """Recover a missed numbered row only when sequence and spacing agree.
+
+        A narrow printed ``1`` can be missed while the text in that row is
+        still read perfectly.  In that case the following row becomes roughly
+        twice its normal height.  This recovery uses the figure's drawing
+        numbers as the allowed sequence and the other row anchors on this page
+        as its geometric scale.  It therefore cannot invent a number that is
+        absent from the reviewed drawings, and it does not prepend 1..n to a
+        continuation page whose first anchor is near the top.
+        """
+        ordered = sorted(anchors, key=lambda item: item[1].center_y)
+        if len(ordered) < 2 or data_height <= 0:
+            return ordered, []
+
+        expected: set[int] = set()
+        for value in expected_numbers:
+            normalized = normalize_vessel_number(value)
+            if re.fullmatch(r"\d+", normalized):
+                number = int(normalized)
+                if number > 0:
+                    expected.add(number)
+        if not expected:
+            return ordered, []
+
+        numbered: list[tuple[int, OCRToken]] = []
+        for value, token in ordered:
+            if re.fullmatch(r"\d+", value):
+                numbered.append((int(value), token))
+        if len(numbered) < 2:
+            return ordered, []
+
+        consecutive_gaps = [
+            right.center_y - left.center_y
+            for (left_number, left), (right_number, right)
+            in zip(numbered, numbered[1:])
+            if right_number == left_number + 1 and right.center_y > left.center_y
+        ]
+        if not consecutive_gaps:
+            return ordered, []
+        typical_gap = float(median(consecutive_gaps))
+        typical_height = float(median(token.height for _, token in numbered))
+        if typical_gap <= max(4.0, typical_height):
+            return ordered, []
+
+        recovered: list[tuple[str, OCRToken]] = []
+        events: list[dict[str, Any]] = []
+
+        def add_missing(number: int, center_y: float, reason: str) -> None:
+            if number not in expected:
+                return
+            reference = min(numbered, key=lambda item: abs(item[1].center_y-center_y))[1]
+            half_height = max(4.0, min(reference.height, typical_height) / 2)
+            top = max(0.0, center_y-half_height)
+            bottom = min(float(data_height), center_y+half_height)
+            if bottom <= top:
+                return
+            token = OCRToken(
+                str(number), 0.0,
+                (reference.bbox[0], top, reference.bbox[2], bottom),
+            )
+            recovered.append((str(number), token))
+            events.append({
+                "code": "sequential_row_anchor_recovered",
+                "row": str(number),
+                "reason": reason,
+                "center_y": round(center_y),
+                "typical_row_gap": round(typical_gap, 2),
+            })
+
+        first_number, first_token = numbered[0]
+        leading_missing = list(range(1, first_number))
+        if (leading_missing and all(number in expected for number in leading_missing)
+                and first_token.center_y >=
+                typical_gap * (len(leading_missing) + .35)):
+            # Enough real image space exists above the first accepted anchor
+            # for every missing row. A continuation page beginning near its
+            # top fails this test even if its first printed number is large.
+            for offset, number in enumerate(reversed(leading_missing), 1):
+                add_missing(
+                    number,
+                    first_token.center_y - typical_gap * offset,
+                    "The first accepted row was abnormally tall and the expected "
+                    "number sequence had a gap above it.",
+                )
+
+        for (left_number, left_token), (right_number, right_token) in zip(
+                numbered, numbered[1:]):
+            numeric_gap = right_number - left_number
+            if numeric_gap <= 1:
+                continue
+            missing = list(range(left_number + 1, right_number))
+            physical_gap = right_token.center_y - left_token.center_y
+            if (not all(number in expected for number in missing)
+                    or physical_gap < typical_gap * (numeric_gap - .35)):
+                continue
+            step = physical_gap / numeric_gap
+            for offset, number in enumerate(missing, 1):
+                add_missing(
+                    number,
+                    left_token.center_y + step * offset,
+                    "Neighbouring row numbers skipped an expected value and the "
+                    "physical gap contained room for the missing row.",
+                )
+
+        if not recovered:
+            return ordered, []
+        existing = {number for number, _ in ordered}
+        combined = ordered + [
+            item for item in recovered if item[0] not in existing
+        ]
+        return sorted(combined, key=lambda item: item[1].center_y), events
+
+    @staticmethod
     def _row_bounds(
             anchors: list[tuple[str, OCRToken]], data_height: int
             ) -> list[tuple[str, int, int]]:
@@ -1139,6 +1257,8 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             conflicts_out=row_anchor_conflicts)
         if not anchors:
             return {"is_table": False, "rows": [], "boundary": boundary.as_dict()}
+        anchors, recovered_row_anchors = self._recover_sequential_row_anchors(
+            anchors, expected_numbers, data_image.height)
         row_bounds = self._row_bounds(anchors, data_image.height)
         requested_numbers = {
             normalize_vessel_number(number) for number in expected_numbers
@@ -1150,6 +1270,14 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
             "message": (f"Competing row numbers at the same position were resolved as "
                         f"{conflict['chosen']} without creating an extra row."),
         } for conflict in row_anchor_conflicts]
+        warnings.extend({
+            "code": "sequential_row_anchor_recovered",
+            "row": event["row"],
+            "message": (
+                f"Recovered missing row {event['row']} from the expected number "
+                "sequence and an abnormally large physical row gap."
+            ),
+        } for event in recovered_row_anchors)
         cell_images: list[Image.Image] = []
         cell_targets: list[tuple[dict[str, str], str, dict[str, Any]]] = []
         ocr_diagnostics: list[dict[str, Any]] = []
@@ -1389,11 +1517,15 @@ class PaddleOCRStructuredExtractor(StructuredExtractor):
                         bbox[2] + page_x, bbox[3] + page_y,
                     ]
         boundary_data["row_anchor_conflicts"] = row_anchor_conflicts
+        for event in recovered_row_anchors:
+            event["center_y"] += page_y
+        boundary_data["recovered_row_anchors"] = recovered_row_anchors
         boundary_data["diagnostic_status"] = {
             "code": "cell_grid_ready",
             "message": (f"Saved diagnostics for {len(rows)} rows and "
                         f"{len(HESBAN_TABLE_COLUMNS)} columns."),
             "row_anchor_conflicts": len(row_anchor_conflicts),
+            "recovered_row_anchors": len(recovered_row_anchors),
         }
         for cell in cell_diagnostics:
             for crop_key in ("crop", "focused_crop"):

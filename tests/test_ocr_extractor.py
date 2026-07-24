@@ -656,6 +656,69 @@ def test_row_bounds_start_at_data_rule_and_split_before_next_number():
     ]
 
 
+def test_missing_first_row_anchor_is_recovered_from_sequence_and_tall_gap():
+    anchors = [
+        ("2", OCRToken("2", .99, (0, 220, 12, 240))),
+        ("3", OCRToken("3", .99, (0, 320, 12, 340))),
+        ("4", OCRToken("4", .99, (0, 420, 12, 440))),
+    ]
+
+    recovered, events = (
+        PaddleOCRStructuredExtractor._recover_sequential_row_anchors(
+            anchors, ["1", "2", "3", "4"], 600))
+
+    assert [number for number, _ in recovered] == ["1", "2", "3", "4"]
+    assert [event["row"] for event in events] == ["1"]
+    bounds = PaddleOCRStructuredExtractor._row_bounds(recovered, 600)
+    assert bounds[0][0] == "1"
+    assert bounds[0][2] == bounds[1][1]
+
+
+def test_missing_middle_anchor_is_recovered_only_when_physical_gap_is_tall():
+    anchors = [
+        ("1", OCRToken("1", .99, (0, 40, 12, 60))),
+        ("3", OCRToken("3", .99, (0, 240, 12, 260))),
+        ("4", OCRToken("4", .99, (0, 340, 12, 360))),
+    ]
+
+    recovered, events = (
+        PaddleOCRStructuredExtractor._recover_sequential_row_anchors(
+            anchors, ["1", "2", "3", "4"], 500))
+
+    assert [number for number, _ in recovered] == ["1", "2", "3", "4"]
+    assert [event["row"] for event in events] == ["2"]
+
+
+def test_continuation_page_does_not_invent_all_earlier_rows():
+    anchors = [
+        ("20", OCRToken("20", .99, (0, 15, 16, 35))),
+        ("21", OCRToken("21", .99, (0, 115, 16, 135))),
+        ("22", OCRToken("22", .99, (0, 215, 16, 235))),
+    ]
+
+    recovered, events = (
+        PaddleOCRStructuredExtractor._recover_sequential_row_anchors(
+            anchors, [str(number) for number in range(1, 23)], 500))
+
+    assert [number for number, _ in recovered] == ["20", "21", "22"]
+    assert events == []
+
+
+def test_sequence_does_not_invent_row_absent_from_expected_drawings():
+    anchors = [
+        ("1", OCRToken("1", .99, (0, 40, 12, 60))),
+        ("3", OCRToken("3", .99, (0, 240, 12, 260))),
+        ("4", OCRToken("4", .99, (0, 340, 12, 360))),
+    ]
+
+    recovered, events = (
+        PaddleOCRStructuredExtractor._recover_sequential_row_anchors(
+            anchors, ["1", "3", "4"], 500))
+
+    assert [number for number, _ in recovered] == ["1", "3", "4"]
+    assert events == []
+
+
 def test_initial_ocr_pass_keeps_unexpected_rows_for_validation(tmp_path):
     image_path = tmp_path / "table.jpg"
     make_table_image(image_path)
