@@ -340,8 +340,9 @@
                 <button class="tab-button" data-tab="pdf">1. PDF document processing</button>
                 <button class="tab-button" data-tab="model">2. Apply Model</button>
                 <button class="tab-button" data-tab="annotation">3. Review Vessel Boxes</button>
-                <button class="tab-button" data-tab="tabular">4. Review &amp; Link</button>
-                <button class="tab-button" data-tab="export">5. Export</button>
+                <button class="tab-button" data-tab="profiles">4. Review Profiles</button>
+                <button class="tab-button" data-tab="tabular">5. Review &amp; Link</button>
+                <button class="tab-button" data-tab="export">6. Export</button>
             </div>
 
             <!-- Tab Content -->
@@ -637,6 +638,85 @@
                     </div>
                 </div>
 
+                <!-- Profile Review Tab -->
+                <div class="tab-content" id="profiles-tab">
+                    <div class="tab-layout profile-review-layout">
+                        <div class="controls-panel">
+                            <div class="control-group">
+                                <h3>Diagnostic Profiles (<span id="profile-review-count">0</span>)</h3>
+                                <button class="btn btn-primary btn-block" id="profile-generate-btn">
+                                    Generate profile proposals
+                                </button>
+                                <label class="annotation-vessels-filter profile-filter">
+                                    <input type="checkbox" id="profile-unresolved-only" checked>
+                                    <span>Needs review only</span>
+                                </label>
+                                <div id="profile-review-summary" class="status-message"></div>
+                            </div>
+                            <div class="control-group profile-review-list-wrap">
+                                <div id="profile-review-list" class="annotation-image-list"></div>
+                            </div>
+                        </div>
+
+                        <div class="preview-panel">
+                            <div id="profile-empty-msg" class="empty-message">
+                                <h3>No crop selected</h3>
+                                <p>Extract approved crops first, then generate profile proposals.</p>
+                            </div>
+                            <div id="profile-editor" class="profile-editor" style="display:none;">
+                                <div class="profile-editor-header">
+                                    <div>
+                                        <strong id="profile-current-name">No crop</strong>
+                                        <span id="profile-current-status" class="profile-status-pill">not generated</span>
+                                    </div>
+                                    <div class="profile-actions">
+                                        <button class="btn btn-secondary" id="profile-back-btn" disabled>Back</button>
+                                        <button class="btn btn-secondary" id="profile-undo-btn" disabled>Undo</button>
+                                        <button class="btn btn-secondary" id="profile-zoom-out-btn">Zoom out</button>
+                                        <button class="btn btn-secondary" id="profile-zoom-in-btn">Zoom blob</button>
+                                        <button class="btn btn-secondary" id="profile-zoom-fit-btn">Fit</button>
+                                        <button class="btn btn-success" id="profile-approve-btn">Approve</button>
+                                        <button class="btn btn-secondary" id="profile-save-edit-btn">Save edit</button>
+                                        <button class="btn btn-secondary" id="profile-reset-btn">Reset auto</button>
+                                        <button class="btn btn-danger" id="profile-no-profile-btn">No profile</button>
+                                    </div>
+                                </div>
+
+                                <div class="profile-workspace">
+                                    <div class="profile-canvas-card">
+                                        <div class="profile-canvas-title">Original crop with editable profile overlay</div>
+                                        <div id="profile-canvas-wrap" class="profile-canvas-wrap">
+                                            <canvas id="profile-canvas"></canvas>
+                                        </div>
+                                    </div>
+                                    <div class="profile-canvas-card">
+                                        <div class="profile-canvas-title">Accepted profile mask</div>
+                                        <img id="profile-mask-preview" class="profile-mask-preview" alt="Accepted profile mask">
+                                    </div>
+                                </div>
+
+                                <div class="editor-controls profile-tools">
+                                    <div class="control-cluster">
+                                        <button class="btn btn-tool active" id="profile-brush-tool" data-profile-tool="brush">Brush</button>
+                                        <button class="btn btn-tool" id="profile-eraser-tool" data-profile-tool="eraser">Eraser</button>
+                                        <button class="btn btn-tool" id="profile-branch-tool" data-profile-tool="branch">Remove branch</button>
+                                        <button class="btn btn-tool" id="profile-rect-tool" data-profile-tool="rect">Rerun rectangle</button>
+                                    </div>
+                                    <label class="size-control">Size <input type="range" id="profile-brush-size" min="4" max="80" value="22"></label>
+                                </div>
+
+                                <div class="profile-evidence">
+                                    <div><strong>Confidence:</strong> <span id="profile-confidence">-</span></div>
+                                    <div><strong>Reasons:</strong> <span id="profile-reasons">-</span></div>
+                                    <label>Review note
+                                        <textarea id="profile-review-note" class="form-control" rows="2"></textarea>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Tabular Tab -->
                 <div class="tab-content" id="tabular-tab">
                     <h2>Review &amp; Link</h2>
@@ -835,6 +915,12 @@
                             <label class="export-search">Search masks
                                 <input id="research-export-search" class="form-control" placeholder="Figure, number, or vessel type">
                             </label>
+                            <label class="export-image-mode">Image export
+                                <select id="research-export-image-mode" class="form-control">
+                                    <option value="vessel">Whole vessel crops</option>
+                                    <option value="profile">Side profile masks only</option>
+                                </select>
+                            </label>
                             <button class="btn btn-secondary" id="research-export-select-all">Include all</button>
                             <button class="btn btn-secondary" id="research-export-clear-all">Clear selection</button>
                             <span id="research-export-save-status">Saved</span>
@@ -901,6 +987,7 @@
     <script src="/static/js/pdf-tab.js?v=20260719"></script>
     <script src="/static/js/model-tab.js?v=20251024163500"></script>
     <script src="/static/js/annotation-tab.js?v=20251024163500"></script>
+    <script src="/static/js/profiles-tab.js?v=20260724"></script>
     <script src="/static/js/tabular-tab.js?v=20260719"></script>
     <script src="/static/js/export-tab.js?v=20260719"></script>
     <script src="/static/js/main.js?v=20260716"></script>

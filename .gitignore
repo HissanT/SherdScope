@@ -18,6 +18,7 @@ projects/
 outputs/
 pdf2img_outputs/
 uploads/
+tmp/
 logs/
 !logs/
 logs/*

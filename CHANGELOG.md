@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-07-24
+
+### Added
+
+- Added a **Profiles** workspace that turns approved rectangular vessel crops
+  into diagnostic side-profile mask proposals for later shape-retrieval
+  research.
+- Added thick-body segmentation that uses strict and loose ink thresholds,
+  distance-transform support, hole filling, and thin-branch removal to retain
+  the filled ceramic cross-section while suppressing attached diameter and
+  construction lines.
+- Added reviewer tools for zooming, drawing and erasing mask pixels, removing a
+  thin connected branch, rerunning segmentation inside a selected rectangle,
+  undoing edits, approving a proposal, saving an edited mask, or marking a crop
+  as having no usable profile.
+- Stored automatic proposals separately from accepted masks and persisted
+  proposal confidence, reasons, algorithm version, review status, and notes in
+  `profile_review.json`.
+- Added export support for choosing either whole-vessel crops or accepted
+  side-profile masks. Profile exports retain the linked catalogue metadata and
+  identify the image mode and profile-review status.
+
+### Validation
+
+- Manually reviewed approximately 50 varied Hesban profiles. About half were
+  accepted without correction and the other half required only minor edits
+  averaging approximately 10 seconds each; none in this pilot required full
+  manual reconstruction.
+- Focused profile-segmentation suite: 7 tests passed, covering connected thin
+  lines, thin stubs, faint-outline restoration, ambiguous thick candidates,
+  persistence, reviewed-mask protection, and explicit forced regeneration.
+
 ## 2026-07-23
 
 ### Fixed

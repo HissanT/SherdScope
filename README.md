@@ -47,7 +47,10 @@ real-corpus validation. The current workflow can:
 - approve figures individually and withhold ambiguous joins;
 - preserve the publication grid and reviewer warning decisions through ordinary
   saves without unnecessarily rerunning OCR; and
-- export a clean 25-column research CSV or a complete dataset ZIP with visible
+- propose a clean diagnostic side-profile mask from each approved vessel crop,
+  then let the researcher approve it or make a quick mask correction; and
+- export a clean 25-column research CSV or a complete dataset ZIP containing
+  either whole-vessel crops or accepted side-profile masks, with visible
   preparation and byte-transfer progress.
 
 PaddleOCR and OpenCV run locally. Generative AI and paid API calls are not
@@ -134,9 +137,23 @@ the same public identity. Rerunning the model matches detections back to these
 records; reviewed, deleted, and unmatched records are retained rather than
 silently renumbered.
 
-This stage only prepares clean bounding-box crops for later diagnostic-profile
-research. Diagnostic-blob separation and profile matching are not implemented
-here.
+After extracting approved crops, open **Profiles** to generate diagnostic
+side-profile proposals. The proposal algorithm searches for the thick filled
+ceramic cross-section, fills its interior, restores faint boundary ink, and
+suppresses thin connected construction or diameter lines. The original crop,
+automatic proposal, and researcher-accepted mask remain separate.
+
+Reviewers can approve a clean proposal immediately, draw or erase mask pixels,
+remove a thin attached branch, rerun the proposal inside a selected rectangle,
+undo edits, or mark a crop as having no usable profile. Review status,
+confidence, diagnostic reasons, notes, and algorithm version are stored in
+`cards/profile_review.json`; accepted masks are stored under
+`cards/profiles/accepted/`.
+
+A manual pilot on approximately 50 varied Hesban profiles found that about half
+were immediately acceptable and the other half needed only minor corrections
+averaging approximately 10 seconds. This is a development workflow result, not
+a corpus-wide segmentation-accuracy estimate.
 
 SherdScope records PDF-page order in `page_manifest.json`, including split-page
 information where applicable.
@@ -383,7 +400,7 @@ Implementation is grouped by responsibility:
 
 - `app.py` - the obvious Flask entry point and application API assembly;
 - `catalog/` - figure/table linkage, measurements, sidecar persistence, and
-  clean research-dataset export;
+  diagnostic-profile segmentation, and clean research-dataset export;
 - `processors/` - PDF rendering, OCR, model architecture, and the image
   processing pipeline;
 - `routes/` - focused Flask route groups;
@@ -399,7 +416,10 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed implementation history.
   other catalogue layouts will require their own profiles.
 - Automatic segmentation, small-cell OCR, scale calibration, and rim diameter
   can still require manual correction on poor scans.
-- SherdScope currently builds the reviewed reference corpus. It does not yet
+- Diagnostic-profile proposals still require researcher approval. Thick
+  decoration or construction marks that touch the ceramic body can require
+  erasing or a rectangle-limited rerun.
+- SherdScope now prepares reviewed reference-profile masks, but it does not yet
   take a photographed sherd and return ranked matches.
 - The next planned research stage is to represent each cross-section as
   exterior, interior, and fracture curves; exclude the accidental fracture from

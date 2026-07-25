@@ -52,6 +52,9 @@ class TabManager {
                 case 'annotation':
                     await refreshAnnotationTab();
                     break;
+                case 'profiles':
+                    await refreshProfilesTab();
+                    break;
                 case 'tabular':
                     await refreshTabularTab();
                     break;
@@ -124,6 +127,15 @@ async function refreshAnnotationTab() {
         }
     } catch (error) {
         console.error('Error refreshing annotation tab:', error);
+    }
+}
+
+async function refreshProfilesTab() {
+    console.log('Refreshing profile review tab...');
+    if (window.loadProfileReview) {
+        await window.loadProfileReview();
+    } else {
+        console.warn('loadProfileReview function not available');
     }
 }
 
@@ -218,6 +230,7 @@ window.PyPotteryApp = {
     refreshProjectsTab,
     refreshModelTab,
     refreshAnnotationTab,
+    refreshProfilesTab,
     refreshTabularTab,
     refreshExportTab,
     updateTabsState

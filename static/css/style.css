@@ -2304,13 +2304,14 @@ body {
 .research-export-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 2rem; }
 .export-acronym-field { width: min(270px, 100%); font-weight: 600; color: #344054; }
 .export-acronym-field small { display: block; margin-top: .25rem; color: #667085; font-weight: 400; }
-.research-export-summary { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: .75rem; margin: 1rem 0; }
+.research-export-summary { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: .75rem; margin: 1rem 0; }
 .research-export-summary > div { padding: 1rem; background: #fff; border: 1px solid #d9dee8; border-radius: 8px; }
 .research-export-summary strong { display: block; font-size: 1.55rem; color: #172033; }
 .research-export-summary span { color: #667085; font-size: .82rem; }
 .research-export-panel { margin: 1rem 0; padding: 1rem; background: #fff; border: 1px solid #d9dee8; border-radius: 9px; }
 .research-export-toolbar { display: flex; align-items: end; gap: .55rem; margin-bottom: .9rem; }
 .export-search { flex: 1; color: #344054; font-weight: 600; }
+.export-image-mode { min-width: 205px; color: #344054; font-weight: 600; }
 #research-export-save-status { color: #667085; font-size: .82rem; }
 .research-export-masks { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: .65rem; max-height: 420px; overflow-y: auto; }
 .research-export-mask { display: grid; grid-template-columns: auto 64px 1fr; align-items: center; gap: .65rem; padding: .65rem; border: 1px solid #d9dee8; border-radius: 7px; cursor: pointer; }
@@ -2505,6 +2506,126 @@ body {
     .vessel-boxes-header { padding-right: 0; }
     .vessel-boxes-header #approve-all-boxes { position: static; margin-top: 6px; }
     .vessel-box-item { flex-wrap: wrap; }
+}
+
+.profile-review-layout {
+    grid-template-columns: 235px minmax(0, 1fr);
+    gap: 1rem;
+}
+.profile-review-layout .controls-panel {
+    min-width: 0;
+    gap: .9rem;
+}
+.profile-review-layout .control-group {
+    padding: .9rem;
+}
+.profile-filter {
+    margin-top: .75rem;
+}
+.profile-review-list-wrap {
+    flex: 1;
+    min-height: 0;
+}
+.profile-list-item small {
+    margin-left: auto;
+    color: var(--text-secondary);
+    font-size: .75rem;
+}
+.profile-editor {
+    color: #172033;
+}
+.profile-editor-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: .8rem;
+}
+.profile-status-pill {
+    display: inline-block;
+    margin-left: .5rem;
+    padding: .15rem .45rem;
+    border: 1px solid #cfd6e1;
+    border-radius: 999px;
+    color: #526071;
+    background: #f8fafc;
+    font-size: .75rem;
+    text-transform: uppercase;
+}
+.profile-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .45rem;
+    justify-content: flex-end;
+}
+.profile-actions .btn {
+    padding: .42rem .65rem;
+    font-size: .82rem;
+}
+.profile-workspace {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(340px, .75fr);
+    gap: .8rem;
+    align-items: start;
+}
+.profile-canvas-card {
+    padding: .65rem;
+    background: #fff;
+    border: 1px solid #d9dee8;
+    border-radius: 8px;
+}
+.profile-canvas-title {
+    margin-bottom: .45rem;
+    color: #344054;
+    font-weight: 700;
+    font-size: .86rem;
+}
+.profile-canvas-wrap {
+    overflow: auto;
+    max-height: 760px;
+    background: #f8fafc;
+    border: 1px solid #e4e7ec;
+}
+#profile-canvas {
+    display: block;
+    cursor: crosshair;
+}
+.profile-mask-preview {
+    display: block;
+    width: 100%;
+    min-height: 260px;
+    max-height: 820px;
+    object-fit: contain;
+    background: #fff;
+    border: 1px solid #e4e7ec;
+    image-rendering: auto;
+}
+.profile-tools {
+    justify-content: flex-start;
+    margin: .75rem 0;
+}
+.profile-evidence {
+    display: grid;
+    gap: .55rem;
+    padding: .75rem;
+    background: #f8fafc;
+    border: 1px solid #d9dee8;
+    border-radius: 8px;
+}
+.profile-evidence textarea {
+    margin-top: .25rem;
+}
+@media (max-width: 950px) {
+    .profile-editor-header,
+    .profile-workspace {
+        display: block;
+    }
+    .profile-actions {
+        margin-top: .6rem;
+    }
+    .profile-canvas-card {
+        margin-bottom: .75rem;
+    }
 }
 
 /* Final light-theme overrides intentionally remain last in the stylesheet. */

@@ -438,6 +438,32 @@ def test_clean_export_preview_selection_csv_and_zip(tmp_path, monkeypatch):
     assert transfer.data == prepared_download.data
     assert "Content-Disposition" not in transfer.headers
 
+    profile_dir = project_path / "cards" / "profiles" / "accepted"
+    profile_dir.mkdir(parents=True)
+    Image.new("L", (12, 18), 255).save(profile_dir / "page_mask_layer_0_profile.png")
+    Image.new("L", (12, 18), 255).save(profile_dir / "page_mask_layer_1_profile.png")
+
+    profile_preview = client.get(
+        f"/api/projects/{project_id}/export/preview?acronym=HES&image_mode=profile")
+    assert profile_preview.status_code == 200
+    profile_payload = profile_preview.get_json()
+    assert profile_payload["summary"]["image_mode"] == "profile"
+    assert profile_payload["masks"][0]["thumbnail_url"].endswith(
+        "/profile-mask/accepted/page_mask_layer_0.png")
+
+    profile_csv = client.post(f"/api/projects/{project_id}/export/csv",
+                              json={"acronym": "HES", "image_mode": "profile"})
+    assert profile_csv.status_code == 200
+    profile_exported = pd.read_csv(io.BytesIO(profile_csv.data), dtype=str, keep_default_na=False)
+    assert profile_exported.loc[0, "Image Filename"] == "HES_Fig2-1_No1_profile.png"
+
+    profile_dataset = client.post(f"/api/projects/{project_id}/export/dataset",
+                                  json={"acronym": "HES", "image_mode": "profile"})
+    assert profile_dataset.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(profile_dataset.data)) as archive:
+        assert "images/HES_Fig2-1_No1_profile.png" in archive.namelist()
+        assert "images/HES_Fig2-1_No1.png" not in archive.namelist()
+
 
 def test_export_setting_edit_preserves_hidden_legacy_exclusions(tmp_path, monkeypatch):
     manager, project_id, project_path = _make_api_project(tmp_path, "Legacy Export")

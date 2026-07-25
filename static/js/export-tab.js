@@ -24,6 +24,11 @@
         return /^[A-Za-z0-9_]+$/.test(acronym());
     }
 
+    function imageMode() {
+        const value = document.getElementById('research-export-image-mode')?.value || 'vessel';
+        return value === 'profile' ? 'profile' : 'vessel';
+    }
+
     function renderSummary(summary = {}) {
         const container = document.getElementById('research-export-summary');
         if (!container) return;
@@ -33,6 +38,7 @@
             ['Unresolved figures', summary.unresolved_figures || 0],
             ['Included masks', summary.included_masks || 0],
             ['Excluded masks', summary.excluded_masks || 0],
+            ['Image mode', summary.image_mode === 'profile' ? 'Side profiles' : 'Whole vessels'],
         ];
         container.innerHTML = cards.map(([label, value]) =>
             `<div><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join('');
@@ -55,6 +61,7 @@
                      alt="Vessel ${escapeHtml(mask.vessel_number)}">
                 <span><strong>Figure ${escapeHtml(mask.figure)}, No. ${escapeHtml(mask.vessel_number)}</strong>
                     <small>${escapeHtml(mask.vessel_type || 'Type not recorded')}</small>
+                    <small>${mask.image_mode === 'side_profile' ? 'Side profile mask' : 'Whole vessel crop'}</small>
                     <small>${mask.included ? 'Included in export' : 'Excluded from export'}</small></span>
             </label>`).join('');
         container.querySelectorAll('[data-export-mask]').forEach(input => {
@@ -96,7 +103,7 @@
         try {
             if (status) status.textContent = 'Loading export preview…';
             const response = await window.PyPotteryUtils.apiRequest(
-                `/api/projects/${encodeURIComponent(pid)}/export/preview?acronym=${encodeURIComponent(acronym() || 'DATA')}`);
+                `/api/projects/${encodeURIComponent(pid)}/export/preview?acronym=${encodeURIComponent(acronym() || 'DATA')}&image_mode=${encodeURIComponent(imageMode())}`);
             state.masks = response.masks || [];
             state.rows = response.rows || [];
             state.columns = response.columns || [];
@@ -240,7 +247,7 @@
                 const preparedResponse = await fetch(
                     `/api/projects/${encodeURIComponent(pid)}/export/dataset/prepare`, {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({acronym: acronym()})
+                        body: JSON.stringify({acronym: acronym(), image_mode: imageMode()})
                     });
                 const prepared = await preparedResponse.json().catch(() => ({}));
                 if (!preparedResponse.ok || !prepared.success || !prepared.download_url) {
@@ -276,7 +283,7 @@
             }
             const response = await fetch(`/api/projects/${encodeURIComponent(pid)}/export/${kind}`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({acronym: acronym()})
+                body: JSON.stringify({acronym: acronym(), image_mode: imageMode()})
             });
             if (!response.ok) {
                 const error = await response.json().catch(() => ({}));
@@ -312,6 +319,7 @@
     document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('research-export-search')?.addEventListener('input', renderMasks);
         document.getElementById('research-export-acronym')?.addEventListener('change', loadResearchExport);
+        document.getElementById('research-export-image-mode')?.addEventListener('change', loadResearchExport);
         document.getElementById('research-export-select-all')?.addEventListener('click', () => {
             state.masks.forEach(mask => { mask.included = true; }); renderMasks(); scheduleSave();
         });

@@ -18,6 +18,7 @@ import zipfile
 import pandas as pd
 
 from catalog.linkage import PUBLIC_LINKAGE_MAP, load_linkage_state, migrate_linkage_columns
+from catalog.profile_segmentation import ACCEPTED_DIR, profile_mask_path, read_profile_review
 from catalog.profiles import HESBAN_COLUMN_SPECS
 
 
@@ -77,6 +78,13 @@ def _resolve_card(cards_path: Path, mask_file: str) -> Path | None:
     return None
 
 
+def _resolve_profile_mask(cards_path: Path, card: Path) -> Path | None:
+    path = profile_mask_path(cards_path, card.name, ACCEPTED_DIR)
+    if path.is_file():
+        return path
+    return None
+
+
 def load_export_settings(project_path: Path) -> dict:
     """Load settings and migrate the former Post Processing exclusions once."""
     path = project_path / EXPORT_SETTINGS_NAME
@@ -125,7 +133,9 @@ def save_export_settings(project_path: Path, excluded_masks: list[str],
     return settings
 
 
-def build_export(project_path: Path, acronym: str) -> dict:
+def build_export(project_path: Path, acronym: str, image_mode: str = "vessel") -> dict:
+    if image_mode not in {"vessel", "profile"}:
+        raise ValueError("Export image mode must be 'vessel' or 'profile'")
     cards_path = project_path / "cards"
     csv_path = cards_path / "mask_info.csv"
     if not csv_path.exists():
@@ -143,6 +153,8 @@ def build_export(project_path: Path, acronym: str) -> dict:
         approved["mask_file"] = ""
         mask_column = "mask_file"
 
+    profile_review = read_profile_review(cards_path) if image_mode == "profile" else {}
+    profile_records = profile_review.get("profiles", {}) if isinstance(profile_review, dict) else {}
     rows, images, candidates, seen_names = [], [], [], set()
     prefix = _safe_piece(acronym, "DATA")
     for _, source_row in approved.iterrows():
@@ -153,10 +165,22 @@ def build_export(project_path: Path, acronym: str) -> dict:
         figure = _clean_text(source_row.get("Figure", ""))
         number = _clean_text(source_row.get("No.", ""))
         base = f"{prefix}_Fig{_safe_piece(figure, 'Unknown')}_No{_safe_piece(number, 'Unknown')}"
-        export_name = f"{base}{card.suffix.lower()}"
+        image_source = card
+        image_kind = "whole_vessel"
+        profile_status = ""
+        if image_mode == "profile":
+            profile_source = _resolve_profile_mask(cards_path, card)
+            if profile_source is None:
+                continue
+            image_source = profile_source
+            image_kind = "side_profile"
+            profile_status = _clean_text(
+                (profile_records.get(card.name) or {}).get("review_status", ""))
+        suffix = ".png" if image_mode == "profile" else card.suffix.lower()
+        export_name = f"{base}{'_profile' if image_mode == 'profile' else ''}{suffix}"
         duplicate = 2
         while export_name.lower() in seen_names:
-            export_name = f"{base}-{duplicate}{card.suffix.lower()}"
+            export_name = f"{base}{'_profile' if image_mode == 'profile' else ''}-{duplicate}{suffix}"
             duplicate += 1
         seen_names.add(export_name.lower())
         is_included = _mask_stem(mask_file) not in excluded
@@ -168,6 +192,8 @@ def build_export(project_path: Path, acronym: str) -> dict:
             "vessel_type": _clean_text(source_row.get("Type", "")),
             "included": is_included,
             "export_name": export_name,
+            "image_mode": image_kind,
+            "profile_status": profile_status,
         })
         if not is_included:
             continue
@@ -176,7 +202,7 @@ def build_export(project_path: Path, acronym: str) -> dict:
         for target, origin in SOURCE_COLUMNS.items():
             row[target] = _clean_text(source_row.get(origin, ""))
         rows.append(row)
-        images.append((card, export_name, _mask_stem(mask_file)))
+        images.append((image_source, export_name, _mask_stem(mask_file)))
 
     frame = pd.DataFrame(rows, columns=EXPORT_COLUMNS).fillna("")
     state = load_linkage_state(project_path)
@@ -198,6 +224,7 @@ def build_export(project_path: Path, acronym: str) -> dict:
             "unresolved_figures": len(unresolved),
             "included_masks": len(images),
             "excluded_masks": max(0, len(candidates) - len(images)),
+            "image_mode": image_mode,
         },
     }
 
@@ -226,6 +253,7 @@ def dataset_zip_bytes(result: dict, project_name: str) -> bytes:
         summary = result["summary"]
         archive.writestr("export_summary.txt", "\n".join([
             f"Project: {project_name}", f"Exported: {now}",
+            f"Image export mode: {summary.get('image_mode', 'vessel')}",
             f"Included vessel masks: {summary['included_masks']}",
             f"Excluded or unresolved masks: {summary['excluded_masks']}",
             f"Unresolved figures: {unresolved_names}", "",

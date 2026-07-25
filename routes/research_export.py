@@ -19,7 +19,7 @@ from catalog.export import (
 def register_research_export_routes(app, get_project_manager):
     """Register export routes while preserving their original endpoint names."""
 
-    def export_payload(project_id, acronym):
+    def export_payload(project_id, acronym, image_mode="vessel"):
         project_manager = get_project_manager()
         project_metadata = project_manager.get_project(project_id)
         if not project_metadata:
@@ -29,20 +29,27 @@ def register_research_export_routes(app, get_project_manager):
                 "Dataset acronym can only contain letters, numbers, and underscores"
             )
         project_path = project_manager.get_project_path(project_id)
-        return project_metadata, build_export(project_path, str(acronym))
+        return project_metadata, build_export(project_path, str(acronym), image_mode=image_mode)
 
     def preview_project_research_export(project_id):
         """Preview approved rows and masks available for final export."""
         try:
             acronym = request.args.get("acronym", "DATA")
-            _, result = export_payload(project_id, acronym)
+            image_mode = request.args.get("image_mode", "vessel")
+            _, result = export_payload(project_id, acronym, image_mode)
             candidates = []
             for candidate in result["candidates"]:
                 item = dict(candidate)
-                item["thumbnail_url"] = (
-                    f"/api/projects/{project_id}/card/"
-                    + quote(candidate["mask_file"])
-                )
+                if result["summary"].get("image_mode") == "profile":
+                    item["thumbnail_url"] = (
+                        f"/api/projects/{project_id}/profile-mask/accepted/"
+                        + quote(candidate["mask_file"])
+                    )
+                else:
+                    item["thumbnail_url"] = (
+                        f"/api/projects/{project_id}/card/"
+                        + quote(candidate["mask_file"])
+                    )
                 candidates.append(item)
             return jsonify(
                 {
@@ -104,7 +111,8 @@ def register_research_export_routes(app, get_project_manager):
         try:
             data = request.get_json(silent=True) or {}
             acronym = str(data.get("acronym", "")).strip()
-            _, result = export_payload(project_id, acronym)
+            image_mode = str(data.get("image_mode", "vessel"))
+            _, result = export_payload(project_id, acronym, image_mode)
             payload = BytesIO(csv_bytes(result["frame"]))
             payload.seek(0)
             return send_file(
@@ -129,7 +137,12 @@ def register_research_export_routes(app, get_project_manager):
                 if request.method == "GET"
                 else data.get("acronym", "")
             ).strip()
-            project_metadata, result = export_payload(project_id, acronym)
+            image_mode = str(
+                request.args.get("image_mode", "vessel")
+                if request.method == "GET"
+                else data.get("image_mode", "vessel")
+            )
+            project_metadata, result = export_payload(project_id, acronym, image_mode)
             payload = BytesIO(
                 dataset_zip_bytes(
                     result, project_metadata.get("project_name", project_id)
@@ -155,7 +168,8 @@ def register_research_export_routes(app, get_project_manager):
         try:
             data = request.get_json(silent=True) or {}
             acronym = str(data.get("acronym", "")).strip()
-            project_metadata, result = export_payload(project_id, acronym)
+            image_mode = str(data.get("image_mode", "vessel"))
+            project_metadata, result = export_payload(project_id, acronym, image_mode)
             archive = dataset_zip_bytes(
                 result, project_metadata.get("project_name", project_id)
             )

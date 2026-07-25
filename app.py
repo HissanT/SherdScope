@@ -88,6 +88,18 @@ from catalog.measurements import (
     persist_figure_measurements,
     verified_measurement,
 )
+from catalog.profile_segmentation import (
+    ACCEPTED_DIR,
+    AUTO_DIR,
+    PROFILE_DIR,
+    generate_profile_proposals,
+    list_card_files,
+    profile_mask_path,
+    propose_profile_mask,
+    read_profile_review,
+    save_profile_mask,
+    write_profile_review,
+)
 from routes.research_export import register_research_export_routes
 from services.linkage_jobs import LinkageJobCoordinator
 
@@ -1877,6 +1889,200 @@ def serve_project_card_modified(project_id, filename):
         
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 404
+
+
+@app.route('/api/projects/<project_id>/profiles', methods=['GET'])
+def get_project_profiles(project_id):
+    """List approved crops and their diagnostic-profile review state."""
+    try:
+        project_metadata = project_manager.get_project(project_id)
+        if not project_metadata:
+            return jsonify({'error': 'Project not found', 'success': False}), 404
+
+        cards_path = project_manager.get_project_path(project_id, 'cards')
+        if not cards_path or not cards_path.exists():
+            return jsonify({'profiles': [], 'total': 0, 'success': True})
+
+        document = read_profile_review(cards_path)
+        records = document.get('profiles', {})
+        profiles = []
+        for card_path in list_card_files(cards_path):
+            filename = card_path.name
+            record = records.get(filename, {})
+            proposal = record.get('proposal') or {}
+            auto_path = profile_mask_path(cards_path, filename, AUTO_DIR)
+            accepted_path = profile_mask_path(cards_path, filename, ACCEPTED_DIR)
+            with Image.open(card_path) as card_img:
+                width, height = card_img.size
+            profiles.append({
+                'filename': filename,
+                'card_url': f'/api/projects/{project_id}/card/{filename}',
+                'width': width,
+                'height': height,
+                'review_status': record.get('review_status') or 'not_generated',
+                'review_note': record.get('review_note') or '',
+                'proposal': proposal,
+                'auto_mask_url': (
+                    f'/api/projects/{project_id}/profile-mask/auto/{filename}'
+                    if auto_path.exists() else None
+                ),
+                'accepted_mask_url': (
+                    f'/api/projects/{project_id}/profile-mask/accepted/{filename}'
+                    if accepted_path.exists() else None
+                ),
+            })
+
+        return jsonify({
+            'profiles': profiles,
+            'total': len(profiles),
+            'success': True,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/profiles/propose', methods=['POST'])
+def propose_project_profiles(project_id):
+    """Generate automatic profile proposals for extracted crop images."""
+    try:
+        project_metadata = project_manager.get_project(project_id)
+        if not project_metadata:
+            return jsonify({'error': 'Project not found', 'success': False}), 404
+        cards_path = project_manager.get_project_path(project_id, 'cards')
+        if not cards_path or not cards_path.exists():
+            return jsonify({'error': 'Extract approved crops first.', 'success': False}), 404
+
+        data = request.json or {}
+        summary = generate_profile_proposals(cards_path, force=bool(data.get('force')))
+        return jsonify({'summary': summary, 'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/profile-mask/<kind>/<filename>')
+def serve_project_profile_mask(project_id, kind, filename):
+    """Serve an automatic or accepted diagnostic-profile mask."""
+    try:
+        cards_path = project_manager.get_project_path(project_id, 'cards')
+        if kind not in {AUTO_DIR, ACCEPTED_DIR}:
+            return jsonify({'error': 'Unknown profile mask type', 'success': False}), 400
+        safe_name = secure_filename(filename)
+        if safe_name != filename:
+            return jsonify({'error': 'Invalid filename', 'success': False}), 400
+        mask_path = profile_mask_path(cards_path, filename, kind)
+        profile_root = cards_path / PROFILE_DIR / kind
+        if not mask_path.exists() or mask_path.parent != profile_root:
+            return jsonify({'error': 'Profile mask not found', 'success': False}), 404
+        return send_from_directory(profile_root, mask_path.name)
+    except Exception as e:
+        return jsonify({'error': str(e), 'success': False}), 404
+
+
+@app.route('/api/projects/<project_id>/profiles/<filename>/rerun-rect', methods=['POST'])
+def rerun_project_profile_rect(project_id, filename):
+    """Run the profile proposal algorithm inside a reviewer-selected rectangle."""
+    try:
+        cards_path = project_manager.get_project_path(project_id, 'cards')
+        if not cards_path or not cards_path.exists():
+            return jsonify({'error': 'Cards folder not found', 'success': False}), 404
+        safe_name = secure_filename(filename)
+        if safe_name != filename:
+            return jsonify({'error': 'Invalid filename', 'success': False}), 400
+        card_path = cards_path / filename
+        if not card_path.exists() or card_path.parent != cards_path:
+            return jsonify({'error': 'Crop image not found', 'success': False}), 404
+
+        data = request.json or {}
+        bbox = data.get('bbox') or []
+        if len(bbox) != 4:
+            return jsonify({'error': 'Rectangle bbox must contain four coordinates', 'success': False}), 400
+        with Image.open(card_path) as raw_img:
+            card_img = raw_img.convert('RGB')
+        width, height = card_img.size
+        x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+        x1, x2 = sorted((max(0, min(width, x1)), max(0, min(width, x2))))
+        y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return jsonify({'error': 'Selected rectangle is too small', 'success': False}), 400
+        crop = card_img.crop((x1, y1, x2, y2))
+        crop_mask, proposal = propose_profile_mask(crop)
+        full_mask = Image.new('L', (width, height), 0)
+        full_mask.paste(Image.fromarray(crop_mask, mode='L'), (x1, y1))
+        buffer = BytesIO()
+        full_mask.save(buffer, format='PNG')
+        mask_data = base64.b64encode(buffer.getvalue()).decode('ascii')
+
+        return jsonify({
+            'mask_data': f'data:image/png;base64,{mask_data}',
+            'proposal': proposal.as_dict(),
+            'success': True,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/profiles/<filename>', methods=['POST'])
+def save_project_profile(project_id, filename):
+    """Save reviewer status and the accepted profile mask for one crop."""
+    try:
+        cards_path = project_manager.get_project_path(project_id, 'cards')
+        if not cards_path or not cards_path.exists():
+            return jsonify({'error': 'Cards folder not found', 'success': False}), 404
+        safe_name = secure_filename(filename)
+        if safe_name != filename:
+            return jsonify({'error': 'Invalid filename', 'success': False}), 400
+        card_path = cards_path / filename
+        if not card_path.exists() or card_path.parent != cards_path:
+            return jsonify({'error': 'Crop image not found', 'success': False}), 404
+
+        data = request.json or {}
+        status = str(data.get('review_status') or 'pending')
+        if status not in {'pending', 'approved', 'edited', 'no_profile'}:
+            return jsonify({'error': 'Invalid review status', 'success': False}), 400
+
+        document = read_profile_review(cards_path)
+        records = document.setdefault('profiles', {})
+        record = dict(records.get(filename) or {'filename': filename})
+
+        mask_data = data.get('mask_data')
+        if status == 'no_profile':
+            with Image.open(card_path) as card_img:
+                empty = Image.new('L', card_img.size, 0)
+            accepted_path = profile_mask_path(cards_path, filename, ACCEPTED_DIR)
+            save_profile_mask(accepted_path, empty)
+            record['accepted_mask'] = accepted_path.relative_to(cards_path).as_posix()
+        elif mask_data:
+            if ',' in mask_data:
+                mask_data = mask_data.split(',', 1)[1]
+            mask_bytes = base64.b64decode(mask_data)
+            with Image.open(BytesIO(mask_bytes)) as mask_img:
+                with Image.open(card_path) as card_img:
+                    clean = mask_img.convert('L')
+                    if clean.size != card_img.size:
+                        clean = clean.resize(card_img.size, Image.Resampling.NEAREST)
+                accepted_path = profile_mask_path(cards_path, filename, ACCEPTED_DIR)
+                save_profile_mask(accepted_path, clean)
+                record['accepted_mask'] = accepted_path.relative_to(cards_path).as_posix()
+        elif status == 'approved':
+            auto_path = profile_mask_path(cards_path, filename, AUTO_DIR)
+            if not auto_path.exists():
+                return jsonify({'error': 'Generate an automatic proposal first.', 'success': False}), 400
+            accepted_path = profile_mask_path(cards_path, filename, ACCEPTED_DIR)
+            with Image.open(auto_path) as auto_img:
+                save_profile_mask(accepted_path, auto_img)
+            record['accepted_mask'] = accepted_path.relative_to(cards_path).as_posix()
+
+        record['review_status'] = status
+        record['review_note'] = str(data.get('review_note') or '')
+        records[filename] = record
+        write_profile_review(cards_path, document)
+        return jsonify({
+            'profile': record,
+            'accepted_mask_url': f'/api/projects/{project_id}/profile-mask/accepted/{filename}',
+            'success': True,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'success': False}), 500
 
 
 @app.route('/api/projects/<project_id>/tabular/load', methods=['POST'])
