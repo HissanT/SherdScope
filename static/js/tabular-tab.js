@@ -2,6 +2,10 @@
 // Uses window.PyPotteryUtils.* functions directly
 
 // State
+const metadataReviewerSession = (
+    window.crypto?.randomUUID?.() ||
+    `review-${Date.now()}-${Math.random().toString(16).slice(2)}`
+);
 let tabularState = {
     currentProject: null,
     cards: [],
@@ -29,7 +33,8 @@ let tabularState = {
     metadataFigureDetails: new Map(),
     metadataLoadSequence: 0,
     metadataBackendReload: null,
-    metadataStaleFigureCount: 0
+    metadataStaleFigureCount: 0,
+    metadataReviewerSession
 };
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -774,7 +779,7 @@ function displayImageList() {
         }
         
         div.innerHTML = `
-            <span class="image-name">${item.image_name}</span>
+            <span class="image-name" title="${linkEscape(item.image_name)}">${linkEscape(item.image_name)}</span>
             <span class="status-icon">${item.reviewed ? '✅' : '⚪'}</span>
         `;
         
@@ -955,11 +960,18 @@ async function loadMetadataLinkState() {
         tabularState.metadataStaleFigureCount = Number(data.stale_figure_count || 0);
         const sourceSelect = document.getElementById('metadata-link-source');
         if (sourceSelect) {
-            const previous = sourceSelect.value;
-            sourceSelect.innerHTML = data.sources.map(source =>
-                `<option value="${linkEscape(source)}">${linkEscape(source)}</option>`).join('');
-            if (data.sources.includes(previous)) sourceSelect.value = previous;
-            sourceSelect.hidden = data.sources.length <= 1;
+            const prior = sourceSelect.value;
+            const firstLoad = sourceSelect.dataset.initialized !== 'true';
+            sourceSelect.innerHTML = [
+                '<option value="">All PDFs (combined; only when intended)</option>',
+                ...data.sources.map(source =>
+                    `<option value="${linkEscape(source)}">Only ${linkEscape(source)}</option>`),
+            ].join('');
+            if (prior && data.sources.includes(prior)) sourceSelect.value = prior;
+            else if (firstLoad && data.sources.length > 1) sourceSelect.value = data.sources[0];
+            else if (data.sources.length === 1) sourceSelect.value = data.sources[0];
+            sourceSelect.dataset.initialized = 'true';
+            sourceSelect.hidden = false;
         }
         renderMetadataLinkState(displayState, data.active);
         clearTimeout(tabularState.metadataLinkPoll);
@@ -1978,6 +1990,7 @@ async function openMetadataColumnEditor(figureId, imageName) {
                 `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}/pages/${encodeURIComponent(imageName)}/columns`, {
                     method: 'PUT', body: JSON.stringify({
                         reviewer_revision: Number(figure.reviewer_revision || 0),
+                        reviewer_session: tabularState.metadataReviewerSession,
                         normalized_column_edges: edges
                     })
                 });
@@ -1998,7 +2011,10 @@ async function openMetadataColumnEditor(figureId, imageName) {
             button.setAttribute('aria-busy', 'true');
             const response = await window.PyPotteryUtils.apiRequest(
                 `/api/projects/${tabularState.currentProject.project_id}/metadata-link/figures/${encodeURIComponent(figureId)}/pages/${encodeURIComponent(imageName)}/columns`, {
-                    method: 'DELETE', body: JSON.stringify({reviewer_revision: Number(figure.reviewer_revision || 0)})
+                    method: 'DELETE', body: JSON.stringify({
+                        reviewer_revision: Number(figure.reviewer_revision || 0),
+                        reviewer_session: tabularState.metadataReviewerSession
+                    })
                 });
             if (!response.success) throw new Error(response.error || 'Could not reset columns');
             dialog.close(); await loadMetadataLinkState();
@@ -2217,6 +2233,7 @@ function collectMetadataFigureEdits(figureId) {
     });
     return {
         reviewer_revision: Number(figureEl.dataset.reviewerRevision || existing?.reviewer_revision || 0),
+        reviewer_session: tabularState.metadataReviewerSession,
         figure_id: figureEl.querySelector('[data-link-figure-id]')?.value || figureId,
         figure_caption: figureEl.querySelector('[data-link-caption]')?.value || '',
         drawing_numbers: drawingNumbers,
@@ -2351,7 +2368,7 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
     const context = canvas.getContext('2d');
     const image = new Image();
     const evidenceUrl = `/api/projects/${encodeURIComponent(tabularState.currentProject.project_id)}/metadata-link/evidence/${encodeURIComponent(imageName)}` +
-        `?figure=${encodeURIComponent(figureId)}&kind=drawing&overlay=0&measurement=0&v=${Date.now()}`;
+        `?figure=${encodeURIComponent(figureId)}&kind=drawing&overlay=0.08&measurement=0&v=${Date.now()}`;
     let coordinateSize = (mode === 'rim' ? measurement.image_size : calibration.image_size) ||
         calibration.image_size || measurement.image_size || [1, 1];
     let points = structuredClone(mode === 'rim' ? measurement.rim_endpoints :
@@ -2392,6 +2409,11 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
         const padY = mode === 'scale' ? Math.max(30, height * 5, width * 0.12) : Math.max(20, height * 0.20);
         return clampView([left - padX, top - padY, right + padX, bottom + padY]);
     };
+    const endpointsVisibleInView = () => points.length === 2 && points.every(point =>
+        Array.isArray(point) && point.length === 2 &&
+        Number.isFinite(Number(point[0])) && Number.isFinite(Number(point[1])) &&
+        point[0] >= view[0] && point[0] <= view[2] &&
+        point[1] >= view[1] && point[1] <= view[3]);
     const resizeCanvas = () => {
         if (!view) return;
         const viewWidth = view[2] - view[0], viewHeight = view[3] - view[1];
@@ -2445,6 +2467,10 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
         }
         fitView = evidenceView();
         view = [...fitView];
+        // Stale detections can exist in page coordinates while both handles
+        // are outside the fitted evidence view. Treat that pair as absent so
+        // the next click creates visible endpoints instead of moving a hidden one.
+        if (points.length === 2 && !endpointsVisibleInView()) points = [];
         resizeCanvas();
         redraw();
     };
@@ -2456,6 +2482,10 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
     };
     const placeEndpoint = event => {
         const point = eventPoint(event);
+        if (points.length === 2 && !endpointsVisibleInView()) {
+            points = [];
+            dragIndex = -1;
+        }
         if (points.length < 2) { points.push(point); dragIndex = points.length - 1; }
         else {
             const distances = points.map(item => Math.hypot(item[0] - point[0], item[1] - point[1]));
@@ -2514,7 +2544,10 @@ function openMetadataMeasurementEditor(figureId, maskFile = null, scalePage = nu
     dialog.querySelector('[data-measure-save]').addEventListener('click', async () => {
         if (points.length !== 2) return;
         const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
-        const body = {reviewer_revision: Number(figureEl?.dataset.reviewerRevision || figure.reviewer_revision || 0)};
+        const body = {
+            reviewer_revision: Number(figureEl?.dataset.reviewerRevision || figure.reviewer_revision || 0),
+            reviewer_session: tabularState.metadataReviewerSession
+        };
         if (mode === 'scale') body.scale_calibrations = {[calibrationName]: {
             p1: points[0], p2: points[1], real_cm: 10,
             evidence_image: imageName !== calibrationName ? imageName : undefined
@@ -2628,6 +2661,13 @@ async function performMetadataFigureSave(figureId, quiet = false, retryConflict 
     if (raw.status === 409 && response.conflict && retryConflict) {
         const figureEl = document.querySelector(`[data-link-figure="${CSS.escape(figureId)}"]`);
         if (figureEl) figureEl.dataset.reviewerRevision = response.reviewer_revision;
+        if (response.same_session ||
+                response.figure?.reviewer_session === tabularState.metadataReviewerSession) {
+            // Another action from this browser tab (autosave, diameter edit,
+            // or column reread) won the race. Rebase this still-visible draft
+            // onto its revision; this is not a second-person conflict.
+            return performMetadataFigureSave(figureId, quiet, false);
+        }
         if (!mergeMetadataConflict(figureId, response.figure)) {
             tabularState.metadataDirty.add(figureId);
             setMetadataSaveStatus(figureId, 'Save conflict — review newer changes', true);
@@ -2903,7 +2943,10 @@ function validateMetadataFigureDom(figureId) {
         const value = input.value.trim();
         const row = input.closest('tr');
         const invalid = !/^[1-9]\d*[a-z]?$/i.test(value) || rowCounts.get(value) > 1;
-        const unmatched = value && !drawingCounts.has(value);
+        const ignoredUnexpectedRow = value && [...figureEl.querySelectorAll(
+            '[data-warning-code="unexpected_table_row"][data-override-active="1"]'
+        )].some(card => card.dataset.warningRow === value);
+        const unmatched = value && !drawingCounts.has(value) && !ignoredUnexpectedRow;
         hasDraftBlocker ||= invalid || !!unmatched;
         row.classList.toggle('metadata-link-row-invalid', invalid);
         row.classList.toggle('metadata-link-row-unmatched', unmatched);

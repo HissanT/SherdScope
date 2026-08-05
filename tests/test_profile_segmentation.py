@@ -8,6 +8,7 @@ from catalog.profile_segmentation import (
     profile_mask_path,
     propose_profile_mask,
     read_profile_review,
+    recover_profile_mask,
     save_profile_mask,
     write_profile_review,
 )
@@ -117,7 +118,7 @@ def test_reviewed_profile_is_not_overwritten_without_force(tmp_path):
     assert saved["profiles"]["page_mask_layer_0.png"]["review_note"] == "manual correction"
 
 
-def test_force_profile_generation_resets_review_and_replaces_accepted_mask(tmp_path):
+def test_force_profile_generation_refreshes_auto_but_preserves_reviewed_mask(tmp_path):
     cards = tmp_path / "cards"
     cards.mkdir()
     _crop_with_profile().save(cards / "page_mask_layer_0.png")
@@ -135,8 +136,37 @@ def test_force_profile_generation_resets_review_and_replaces_accepted_mask(tmp_p
     assert summary["generated"] == 1
     assert summary["skipped_reviewed"] == 0
     refreshed = read_profile_review(cards)["profiles"]["page_mask_layer_0.png"]
-    assert refreshed["review_status"] == "pending"
-    assert refreshed["review_note"] == ""
+    assert refreshed["review_status"] == "approved"
+    assert refreshed["review_note"] == "looks good"
     current = np.asarray(Image.open(profile_mask_path(cards, "page_mask_layer_0.png", "accepted")))
-    assert current[25, 25] == 0
-    assert current[:, 130:160].sum() > 0
+    assert current[25, 25] == 255
+    assert current[:, 130:160].sum() == 0
+    auto = np.asarray(Image.open(profile_mask_path(cards, "page_mask_layer_0.png", "auto")))
+    assert auto[:, 130:160].sum() > 0
+
+
+def test_generate_profile_proposals_can_target_only_new_source_cards(tmp_path):
+    cards = tmp_path / "cards"
+    cards.mkdir()
+    _crop_with_profile().save(cards / "old.png")
+    _crop_with_profile().save(cards / "new.png")
+
+    summary = generate_profile_proposals(cards, target_filenames={"new.png"})
+
+    assert summary["generated"] == 1
+    assert summary["skipped_out_of_scope"] == 1
+    assert "new.png" in read_profile_review(cards)["profiles"]
+    assert "old.png" not in read_profile_review(cards)["profiles"]
+
+
+def test_guided_recovery_adds_connected_thick_profile_without_hairline():
+    image = _crop_with_profile(connected_line=True)
+    current = np.zeros((120, 180), dtype=np.uint8)
+    current[45:90, 138:150] = 255
+
+    recovered, evidence = recover_profile_mask(image, current)
+    selected = recovered > 0
+
+    assert evidence["added_pixels"] > 0
+    assert selected[:, 130:165].sum() > current[:, 130:165].astype(bool).sum()
+    assert not selected[61, 30]

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Real-sherd U-Net pilot</title>
+    <link rel="stylesheet" href="/pilot-static/pilot.css?v=1">
+</head>
+<body>
+<header>
+    <div><h1>Real-sherd segmentation pilot</h1><p>{{ workspace_name }} · scale ignored</p></div>
+    <div id="run-meta">Loading…</div>
+</header>
+<div class="layout">
+    <aside>
+        <h2>Five photographs</h2>
+        <div id="queue"></div>
+        <div class="legend"><strong>Gold target</strong><br>Trace only visible pottery. Exclude glove, paper, scale, and shadow. Do not invent pottery hidden by fingers.</div>
+    </aside>
+    <main>
+        <section class="heading">
+            <div><h2 id="title">Select a photograph</h2><p id="subtitle"></p></div>
+            <div><button id="previous">← Previous</button><button id="next">Next →</button></div>
+        </section>
+        <section class="tools" aria-label="Editor tools">
+            <button data-tool="outline" class="active">Outline points (O)</button>
+            <button id="finish">Finish + fill (Enter)</button>
+            <button data-tool="brush">Brush (B)</button>
+            <button data-tool="eraser">Eraser (E)</button>
+            <button data-tool="pan">Pan (P)</button>
+            <button id="undo">Undo (Ctrl+Z)</button>
+            <button id="clear">Clear</button>
+            <button id="zoom-out">Zoom −</button><button id="zoom-in">Zoom +</button>
+            <button id="fit">Fit (F)</button>
+            <label>Brush <input id="brush-size" type="range" min="2" max="100" value="18"></label>
+            <output id="zoom-level">100%</output>
+            <button id="adjust-roi" class="crop">Adjust crop</button>
+            <button id="save-roi" class="crop hidden">Save crop + rerun U-Net</button>
+            <button id="cancel-roi" class="hidden">Cancel crop</button>
+        </section>
+        <section class="work-grid">
+            <figure class="editor-card">
+                <figcaption>Manual gold-mask editor</figcaption>
+                <p class="hint">Click around the visible sherd. Enter closes and fills the outline. Zoom and pan whenever needed.</p>
+                <div id="canvas-scroll"><canvas id="canvas"></canvas></div>
+            </figure>
+            <section class="results-card">
+                <h3>Independent U-Net comparison</h3>
+                <div id="locked" class="locked">Hidden until the manual gold mask is saved, preventing annotation bias.</div>
+                <div id="results" class="hidden">
+                    <div class="previews">
+                        <figure><figcaption>U-Net mask</figcaption><img id="unet-preview" alt="U-Net mask"></figure>
+                        <figure><figcaption>Agreement overlay</figcaption><img id="comparison-preview" alt="Segmentation comparison"></figure>
+                    </div>
+                    <p class="key"><span class="green"></span> Agreement <span class="blue"></span> Missed by U-Net <span class="red"></span> Extra U-Net</p>
+                    <div id="metrics"></div>
+                </div>
+            </section>
+        </section>
+        <section class="save-panel">
+            <label>Edge smoothing <input id="smoothing" type="range" min="0" max="3" step="0.25" value="1"><output id="smoothing-value">1.00 px</output></label>
+            <span class="hint">Small Gaussian edge smoothing only; it does not simplify the contour into large straight segments.</span>
+            <button id="save" class="primary">Save gold + calculate metrics (A)</button>
+        </section>
+        <div id="status" role="status" aria-live="polite"></div>
+    </main>
+</div>
+<script src="/pilot-static/pilot.js?v=1"></script>
+</body>
+</html>
+

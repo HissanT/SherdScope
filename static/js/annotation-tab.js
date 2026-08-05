@@ -458,6 +458,7 @@ function updateCurrentImageLabel() {
     const visibleIndices = getVisibleImageIndices();
     const visiblePosition = visibleIndices.indexOf(annotationState.currentIndex);
     label.textContent = `${visiblePosition + 1}/${visibleIndices.length} - ${img.filename}`;
+    label.title = img.filename;
 }
 
 async function selectImage(index) {

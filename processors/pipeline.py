@@ -266,7 +266,7 @@ class ModelProcessor:
                 save_mask(
                     img,
                     pred_masks,
-                    image_file.split(".")[0],
+                    Path(image_file).stem,
                     output_folder,
                     kernel_size,
                     iterations,

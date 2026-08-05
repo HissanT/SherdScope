@@ -56,6 +56,34 @@ real-corpus validation. The current workflow can:
 PaddleOCR and OpenCV run locally. Generative AI and paid API calls are not
 required for the normal Hesban workflow.
 
+## Five-photo real-sherd segmentation pilot
+
+The isolated pilot keeps the photographs and experimental outputs outside the
+ordinary project/export pipeline. From the repository root, run:
+
+```powershell
+python -m scripts.real_sherd.pilot
+```
+
+It uses `IMG_6450.JPG` through `IMG_6454.JPG` from the user's Downloads folder,
+runs the existing real-photo U-Net, and opens a local review page. Trace only
+the visible pottery (not glove, paper, scale, or shadow), fill the outline, make
+brush/eraser corrections, and save. The U-Net result is deliberately hidden
+until the manual gold mask is saved. Completed manual and U-Net blobs are
+written under `outputs/real_sherd_pilot_5/exports`, and segmentation metrics are
+written under `outputs/real_sherd_pilot_5/reports`.
+
+After all five gold masks exist, reproduce the model comparison with:
+
+```powershell
+python -m scripts.segmentation.benchmark
+```
+
+The benchmark retains the original U-Net result, adds an outer-contour-safe
+enclosed-hole variant, evaluates SAM 2.1 using only prompts derived from the
+U-Net result, and includes DeepLabV3+ when its checkpoint exists. Results are
+stored under `outputs/real_sherd_segmentation_benchmark`.
+
 ## Why review remains important
 
 Catalogue scans vary in quality and layout. OCR can misread small characters,
@@ -116,6 +144,31 @@ Open [http://localhost:5001](http://localhost:5001).
 The required vessel-detection and orientation models are downloaded from the
 original PyPotteryLens Hugging Face repository on first use.
 
+### Fixed 30-query shape and metadata experiment
+
+After the fracture trace and gold rim point have been saved for all 30 query
+images, enter the optional human metadata once:
+
+```powershell
+python -m scripts.matcher.metadata --project "PATH_TO_PROJECT" --queries ".\Classical Queries"
+```
+
+Blank fields mean unknown and do not affect ranking. The screen reloads saved
+values for editing. Then run both experiment arms together:
+
+```powershell
+python -m scripts.matcher.batch "PATH_TO_PROJECT" --output ".\outputs\matcher_v15_final_balanced_metadata"
+```
+
+The workbook contains separate `Top five` shape-only rows and `Shape +
+metadata` rows. The second arm uses one continuous combined cost from the full
+catalogue onward: metadata participates when the 400-candidate retrieval pool
+is formed and again at the coarse, medium, and fine survivor stages. Shape
+remains primary, blank fields are neutral, and large reliable incompatibilities
+such as a severe rim-diameter mismatch receive a bounded penalty. The two arms
+run independently so metadata can admit a deserving reference that the
+shape-only 400-candidate cutoff would have excluded.
+
 ## Research workflow
 
 ### 1. Create and prepare a project
@@ -157,6 +210,61 @@ a corpus-wide segmentation-accuracy estimate.
 
 SherdScope records PDF-page order in `page_manifest.json`, including split-page
 information where applicable.
+
+### Prepare reviewed profiles for U-Net training
+
+The temporary training curator creates a new versioned folder under the chosen
+project. It never replaces project cards or accepted masks. First compare a
+small sample of the current JPEG-derived crops with lossless crops rendered
+directly from the source PDF:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.training.profile_curator pilot `
+  --project "projects\<project-id>" --dpi 600 --count 20
+```
+
+After checking the pilot report, prepare/resume all reviewed profiles and launch
+the local-only curator:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.training.profile_curator curate `
+  --project "projects\<project-id>" --dpi 600
+```
+
+The curator supports brush (`B`), eraser (`E`), pan (`P`), fit (`F`), zoom,
+undo, draft save (`S`), approve (`A`), reject (`R`), high-resolution profile
+recovery (`G`), and previous/next arrow keys. Recovery adds only thick profile
+ink connected to the current reviewed mask, stays on screen until explicitly
+saved, and can be undone. Approval removes only microscopic disconnected specks;
+it does not apply morphology that could shorten thin fracture or rim features.
+Candidate rendering checkpoints every ten profiles and reuses completed files
+after interruption. Approved image/mask snapshots and their SHA-256 hashes are
+stored under `training/profile_unet_v1/`; decisions and source provenance remain
+in its atomic `manifest.json`.
+
+After approving a representative first batch, train the compact U-Net and open
+an unseen holdout preview:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.training.profile_curator train `
+  --project "projects\<project-id>" --image-size 320 --batch-size 4
+```
+
+Only after checking that preview, generate review candidates for every pending
+profile:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.training.profile_curator predict `
+  --project "projects\<project-id>"
+```
+
+Predictions are stored separately under `predictions/unet_v1/`. The curator uses
+the original SherdScope automatic mask by default; **Try U-Net** (`U`) loads the
+model result only when a reviewer wants to compare it, and **Original auto**
+(`O`) restores the former mask. An existing approved mask always takes priority
+and is never overwritten. Prediction post-processing uses the migrated draft
+only as location evidence, preventing unrelated drawings elsewhere in a wide
+crop from being selected.
 
 ### 2. Review and link the catalogue
 
@@ -405,6 +513,11 @@ Implementation is grouped by responsibility:
   processing pipeline;
 - `routes/` - focused Flask route groups;
 - `services/` - project-workspace management;
+- `scripts/` - module-based matcher, real-sherd, segmentation, training, and
+  maintenance commands (run with `python -m scripts.<group>.<command>`);
+- `real_sherd_pilot/` and `training_curator/` - reusable workflow packages
+  behind the corresponding commands;
+- `models/` - locally downloaded or trained model checkpoints;
 - `static/` and `templates/` - browser assets and the application page;
 - `tests/` - unit and Flask integration coverage.
 

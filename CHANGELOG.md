@@ -1,5 +1,315 @@
 # Changelog
 
+## 2026-08-05 - repository cleanup
+
+- Moved standalone research commands out of the repository root and into the
+  `scripts/matcher`, `scripts/real_sherd`, `scripts/segmentation`,
+  `scripts/training`, and `scripts/maintenance` packages. Commands now run as
+  Python modules so imports resolve consistently from the project root.
+- Removed the hard-coded, one-off Query 2 workbook repair script. Its result is
+  already represented by the general evaluation exporter, so retaining the
+  project-specific copy risked writing stale query mappings.
+- Quarantined generated Python/test caches and Codex scratch analysis files for
+  safe removal, and moved the downloaded SAM checkpoint under `models`. Saved
+  projects, query corpora, reviewed artifacts, experiment outputs, and research
+  logs were left untouched.
+
+## 2026-08-05 - 400-candidate retrieval pool
+
+- Standardized the shape-only and shape-plus-metadata retrieval pool at 400
+  references before the expensive scoring cascade. This gives borderline
+  candidates more opportunity to survive coarse retrieval without changing
+  the later scoring weights.
+- Extended the synthetic benchmark report through Top-400 while retaining
+  Top-300 as a useful historical comparison point.
+
+## 2026-08-04 - structural scale validation
+
+- Removed the project-wide `scale_median_disagreement` rejection. Hesban PDFs
+  can contain multiple legitimate scan scales within the same source file and
+  render DPI, so structurally valid ruler detections are no longer compared to
+  one global pixels-per-centimetre median.
+- Added compatibility migration for saved median-disagreement records. Legacy
+  automatic rulers with retained endpoints are restored as structurally
+  verified calibrations and their obsolete warning is removed.
+
+## 2026-08-04 — final balanced metadata calibration
+
+- Versioned the matcher as v15 and metadata model as v6. Retained the stronger
+  general v13 metadata bonus and penalty, while halving the aggressive v14
+  severe-diameter quadratic tail and its cap. This is the final middle-ground
+  calibration used for the next 30-query experiment.
+
+## 2026-08-04 — continuing severe-diameter penalty
+
+- Versioned the matcher as v14 and metadata model as v5. Added a smooth,
+  reliability-scaled quadratic penalty beyond a 5 cm rim-diameter gap so
+  severe conflicts continue separating instead of saturating near the generic
+  metadata penalty ceiling. The extra tail remains capped and does not affect
+  close diameter agreement.
+
+## 2026-08-04 — stronger metadata calibration
+
+- Versioned the matcher as v13 and the metadata model as v4. Increased the
+  nominal metadata ceiling from 15% to 22%, the maximum compatibility bonus
+  from 0.018 to 0.030 normalized cost, and the maximum incompatibility penalty
+  from 0.045 to 0.075. This keeps shape primary while giving reliable diameter
+  and fabric evidence more power at retrieval and every cascade cutoff.
+
+## 2026-08-04
+
+### Full-pipeline metadata retrieval
+
+- Versioned the matcher as v12 and changed the 30-query batch so its
+  shape-plus-metadata arm starts from the full reference catalogue. Metadata
+  now influences the 300-candidate retrieval cutoff and every later survivor
+  stage instead of only reranking the fine-scored pool.
+- Kept shape-only and metadata-aware runs independent for an auditable
+  comparison. Missing metadata remains neutral, while reliable severe
+  mismatches such as implausible rim diameters receive a bounded penalty.
+- Added retrieval regression coverage proving that a severe diameter mismatch
+  can evict the nominal shape-only boundary candidate before expensive scoring.
+
+## 2026-08-03
+
+### Incremental review safety and profile recovery
+
+- Fixed Review Profiles so proposal generation is missing-only by default and
+  can be limited to one source PDF. Reviewed accepted masks are never replaced,
+  including when automatic proposals are explicitly refreshed.
+- Restored the 1,099 approved Project 18 profiles from the immutable curator
+  archive after the old UI accidentally regenerated them. The restore created
+  a timestamped backup and left all 139 cards from `Eight_new_Figures_Hesban.pdf`
+  unresolved as the only new review work.
+- Integrated the curator's actual high-resolution workflow into Review
+  Profiles: crops are rendered directly from the source PDF at 600 DPI, edits
+  and guided recovery operate at that resolution, and masks are reduced to the
+  project card size only on save. The large curator-style editor/preview layout,
+  Pan, Original Auto, Autofill (G), cursor outlines, undo, and keyboard controls
+  are available in the main application.
+- Fixed Review & Link source selection so each imported PDF is selectable, with
+  the newest source selected initially. Source-specific linking preserves all
+  unrelated existing figure state.
+- Made canonical-contour construction incremental: unchanged valid contours are
+  preserved and only missing or genuinely changed contours are built.
+
+### Documentation and validation checkpoint
+
+- Added a consolidated research-evidence checkpoint covering the 1,058-reference
+  v9-v11 matcher runs, shape-plus-metadata comparison, corrected 360-query
+  synthetic benchmark, five-photo U-Net/SAM/DeepLab comparison, exploratory
+  type voting, runtime diagnostics, exceptions, and threats to validity.
+- Updated the AAAI-style manuscript and research logs from the saved workbooks,
+  manifests, JSON diagnostics, and changelog rather than relying on remembered
+  headline results.
+- Fresh combined linkage runs now keep unchanged, fully approved figures frozen
+  while processing appended or unfinished figures. Geometry changes still use
+  the existing invalidation path and correctly return affected figures to
+  review.
+- Added and visually verified a 24-page Hesban PDF containing Figures 4.5,
+  3.53, 3.65, 3.76, 3.25, 3.56, 3.88, and 3.84 with p, p+1, and p+2 for each.
+
+- Added a leakage-controlled five-photo segmentation benchmark covering the
+  original U-Net, topology-safe enclosed-hole filling, SAM 2.1 Tiny prompted
+  only from U-Net geometry, and a DeepLabV3+ model trained on the separate 68
+  labelled photographs. It exports identical per-image metrics, aggregate
+  metrics, masks, colour overlays, a visual HTML gallery, and a Markdown
+  summary without changing the manual gold masks.
+
+- Added an isolated five-photograph real-sherd segmentation pilot. It preserves
+  the original JPGs and hashes, runs the existing ResNet-50 U-Net on CUDA when
+  available, proposes adjustable crops, and provides an independent zoomable
+  outline/brush/eraser gold-mask editor. U-Net predictions remain hidden until
+  the gold mask is saved. The pilot then exports lightly smoothed manual and
+  U-Net query blobs plus Dice, IoU, precision, recall, boundary F1, HD95, mean
+  surface distance, and area error reports in CSV and JSON form.
+
+- Added conservative matcher v11. It restores the validated two-channel
+  outline/ribbon retrieval path, preserves every ordinary score top-K candidate,
+  and only appends a small number of channel champions. The v10 timing and
+  candidate-lineage diagnostics remain, while the unvalidated persistent-local
+  retrieval channel is disabled pending held-out testing.
+- Added a separate Hesban query-metadata curator that displays the saved query,
+  fracture trace, rim point, and the read-only catalogue metadata already stored
+  for its known Figure + Item, then stores optional noisy human observations
+  without changing the query geometry. The 30-query batch now exports both
+  shape-only and shape-plus-metadata rankings from the same fine-scored shape
+  pool. Shape and metadata now form one continuous cost with shape carrying the
+  larger share; metadata can move candidates out of the final five but cannot
+  import shape-rejected references. Blank fields are neutral.
+
+- Versioned the shape matcher as `two-wall-joint-fgw-v10`. Local curvature now
+  distinguishes cross-scale persistent fine features from unstable pixel
+  stair-steps instead of broadly smoothing small contour movement. Retrieval
+  adds a persistent-local-shape channel without enlarging the 300-candidate
+  pool; the cascade reserves bounded champions from every retrieval channel
+  through pruning and returns to pure score ordering for the final five.
+- Added per-stage candidate lineage, known-target ranks, and retrieval/coarse/
+  medium/fine timings to matcher results. The medium pass now uses one exact
+  composite hypothesis consistent with coarse pruning, leaving the diverse
+  expensive hypothesis search for finalists and materially reducing repeated
+  work. Confidence thresholds and UI labels remain intentionally deferred.
+
+- Added an optional uncertainty-aware Hesban metadata comparison and fusion
+  module. It supports rim diameter, Munsell colour, non-plastics, voids,
+  manufacture, surface treatment, decoration qualifiers, and firing. Missing
+  fields are neutral; noisy numeric and ordinal differences are gradual rather
+  than hard thresholds; correlated fields are capped; every contribution is
+  explained. Fusion preserves every shape candidate and adapts its influence to
+  available, reliable evidence instead of applying a fixed 50/50 weight. The
+  current matcher remains shape-only until a held-out metadata experiment is
+  explicitly enabled.
+
+## 2026-08-02
+
+### Changed
+
+- Added a resumable sequential runner for the exact 30 reviewed Hesban query
+  artifacts. It reuses their saved fracture/rim annotations, scores a known
+  target separately only when absent from the top five, and writes an isolated
+  Excel workbook without changing the prepared query artifacts.
+- Added a one-time local Hesban query curator for drawing and saving the purple
+  fracture trace and gold rim point across Queries 1-30 before batch matching.
+
+- Versioned the shape matcher as `two-wall-joint-fgw-v9` and expanded the
+  metadata-free retrieval safety pool from 150 to 300 candidates. The coarse,
+  medium, and fine stages now retain 40, 12, and 5 candidates respectively.
+- Added bounded deterministic candidate concurrency. The cheap coarse stage
+  uses up to four workers; POT-based exact stages remain sequential because
+  local timing showed native-solver contention when they were threaded.
+- Added a mild 6% squared unmatched-reference completeness component so a
+  candidate receives a small penalty for explaining only a convenient short
+  interval. The contribution is stored in result diagnostics and displayed in
+  Match Query without changing existing saved runs.
+- Added a seeded synthetic rim-query benchmark and visual preflight galleries.
+  Rim selection now compares both end caps in original upright publication
+  coordinates instead of assuming the contour's nominal seam is archaeological
+  truth.
+
+### Validation
+
+- All 183 automated tests pass. A 90-query clean synthetic retrieval check
+  retained 87 parents in the 300-candidate pool (96.7%), compared with 83 in
+  the former 150-candidate pool (92.2%). A one-query full rerank also confirmed
+  that runtime and intermediate scoring still require further work; it is not
+  presented as an accuracy estimate.
+
+## 2026-07-31
+
+### Added
+
+- Added a non-destructive U-Net dataset preparation command that renders only
+  reviewed vessel rectangles directly from their source PDF as configurable,
+  lossless PNG crops.
+- Added a 20-profile DPI pilot report for comparing existing JPEG-derived cards
+  with direct 600-DPI PDF crops before preparing the full corpus.
+- Added a resumable local training curator with brush, eraser, pan, zoom, undo,
+  approve, reject, draft-save, navigation hotkeys, atomic decisions, immutable
+  approved snapshots, and SHA-256 provenance.
+- Added thin high-contrast brush/eraser cursor rings, conservative isolated-speck
+  cleanup on approval, and an undoable high-DPI recovery action for omitted
+  fracture/profile ink that leaves saved masks untouched until approval.
+- Added compact mixed-precision U-Net training with deterministic train,
+  validation, and unseen test splits; automatic threshold selection and early
+  stopping; a color-coded holdout preview; and separate, resumable predictions
+  for pending masks. Production predictions are anchored to the migrated draft
+  location to reject unrelated drawings without overwriting approved labels.
+- Restored the original SherdScope automatic mask as the curator default after
+  corpus spot-checking showed the 320-pixel U-Net could lose thin detail on very
+  wide crops. Added explicit `O`/`U` controls for optional side-by-side workflow
+  comparison while retaining all generated predictions separately.
+- Added an **All PDFs (combined)** metadata-linking mode for complementary PDF
+  chunks. Combined runs preserve per-page PDF provenance and stop table
+  lookahead at source boundaries while presenting one unified figure queue.
+- Added a confirmed **Approve all flagged contours** action to canonical-contour
+  review. It accepts all successfully built flagged contours atomically while
+  leaving failed extractions unresolved for repair.
+- Fixed Review & Link autosave conflicts caused by the same browser racing its
+  own diameter, column, or background-review action. No-op autosaves no longer
+  increment revisions, same-tab mutations rebase automatically, and genuinely
+  different browser tabs still receive stale-overwrite protection.
+- Fixed Review & Link approval for card filenames containing decimal-like dots
+  (such as `3.1-3.50`). Card IDs now remove only real image extensions, and
+  legacy figure-key collisions are repaired without discarding review data.
+- Fixed the browser-side approval check so an intentionally accepted
+  `unexpected_table_row` warning no longer leaves an otherwise-ready figure's
+  approval button disabled.
+- Combined Review & Link runs now collapse an exact figure repeated across two
+  PDF chunks when both copies contain the same complete, unique vessel-number
+  set, preventing false duplicate-number blockers such as Figure 3.43. When
+  only one source supplies the accepted table pages, its drawing copy is kept
+  (as required for Figure 3.44), and candidate lookahead stays within each PDF.
+- Fixed stale per-figure `queued`/`processing` labels after a completed linkage
+  job has no active queue, so a figure such as 3.50 no longer appears stuck.
+- Fixed Match Query metadata joins for dotted PDF-derived filenames. All
+  references now retain their full card key, allowing available labels to show
+  as `Figure X Item Y` instead of falling back to cryptic filenames.
+- Match Query now omits contour references that have no Figure/Item metadata
+  once `mask_info.csv` exists, so obsolete or not-yet-linked duplicates cannot
+  appear as filename-only matches.
+
+## 2026-07-30
+
+### Added
+
+- Added canonical contour cleaning for approved profile masks, with derived
+  matcher artifacts stored separately from the accepted binary masks.
+- Added a **Match Query** workflow for PNG query masks, including preprocessing,
+  query metadata capture, top-five ranked results, and diagnostic overlays.
+- Added development lookup tools for inspecting a specific `Figure` and `Item`
+  reference and running matcher diagnostics against it even when it is outside
+  the top-five results.
+- Added larger, zoomable query-outline controls and automatic smoothed outline
+  tracing so researchers can provide or correct exterior, interior, and fracture
+  guidance more easily.
+- Added adaptive rim/split hypotheses so ranking is less dependent on one exact
+  hand-placed gold point.
+- Added a cheap retrieval stage before expensive matching. The stage builds a
+  cached index of continuous-outline and two-wall/ribbon descriptors, searches
+  the full reference pool quickly, and forwards a bounded candidate set to the
+  full matcher.
+- Added retrieval diagnostics to result cards, including retrieval rank,
+  outline-retrieval rank and score, ribbon-retrieval rank and score, and the
+  method that selected the candidate.
+
+### Changed
+
+- Removed query Form from matcher input so shape-only validation is not given
+  the answer as metadata.
+- Kept cleaned contour previews in their source orientation; large alignment
+  rotations now belong to the matcher stage rather than the cleaning stage.
+- Reduced reliance on the centreline as a matching curve because query
+  centrelines can bend toward accidental fracture ends.
+- Treated query fracture markings as boundaries for useful evidence rather than
+  as diagnostic wall curves.
+- Tightened matching so both wall curves must align over one shared ordered
+  interval, with extra penalties for unstable transforms, scale disagreement,
+  and implausible tail alignment.
+- Displayed reference identities as `Figure X.X Item Y` where linked metadata is
+  available.
+
+### Fixed
+
+- Fixed matcher crashes caused by out-of-bounds contour indexing on short
+  curves.
+- Fixed matcher errors that displayed only `0.0` instead of useful failure
+  detail.
+- Fixed several diagnostic-view cases where cleaned references appeared flipped
+  or unexpectedly rotated.
+- Fixed result cards to show the cleaned reference artifact used by the matcher
+  instead of the original pixelated mask.
+
+### Validation
+
+- Focused contour and matcher tests passed.
+- Full Python test suite passed.
+- Python compilation passed for the matcher module.
+- JavaScript syntax validation passed for the matcher tab.
+- On the 208-reference development project, cheap retrieval retained the known
+  correct reference for all 80 saved gold-point variants of Queries 1, 3, 7,
+  and 9. Cached retrieval searches took roughly 0.08 seconds after the first
+  index build.
+
 ## 2026-07-24
 
 ### Added

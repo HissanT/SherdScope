@@ -5,6 +5,7 @@ import threading
 import time
 import zipfile
 
+import numpy as np
 import pandas as pd
 import pytest
 from PIL import Image
@@ -440,7 +441,14 @@ def test_clean_export_preview_selection_csv_and_zip(tmp_path, monkeypatch):
 
     profile_dir = project_path / "cards" / "profiles" / "accepted"
     profile_dir.mkdir(parents=True)
-    Image.new("L", (12, 18), 255).save(profile_dir / "page_mask_layer_0_profile.png")
+    profile_mask = Image.new("L", (80, 60), 0)
+    profile_pixels = profile_mask.load()
+    for y in range(10, 40):
+        for x in range(30, 50):
+            profile_pixels[x, y] = 255
+    profile_pixels[2, 2] = 255
+    profile_pixels[70, 50] = 255
+    profile_mask.save(profile_dir / "page_mask_layer_0_profile.png")
     Image.new("L", (12, 18), 255).save(profile_dir / "page_mask_layer_1_profile.png")
 
     profile_preview = client.get(
@@ -463,6 +471,13 @@ def test_clean_export_preview_selection_csv_and_zip(tmp_path, monkeypatch):
     with zipfile.ZipFile(io.BytesIO(profile_dataset.data)) as archive:
         assert "images/HES_Fig2-1_No1_profile.png" in archive.namelist()
         assert "images/HES_Fig2-1_No1.png" not in archive.namelist()
+        cleaned = Image.open(io.BytesIO(archive.read("images/HES_Fig2-1_No1_profile.png")))
+        assert cleaned.size == (144, 184)
+        cleaned_pixels = np.asarray(cleaned)
+        assert cleaned_pixels[0, :].sum() == 0
+        assert cleaned_pixels[:, 0].sum() == 0
+        assert cleaned_pixels[32:152, 32:112].min() == 255
+        assert cleaned_pixels.sum() == 255 * 120 * 80
 
 
 def test_export_setting_edit_preserves_hidden_legacy_exclusions(tmp_path, monkeypatch):
@@ -743,18 +758,27 @@ def test_reviewable_figure_autosaves_during_later_ocr_and_rejects_stale_revision
     client = app_module.app.test_client()
     saved = client.patch(
         f"/api/projects/{project_id}/metadata-link/figures/2.1",
-        json={"reviewer_revision": 0,
+        json={"reviewer_revision": 0, "reviewer_session": "browser-a",
               "table_rows": [{"table_no": "1", "table_type": "Manual value"}]},
     )
     assert saved.status_code == 200
     assert saved.get_json()["reviewer_revision"] == 1
+    assert saved.get_json()["figure"]["reviewer_session"] == "browser-a"
+    no_op = client.patch(
+        f"/api/projects/{project_id}/metadata-link/figures/2.1",
+        json={"reviewer_revision": 1, "reviewer_session": "browser-a",
+              "table_rows": [{"table_no": "1", "table_type": "Manual value"}]},
+    )
+    assert no_op.status_code == 200
+    assert no_op.get_json()["reviewer_revision"] == 1
     stale = client.patch(
         f"/api/projects/{project_id}/metadata-link/figures/2.1",
-        json={"reviewer_revision": 0,
+        json={"reviewer_revision": 0, "reviewer_session": "browser-a",
               "table_rows": [{"table_no": "1", "table_type": "Lost value"}]},
     )
     assert stale.status_code == 409
     assert stale.get_json()["conflict"] is True
+    assert stale.get_json()["same_session"] is True
     assert stale.get_json()["figure"]["table_rows"][0]["table_type"] == "Manual value"
 
 

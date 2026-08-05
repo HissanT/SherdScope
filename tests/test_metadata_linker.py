@@ -24,8 +24,76 @@ from catalog.linkage import (
     validate_figure,
     load_linkage_state,
     load_page_diagnostics,
+    mask_stem,
     migrate_linkage_columns,
 )
+
+
+def test_mask_stem_preserves_dots_inside_extensionless_card_names():
+    card = "Project_Hesban_Complement_3.1-3.50_page_0_mask_layer_10"
+
+    assert mask_stem(card) == card
+    assert mask_stem(f"{card}.png") == card
+
+
+def test_review_defaults_repair_legacy_figure_key_collisions():
+    state = {"figures": [
+        {"figure_id": "3.10", "figure_key": "legacy-collision", "drawings": [
+            {"mask_file": "Hesban_3.1-3.50_page_0_mask_layer_0"}]},
+        {"figure_id": "3.46", "figure_key": "legacy-collision", "drawings": [
+            {"mask_file": "Hesban_3.1-3.50_page_9_mask_layer_0"}]},
+    ]}
+
+    repaired = linker_module._ensure_review_defaults(state)
+
+    keys = [figure["figure_key"] for figure in repaired["figures"]]
+    assert len(set(keys)) == 2
+    assert "legacy-collision" not in keys
+
+
+def test_combined_linker_collapses_exact_figure_repeated_across_pdfs():
+    figure = {
+        "drawing_pages": [
+            {"image_name": "original.jpg", "source_pdf": "queries.pdf"},
+            {"image_name": "duplicate.jpg", "source_pdf": "complement.pdf"},
+        ],
+        "drawings": [
+            {"image_name": "original.jpg", "vessel_number": "1"},
+            {"image_name": "original.jpg", "vessel_number": "2"},
+            {"image_name": "duplicate.jpg", "vessel_number": "1"},
+            {"image_name": "duplicate.jpg", "vessel_number": "2"},
+        ],
+    }
+
+    removed = linker_module._collapse_cross_source_duplicate_drawings(
+        figure, Hesban11Profile())
+
+    assert removed == ["complement.pdf"]
+    assert [page["source_pdf"] for page in figure["drawing_pages"]] == ["queries.pdf"]
+    assert [drawing["image_name"] for drawing in figure["drawings"]] == [
+        "original.jpg", "original.jpg",
+    ]
+
+
+def test_combined_linker_keeps_duplicate_from_table_page_source():
+    figure = {
+        "drawing_pages": [
+            {"image_name": "original.jpg", "source_pdf": "queries.pdf"},
+            {"image_name": "duplicate.jpg", "source_pdf": "complement.pdf"},
+        ],
+        "drawings": [
+            {"image_name": "original.jpg", "vessel_number": "1"},
+            {"image_name": "duplicate.jpg", "vessel_number": "1"},
+        ],
+    }
+
+    removed = linker_module._collapse_cross_source_duplicate_drawings(
+        figure, Hesban11Profile(), preferred_source="complement.pdf")
+
+    assert removed == ["queries.pdf"]
+    assert figure["drawing_pages"] == [
+        {"image_name": "duplicate.jpg", "source_pdf": "complement.pdf"},
+    ]
 
 
 def test_table_rows_are_naturally_ordered_after_targeted_page_replacement():
@@ -589,17 +657,79 @@ def test_approval_rejects_missing_card_instead_of_false_approval(tmp_path):
     assert "Link Status" not in saved.columns
 
 
-def test_multiple_pdf_manifest_requires_source_selection(tmp_path):
+def test_multiple_pdf_manifest_can_run_as_one_combined_source(tmp_path):
     project = make_project(tmp_path)
     manifest_path = project / "page_manifest.json"
     manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
-    extra = dict(manifest["pages"][0], source_pdf="other.pdf", logical_index=99)
+    other_image = project / "images" / "Other_page_0.jpg"
+    Image.new("RGB", (1000, 1400), "white").save(other_image)
+    extra = dict(
+        manifest["pages"][0], image_name=other_image.name,
+        source_pdf="other.pdf", logical_index=99,
+    )
     manifest["pages"].append(extra)
     manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
-    with pytest.raises(AmbiguousSourceError, match="Select one source PDF"):
-        MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+    combined = MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+    assert len(combined["figures"]) == 1
+    assert combined["run_source_pdf"] == ""
     selected = MetadataLinker(project, FakeExtractor(), Hesban11Profile(), "hesban.pdf").run()
     assert len(selected["figures"]) == 1
+
+
+def test_appending_pdf_keeps_approved_figure_frozen_and_processes_new_figure(tmp_path):
+    project = make_project(tmp_path)
+    MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+    apply_approved_figures(project, ["2.1"])
+    approved_before = next(
+        figure for figure in load_linkage_state(project)["figures"]
+        if figure["figure_id"] == "2.1"
+    )
+
+    manifest_path = project / "page_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for offset, printed in enumerate(["216", "217", "218"]):
+        name = f"NewChunk_page_{offset}.jpg"
+        Image.new("RGB", (1000, 1400), "white").save(project / "images" / name)
+        manifest["pages"].append({
+            "image_name": name,
+            "source_pdf": "new-eight-figures.pdf",
+            "pdf_page_index": offset,
+            "printed_page": printed,
+            "split_part": None,
+            "logical_index": 3 + offset,
+            "page_text": f"Figure 3.53{', continued.' if offset else ''}\n",
+            "figure_id": "3.53",
+            "figure_caption": "Figure 3.53",
+        })
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    annots_path = project / "cards" / "mask_info_annots.csv"
+    annots = pd.read_csv(annots_path, dtype=str, keep_default_na=False)
+    annots.loc[len(annots)] = {
+        "bbox": "(100, 100, 300, 300)",
+        "mask_file": "NewChunk_page_0_mask_layer_0.png",
+    }
+    annots.to_csv(annots_path, index=False)
+    info_path = project / "cards" / "mask_info.csv"
+    info = pd.read_csv(info_path, dtype=str, keep_default_na=False)
+    new_info = {column: "" for column in info.columns}
+    new_info.update({
+        "file": "NewChunk_page_0",
+        "mask_file": "NewChunk_page_0_mask_layer_0",
+    })
+    info.loc[len(info)] = new_info
+    info.to_csv(info_path, index=False)
+
+    rerun = MetadataLinker(project, FakeExtractor(), Hesban11Profile()).run()
+    figures = {figure["figure_id"]: figure for figure in rerun["figures"]}
+
+    assert set(figures) == {"2.1", "3.53"}
+    assert figures["2.1"]["review_status"] == "approved"
+    assert figures["2.1"]["processing_status"] == "approved"
+    assert figures["2.1"]["reviewer_revision"] == approved_before["reviewer_revision"]
+    assert figures["2.1"]["approved_at"] == approved_before["approved_at"]
+    assert figures["3.53"]["review_status"] == "pending"
+    assert figures["3.53"]["processing_status"] in {"ready", "reviewable"}
 
 
 def test_missing_required_type_never_becomes_ready():
