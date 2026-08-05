@@ -486,9 +486,34 @@ def compare_metadata(query: Mapping[str, Any] | None,
         "group_costs": {key: round(value, 6) for key, value in group_costs.items()},
         "group_evidence": {k: round(v, 6) for k, v in group_evidence.items()},
         "fields": details,
-        "summary": ("No comparable metadata; shape ranking is unchanged." if not groups else
-                    f"Metadata provides {'supporting' if total > 0 else 'conflicting' if total < 0 else 'neutral'} evidence from {sum(d['status'] == 'compared' for d in details)} field(s)."),
+        # This comparison report does not yet know the shape cost or the
+        # clipped fused score. Do not label the evidence as supporting or
+        # conflicting here: that older explanation path could disagree with
+        # the numeric adjustment ultimately used by fusion.
+        "summary": (
+            "No comparable metadata; shape ranking is unchanged."
+            if not groups else
+            f"Compared {sum(d['status'] == 'compared' for d in details)} metadata field(s)."
+        ),
     }
+
+
+def _fusion_summary(shape_score: float, fused_score: float, compared_fields: int) -> str:
+    """Explain only the effective score change visible in the final result."""
+    if compared_fields <= 0:
+        return "No comparable metadata; final cost is unchanged."
+    delta = fused_score - shape_score
+    if abs(delta) < 5e-9:
+        return (
+            f"Metadata compared {compared_fields} field(s) and did not change "
+            f"the final cost ({shape_score:.6f})."
+        )
+    direction = "raised" if delta > 0 else "lowered"
+    effect = "weakened" if delta > 0 else "strengthened"
+    return (
+        f"Metadata {direction} the cost by {abs(delta):.6f}, from "
+        f"{shape_score:.6f} to {fused_score:.6f}; the match was {effect}."
+    )
 
 
 def fuse_shape_results(results: Iterable[Mapping[str, Any]], query_metadata: Mapping[str, Any],
@@ -581,6 +606,11 @@ def fuse_shape_results(results: Iterable[Mapping[str, Any]], query_metadata: Map
             adjustment = raw_adjustment * availability + diameter_tail_penalty
             fused_score = min(1.0, max(0.0, shape_cost + adjustment))
             metadata_fraction = metadata_weight
+        # Explain the effective, clipped score change—not the independent
+        # evidence accumulator or the pre-clipping raw adjustment.
+        report["summary"] = _fusion_summary(
+            shape_cost, fused_score, int(report["compared_fields"])
+        )
         row["shape_score"] = cost
         row["metadata"] = report
         row["metadata_score"] = metadata_cost

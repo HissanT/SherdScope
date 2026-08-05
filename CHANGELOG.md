@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-08-05 - committed evaluation scorecard
+
+- Added `EVAL_SCORES.md` as the version-controlled scorecard for the latest
+  completed 29-query v15 shape-only and shape-plus-metadata comparison. It
+  records ranks, Top-K flags, costs and gaps, retrieval-channel ranks, cascade
+  survival, paired metadata effects, metadata coverage, Top-5 overlap, and
+  per-stage runtime.
+- Added a reproducible report builder under `scripts/evaluation` so the
+  scorecard can be regenerated from the stored batch manifest and raw run
+  records without manually copying workbook cells.
+
+## 2026-08-05 - unified metadata score explanations
+
+- Made each displayed metadata summary derive from the effective difference
+  between the existing shape score and final clipped fused score. The text can
+  therefore no longer call metadata supportive when the numeric score was
+  penalized, or conflicting when it received a bonus.
+- This is display-only: retrieval, metadata adjustments, fused scores, and
+  ranking are unchanged.
+
 ## 2026-08-05 - repository cleanup
 
 - Moved standalone research commands out of the repository root and into the

@@ -170,6 +170,39 @@ def test_metadata_bonus_and_penalty_are_bounded_and_asymmetric():
     assert abs(off["metadata_adjustment"]) > abs(same["metadata_adjustment"])
 
 
+def test_fusion_summary_uses_the_effective_final_score_change():
+    fused = fuse_shape_results(
+        [
+            {"reference_id": "same", "overall_score": 0.40},
+            {"reference_id": "off", "overall_score": 0.40},
+        ],
+        {"rim_diameter_cm": 20},
+        {
+            "same": {"rim_diameter_cm": 20},
+            "off": {"rim_diameter_cm": 50},
+        },
+    )
+    for row in fused:
+        delta = round(row["fused_score"] - row["shape_score"], 6)
+        summary = row["metadata"]["summary"]
+        assert f"{abs(delta):.6f}" in summary
+        assert f"{row['shape_score']:.6f}" in summary
+        assert f"{row['fused_score']:.6f}" in summary
+        assert ("lowered" in summary) == (delta < 0)
+        assert ("raised" in summary) == (delta > 0)
+
+
+def test_fusion_summary_reports_no_change_when_clipping_absorbs_bonus():
+    row = fuse_shape_results(
+        [{"reference_id": "same", "overall_score": 0.0}],
+        {"rim_diameter_cm": 20},
+        {"same": {"rim_diameter_cm": 20}},
+    )[0]
+    assert row["metadata_adjustment"] < 0
+    assert row["fused_score"] == row["shape_score"] == 0.0
+    assert "did not change the final cost" in row["metadata"]["summary"]
+
+
 def test_vessel_type_contributes_without_becoming_a_hard_rule():
     rows = [
         {"reference_id": "crater", "overall_score": .10},
