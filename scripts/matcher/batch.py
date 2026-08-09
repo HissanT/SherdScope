@@ -17,6 +17,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-count", type=int, default=30)
     parser.add_argument(
+        "--exclude-query",
+        action="append",
+        type=int,
+        default=[],
+        help="Query number to skip; repeat for multiple exclusions.",
+    )
+    parser.add_argument(
         "--metadata",
         type=Path,
         help="Metadata manifest (defaults to project matcher/query_sets/hesban_30_metadata.json)",
@@ -28,6 +35,7 @@ def main() -> int:
             args.output,
             expected_count=args.expected_count,
             metadata_path=args.metadata,
+            excluded_queries=set(args.exclude_query),
         )
     except MatcherBatchError as exc:
         parser.error(str(exc))

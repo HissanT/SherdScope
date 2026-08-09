@@ -90,7 +90,7 @@ ALIASES = {
     "Decor": "decor", "Fire": "fire", "firing": "fire",
 }
 
-EMPTY = {"", "-", "--", "?", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "**"}
+EMPTY = {"", "-", "--", "?", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "*", "**"}
 
 
 def _observation(raw: Any, key: str, config: MetadataFusionConfig) -> Observation | None:

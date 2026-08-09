@@ -1,8 +1,10 @@
 import json
 
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
+import catalog.matcher_benchmark as benchmark_module
 from catalog.contours import build_contour_artifact
 from catalog.matcher import _master_boundary
 from catalog.matcher_benchmark import (
@@ -10,7 +12,10 @@ from catalog.matcher_benchmark import (
     DEFAULT_TOP_K,
     _rim_oriented_boundary,
     _summary,
+    intervals_overlap,
     synthetic_query_from_reference,
+    wilson_interval,
+    write_analysis_outputs,
 )
 
 
@@ -76,6 +81,95 @@ def test_benchmark_summary_counts_missing_as_failure():
     assert summary["top_10"] == 3
     assert summary["missing"] == 1
     assert summary["top_5_accuracy"] == 0.5
+    assert summary["top_5_ci95_low"] < 0.5 < summary["top_5_ci95_high"]
+    assert len(summary["recall_curve"]) == 150
+    assert summary["median_rank_censored"] == 5.5
+
+
+def test_wilson_interval_and_overlap_check():
+    low, high = wilson_interval(50, 100)
+    assert low == pytest.approx(0.4038, abs=0.0002)
+    assert high == pytest.approx(0.5962, abs=0.0002)
+    assert intervals_overlap((0.40, 0.60), (0.55, 0.70))
+    assert not intervals_overlap((0.40, 0.50), (0.51, 0.70))
+
+
+def test_dose_conditions_use_exact_visible_fraction_and_paired_transform():
+    reference = build_contour_artifact(
+        silhouette(), reference_id="parent", source_filename="parent.png"
+    )
+    _, high = synthetic_query_from_reference(
+        reference, rng=np.random.default_rng(33), condition=CONDITIONS["partial_75"]
+    )
+    _, low = synthetic_query_from_reference(
+        reference, rng=np.random.default_rng(33), condition=CONDITIONS["partial_25"]
+    )
+    assert high["coverage"] == high["left_coverage"] == high["right_coverage"] == 0.75
+    assert low["coverage"] == low["left_coverage"] == low["right_coverage"] == 0.25
+    for field in ("rotation_degrees", "scale", "translation"):
+        assert high[field] == low[field]
+
+
+def test_analysis_outputs_include_tables_and_plots(tmp_path):
+    conditions = ("partial_25", "partial_50", "partial_75")
+    report = {
+        "reference_count": 2600,
+        "selected_parent_count": 4,
+        "query_count": 12,
+        "conditions": list(conditions),
+        "summary": {},
+    }
+    rank_sets = {
+        "partial_25": [1, 20, None, None],
+        "partial_50": [1, 4, 30, None],
+        "partial_75": [1, 2, 3, 8],
+    }
+    for condition, ranks in rank_sets.items():
+        rows = [{"rank": rank} for rank in ranks]
+        summary = _summary(rows, "rank")
+        report["summary"][condition] = {
+            "retrieval": summary,
+            "outline": summary,
+            "ribbon": summary,
+            "final": _summary([], "rank"),
+        }
+    artifacts = write_analysis_outputs(report, tmp_path)
+    assert (tmp_path / "summary_top_k.csv").exists()
+    assert (tmp_path / "recall_at_k_1_150.png").exists()
+    assert (tmp_path / "dose_response.png").exists()
+    assert "dose_response_plot" in artifacts
+
+
+def test_run_writes_channel_metrics_and_isolated_outputs(tmp_path, monkeypatch):
+    reference = build_contour_artifact(
+        silhouette(), reference_id="parent", source_filename="parent.png"
+    )
+    monkeypatch.setattr(
+        benchmark_module, "load_ready_artifacts", lambda _project: [reference]
+    )
+
+    def fake_retrieve(_project, _query, references, *, keep):
+        assert keep == benchmark_module.RETRIEVAL_KEEP
+        return [
+            {
+                "artifact": references[0],
+                "retrieval": {"rank": 1, "outline_rank": 2, "ribbon_rank": 3},
+            }
+        ], {"cache_hit": True}
+
+    monkeypatch.setattr(benchmark_module, "retrieve_candidates", fake_retrieve)
+    report = benchmark_module.run_synthetic_benchmark(
+        tmp_path / "project",
+        tmp_path / "run",
+        sample_size=1,
+        condition_names=("partial_75",),
+    )
+    assert report["query_count"] == 1
+    assert report["summary"]["partial_75"]["retrieval"]["top_1"] == 1
+    assert report["summary"]["partial_75"]["outline"]["top_1"] == 0
+    assert report["summary"]["partial_75"]["ribbon"]["top_5"] == 1
+    assert (tmp_path / "run" / "summary.md").exists()
+    assert (tmp_path / "run" / "synthetic_benchmark.json").exists()
 
 
 def test_clean_and_noisy_conditions_share_break_and_transform():

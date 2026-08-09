@@ -200,6 +200,7 @@ def run_saved_query_batch(
     *,
     expected_count: int = 30,
     metadata_path: Path | None = None,
+    excluded_queries: set[int] | None = None,
 ) -> dict[str, Any]:
     project_path, output_root = Path(project_path), Path(output_root)
     queries = discover_reviewed_queries(project_path)
@@ -214,6 +215,16 @@ def run_saved_query_batch(
             f"Expected saved Queries 1-{expected_count}, but found "
             f"{[q['number'] for q in queries]}"
         )
+    excluded = {int(number) for number in (excluded_queries or set())}
+    invalid_exclusions = sorted(
+        number for number in excluded if number < 1 or number > expected_count
+    )
+    if invalid_exclusions:
+        raise MatcherBatchError(
+            f"Excluded query numbers are outside 1-{expected_count}: "
+            f"{invalid_exclusions}"
+        )
+    active_queries = [query for query in queries if query["number"] not in excluded]
     missing_metadata = [number for number in range(1, expected_count + 1) if str(number) not in metadata_queries]
     if missing_metadata:
         raise MatcherBatchError(
@@ -231,6 +242,7 @@ def run_saved_query_batch(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "metadata_algorithm_version": METADATA_VERSION,
         "metadata_manifest_sha256": metadata_sha256,
+        "excluded_queries": sorted(excluded),
         "queries": {},
     }
     if manifest.get("algorithm_version") != MATCHER_ALGORITHM_VERSION:
@@ -241,16 +253,22 @@ def run_saved_query_batch(
         raise MatcherBatchError(
             "The query metadata changed after this batch began; choose a new output folder."
         )
+    if sorted(manifest.get("excluded_queries") or []) != sorted(excluded):
+        raise MatcherBatchError(
+            "This output folder was started with a different query exclusion set; "
+            "choose a new output folder."
+        )
     failures = []
-    for position, query in enumerate(queries, start=1):
+    active_count = len(active_queries)
+    for position, query in enumerate(active_queries, start=1):
         key = str(query["number"])
         saved = (manifest.get("queries") or {}).get(key) or {}
         if saved.get("status") == "complete":
             if saved.get("artifact_sha256") != query["artifact_sha256"]:
                 raise MatcherBatchError(f"{query['label']} was edited after this batch began")
-            print(f"[{position}/{expected_count}] {query['label']}: already complete")
+            print(f"[{position}/{active_count}] {query['label']}: already complete")
             continue
-        print(f"[{position}/{expected_count}] {query['label']}: matching {query['source_filename']}")
+        print(f"[{position}/{active_count}] {query['label']}: matching {query['source_filename']}")
         run_id = uuid.uuid4().hex
         entry = {**query, "run_id": run_id, "status": "running"}
         manifest["queries"][key] = entry

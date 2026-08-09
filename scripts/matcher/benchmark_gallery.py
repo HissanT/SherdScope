@@ -21,6 +21,9 @@ COLORS = {
     "clean": (0, 145, 85),
     "light": (220, 135, 0),
     "moderate": (210, 45, 55),
+    "partial_75": (80, 85, 200),
+    "partial_50": (130, 70, 180),
+    "partial_25": (175, 45, 130),
 }
 
 
@@ -172,7 +175,12 @@ def render_gallery(
         (241, 244, 248),
     )
     header = ImageDraw.Draw(sheet)
-    header.text((20, 15), "Exact examples from the paired 360-query synthetic run", fill=(15, 28, 48), font=_font(27, bold=True))
+    header.text(
+        (20, 15),
+        f"Exact examples from the paired {report['query_count']}-query synthetic run",
+        fill=(15, 28, 48),
+        font=_font(27, bold=True),
+    )
     header.text((20, 47), "Grey = complete approved reference; colour = generated partial query before random display transform", fill=(75, 87, 105), font=_font(16))
     for row_index, parent_id in enumerate(ordered_parent_ids):
         reference = by_id[parent_id]

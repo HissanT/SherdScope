@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-08-08 - DCT shape-retrieval baseline
+
+- Added a paper-inspired, shape-only Discrete Cosine Transform baseline using
+  100-point rim outlines, 20 harmonics, coefficient RMSD, deterministic pose
+  normalization, and an inspectable reference-coverage search.
+- Set the experiment's reference-coverage search to 50% through 100% in 5%
+  increments. Smaller candidates are excluded because the real queries already
+  preserve substantial profile chunks and should not be matched to tiny local
+  sections.
+- Added read-only single-query and paired synthetic experiment commands with
+  versioned JSON/CSV results, summary metrics, protected output directories,
+  and a query reconstruction plot.
+- Added an eight-worker-capable known-parent batch command that consumes the
+  existing 29-query and 40-query manifests, verifies saved artifact hashes,
+  resolves exact Figure/Item parents, and reports combined and per-cohort
+  Top-K ranks and MRR.
+- Added flushed terminal progress for reference-bank construction and every
+  completed batch query, including completed count, true-parent rank, selected
+  coverage, per-query time, and total elapsed time.
+- Added plain-English method and hyperparameter documentation plus regression
+  tests for pose invariance, partial-profile coverage recovery, reconstruction
+  behavior, reproducible output, and invalid configuration handling.
+
+## 2026-08-08 - real-sherd expert evaluation workflow
+
+- Added a guarded, resumable launcher for the 68 smoothed real-sherd queries
+  that reuses the standard isolated record exporter and three-sheet workbook,
+  then generates the non-ground-truth Markdown evaluation and figures.
+- Added a localhost-only 0–3 expert scoring interface with atomic autosave,
+  exact resume behavior, query/candidate notes, a no-acceptable-match flag,
+  flipped-photo support, and keyboard grading for the saved top-N candidates.
+- Added reproducible expert-score CSV export, a generated real-sherd scorecard,
+  and PNG/SVG plots for expert scores, match cost, winner margin, retrieval
+  rank, cost-versus-score correlation, and per-stage runtime.
+
+## 2026-08-06 - complete diagnostic-profile IoU evaluation
+
+- Evaluated all 2,662 preserved automatic profile proposals against their
+  accepted reviewer masks without modifying either artifact set. Added macro
+  IoU, micro-IoU, Dice, precision, recall, percentiles, threshold counts,
+  mask-area change, and the lowest-IoU cases to `PROFILE_IOU_EVAL.md`.
+- Added a reproducible per-profile evaluator under `scripts/evaluation` and
+  regression coverage for exact binary IoU and dimension-mismatch handling.
+- Added the headline segmentation results to `EVAL_SCORES.md`; the complete
+  per-profile measurements remain in the ignored evaluation output directory.
+
 ## 2026-08-05 - committed evaluation scorecard
 
 - Added `EVAL_SCORES.md` as the version-controlled scorecard for the latest
