@@ -7,7 +7,7 @@
     <title>SherdScope - Archaeological Pottery Documentation Tool</title>
     <script>window.SHERDSCOPE_OCR_CELL_DEBUG = {{ ocr_cell_debug|default(false)|tojson }};</script>
     <link rel="icon" href="/static/imgs/sherdscope-logo.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/static/css/style.css?v=20260716-2">
+    <link rel="stylesheet" href="/static/css/style.css?v=20260730-1">
     <style>
         /* Splash Screen Styles */
         .splash-screen {
@@ -342,7 +342,8 @@
                 <button class="tab-button" data-tab="annotation">3. Review Vessel Boxes</button>
                 <button class="tab-button" data-tab="profiles">4. Review Profiles</button>
                 <button class="tab-button" data-tab="tabular">5. Review &amp; Link</button>
-                <button class="tab-button" data-tab="export">6. Export</button>
+                <button class="tab-button" data-tab="matcher">6. Match Query</button>
+                <button class="tab-button" data-tab="export">7. Export</button>
             </div>
 
             <!-- Tab Content -->
@@ -641,24 +642,39 @@
                 <!-- Profile Review Tab -->
                 <div class="tab-content" id="profiles-tab">
                     <div class="tab-layout profile-review-layout">
-                        <div class="controls-panel">
+                        <aside class="controls-panel profile-review-sidebar" aria-label="Diagnostic profile queue">
                             <div class="control-group">
-                                <h3>Diagnostic Profiles (<span id="profile-review-count">0</span>)</h3>
-                                <button class="btn btn-primary btn-block" id="profile-generate-btn">
-                                    Generate profile proposals
-                                </button>
-                                <label class="annotation-vessels-filter profile-filter">
-                                    <input type="checkbox" id="profile-unresolved-only" checked>
-                                    <span>Needs review only</span>
+                                <div class="profile-queue-heading">
+                                    <h3>Diagnostic Profiles (<span id="profile-review-count">0</span>)</h3>
+                                    <button class="btn btn-secondary profile-queue-toggle" id="profile-queue-toggle"
+                                            type="button" aria-expanded="true" aria-controls="profile-queue-body">
+                                        Hide queue
+                                    </button>
+                                </div>
+                                <label class="profile-source-filter">Work on PDF
+                                    <select id="profile-source" class="form-control"
+                                            title="Choose the newly added PDF or all unresolved crops"></select>
                                 </label>
+                                <button class="btn btn-primary btn-block" id="profile-generate-btn">
+                                    Generate missing proposals only
+                                </button>
+                                <p class="info-text">Approved and edited masks are preserved. Choose the new PDF to review only its vessels.</p>
+                                <div class="profile-queue-filters">
+                                    <input id="profile-search" class="form-control" type="search"
+                                           placeholder="Search crop name" aria-label="Search diagnostic profiles">
+                                    <label class="annotation-vessels-filter profile-filter">
+                                        <input type="checkbox" id="profile-unresolved-only" checked>
+                                        <span>Needs review only</span>
+                                    </label>
+                                </div>
                                 <div id="profile-review-summary" class="status-message"></div>
                             </div>
-                            <div class="control-group profile-review-list-wrap">
+                            <div class="control-group profile-review-list-wrap" id="profile-queue-body">
                                 <div id="profile-review-list" class="annotation-image-list"></div>
                             </div>
-                        </div>
+                        </aside>
 
-                        <div class="preview-panel">
+                        <main class="preview-panel profile-review-main">
                             <div id="profile-empty-msg" class="empty-message">
                                 <h3>No crop selected</h3>
                                 <p>Extract approved crops first, then generate profile proposals.</p>
@@ -666,6 +682,10 @@
                             <div id="profile-editor" class="profile-editor" style="display:none;">
                                 <div class="profile-editor-header">
                                     <div>
+                                        <button class="btn btn-secondary profile-queue-show" id="profile-queue-show"
+                                                type="button" hidden aria-controls="profile-queue-body">
+                                            Show queue
+                                        </button>
                                         <strong id="profile-current-name">No crop</strong>
                                         <span id="profile-current-status" class="profile-status-pill">not generated</span>
                                     </div>
@@ -673,32 +693,34 @@
                                         <button class="btn btn-secondary" id="profile-back-btn" disabled>Back</button>
                                         <button class="btn btn-secondary" id="profile-undo-btn" disabled>Undo</button>
                                         <button class="btn btn-secondary" id="profile-zoom-out-btn">Zoom out</button>
-                                        <button class="btn btn-secondary" id="profile-zoom-in-btn">Zoom blob</button>
+                                        <button class="btn btn-secondary" id="profile-zoom-in-btn" title="Zoom toward the current mask (Z)">Zoom blob (Z)</button>
                                         <button class="btn btn-secondary" id="profile-zoom-fit-btn">Fit</button>
-                                        <button class="btn btn-success" id="profile-approve-btn">Approve</button>
-                                        <button class="btn btn-secondary" id="profile-save-edit-btn">Save edit</button>
-                                        <button class="btn btn-secondary" id="profile-reset-btn">Reset auto</button>
-                                        <button class="btn btn-danger" id="profile-no-profile-btn">No profile</button>
+                                        <button class="btn btn-success" id="profile-approve-btn" title="Approve the current profile (A)">Approve (A)</button>
+                                        <button class="btn btn-secondary" id="profile-save-edit-btn" title="Save edit (S)">Save edit (S)</button>
+                                        <button class="btn btn-secondary" id="profile-reset-btn">Original auto (O)</button>
+                                        <button class="btn btn-danger" id="profile-no-profile-btn" title="Reject as no profile (R)">No profile (R)</button>
                                     </div>
                                 </div>
 
                                 <div class="profile-workspace">
                                     <div class="profile-canvas-card">
-                                        <div class="profile-canvas-title">Original crop with editable profile overlay</div>
+                                        <div class="profile-canvas-title">High-resolution crop with editable overlay <small id="profile-working-resolution"></small></div>
                                         <div id="profile-canvas-wrap" class="profile-canvas-wrap">
                                             <canvas id="profile-canvas"></canvas>
                                         </div>
                                     </div>
                                     <div class="profile-canvas-card">
-                                        <div class="profile-canvas-title">Accepted profile mask</div>
+                                        <div class="profile-canvas-title">Training mask preview</div>
                                         <img id="profile-mask-preview" class="profile-mask-preview" alt="Accepted profile mask">
                                     </div>
                                 </div>
 
                                 <div class="editor-controls profile-tools">
                                     <div class="control-cluster">
-                                        <button class="btn btn-tool active" id="profile-brush-tool" data-profile-tool="brush">Brush</button>
-                                        <button class="btn btn-tool" id="profile-eraser-tool" data-profile-tool="eraser">Eraser</button>
+                                        <button class="btn btn-tool active" id="profile-brush-tool" data-profile-tool="brush">Brush (B)</button>
+                                        <button class="btn btn-tool" id="profile-eraser-tool" data-profile-tool="eraser">Eraser (E)</button>
+                                        <button class="btn btn-tool" id="profile-recover-btn" title="Recover omitted thick profile ink (G)">Autofill (G)</button>
+                                        <button class="btn btn-tool" id="profile-pan-tool" data-profile-tool="pan">Pan (P)</button>
                                         <button class="btn btn-tool" id="profile-branch-tool" data-profile-tool="branch">Remove branch</button>
                                         <button class="btn btn-tool" id="profile-rect-tool" data-profile-tool="rect">Rerun rectangle</button>
                                     </div>
@@ -713,8 +735,41 @@
                                     </label>
                                 </div>
                             </div>
-                        </div>
+                        </main>
                     </div>
+
+                    <section class="control-group contour-cleaning-controls">
+                        <h3>Canonical contours</h3>
+                        <p class="info-text">Build only missing or changed contours. Existing approved contours are preserved.</p>
+                        <button class="btn btn-primary" id="contour-clean-btn" disabled>
+                            Build missing contours
+                        </button>
+                        <button class="btn btn-success" id="contour-approve-all-btn" disabled>
+                            Approve all flagged contours
+                        </button>
+                        <div id="contour-library-status" class="status-message"></div>
+                        <div id="contour-flag-list" class="contour-flag-list"></div>
+                    </section>
+
+                    <section class="contour-citation-lookup" aria-labelledby="contour-lookup-title">
+                        <div class="contour-lookup-heading">
+                            <div>
+                                <h3 id="contour-lookup-title">Development boundary-role lookup</h3>
+                                <p>Find the two vessel walls and excluded fracture/terminal curves for a saved figure and item.</p>
+                            </div>
+                            <form id="contour-lookup-form" class="contour-lookup-form">
+                                <label>Figure
+                                    <input id="contour-lookup-figure" class="form-control" placeholder="e.g. 3.17" required>
+                                </label>
+                                <label>Item
+                                    <input id="contour-lookup-item" class="form-control" placeholder="e.g. 10" required>
+                                </label>
+                                <button class="btn btn-primary" type="submit">Show boundary roles</button>
+                            </form>
+                        </div>
+                        <div id="contour-lookup-status" class="status-message"></div>
+                        <div id="contour-lookup-results" class="contour-lookup-results"></div>
+                    </section>
                 </div>
 
                 <!-- Tabular Tab -->
@@ -896,6 +951,125 @@
                     <div id="tabular-status" class="status-message"></div>
                 </div>
 
+                <!-- Matcher Tab -->
+                <div class="tab-content" id="matcher-tab">
+                    <div class="matcher-heading">
+                        <div>
+                            <h2>Partial Profile Matcher</h2>
+                            <p class="subtitle">Upload a PNG, draw the fracture cutoff, then auto-trace the exterior and interior wall curves before comparing with the two-wall reference library.</p>
+                        </div>
+                        <div id="matcher-library-badge" class="matcher-library-badge">Checking contour library…</div>
+                    </div>
+
+                    <section class="matcher-panel matcher-query-panel">
+                        <h3>Query</h3>
+                        <p class="matcher-notice"><strong>Shape-only test:</strong> metadata is stored but is not used in ranking.</p>
+                        <div class="matcher-query-grid">
+                            <div class="matcher-form">
+                                <label>PNG silhouette
+                                    <input id="matcher-query-file" class="form-control" type="file" accept="image/png,.png">
+                                </label>
+                                <div class="matcher-drawing-instructions">
+                                    <strong>Trace the query manually</strong>
+                                    <span>Draw the purple fracture across the broken end, place the gold rim split point, then auto-trace the blue/red wall curves.</span>
+                                    <div class="matcher-drawing-tools" role="toolbar" aria-label="Query curve drawing tools">
+                                        <button type="button" class="btn matcher-curve-tool" data-curve="exterior">Blue: exterior</button>
+                                        <button type="button" class="btn matcher-curve-tool" data-curve="interior">Red: interior</button>
+                                        <button type="button" class="btn matcher-curve-tool active" data-curve="fracture">Purple: fracture</button>
+                                        <button type="button" class="btn matcher-curve-tool" data-curve="rim_point">Gold: rim point</button>
+                                        <button type="button" id="matcher-auto-curves" class="btn btn-secondary">Auto trace blue/red</button>
+                                        <button type="button" id="matcher-undo-curve" class="btn">Undo selected</button>
+                                        <button type="button" id="matcher-clear-curves" class="btn">Clear all</button>
+                                        <span class="matcher-tool-divider" aria-hidden="true"></span>
+                                        <button type="button" id="matcher-zoom-out" class="btn" aria-label="Zoom out">Zoom −</button>
+                                        <button type="button" id="matcher-zoom-in" class="btn" aria-label="Zoom in">Zoom +</button>
+                                        <button type="button" id="matcher-zoom-reset" class="btn">Fit image</button>
+                                        <button type="button" id="matcher-pan-tool" class="btn">Pan</button>
+                                        <output id="matcher-zoom-level" class="matcher-zoom-level">100%</output>
+                                    </div>
+                                    <small>Mouse wheel zooms around the pointer. Choose Pan to drag the enlarged image, then choose a coloured curve to continue drawing.</small>
+                                    <div id="matcher-curve-status" class="matcher-curve-status">Exterior: not drawn · Interior: not drawn · Fracture: not drawn</div>
+                                </div>
+                                <label>Query ID
+                                    <input id="matcher-query-name" class="form-control" placeholder="e.g. experimental_sherd_01">
+                                </label>
+                                <label>Diameter (cm)
+                                    <input id="matcher-query-diameter" class="form-control" type="number" min="0" step="0.01">
+                                </label>
+                                <label>Fabric
+                                    <input id="matcher-query-fabric" class="form-control">
+                                </label>
+                                <label>Surface
+                                    <input id="matcher-query-surface" class="form-control">
+                                </label>
+                                <label class="matcher-notes-field">Notes
+                                    <textarea id="matcher-query-notes" class="form-control" rows="3"></textarea>
+                                </label>
+                                <div class="matcher-query-actions">
+                                    <button id="matcher-preprocess-btn" class="btn btn-secondary">Prepare query</button>
+                                    <button id="matcher-run-btn" class="btn btn-primary" disabled>Run matcher</button>
+                                </div>
+                                <div id="matcher-query-status" class="status-message"></div>
+                            </div>
+                            <div class="matcher-query-previews">
+                                <figure class="matcher-annotation-figure">
+                                    <figcaption>Draw fracture (purple), place rim point (gold), then auto trace exterior (blue) and interior (red)</figcaption>
+                                    <canvas id="matcher-annotation-canvas" aria-label="Manual query contour drawing canvas"></canvas>
+                                    <img id="matcher-upload-preview" alt="" hidden>
+                                </figure>
+                                <figure>
+                                    <figcaption>Prepared query curves</figcaption>
+                                    <img id="matcher-contour-preview" alt="Prepared contour preview">
+                                </figure>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="matcher-panel">
+                        <div class="matcher-results-heading">
+                            <div>
+                                <h3>Top five</h3>
+                                <p>Lower match cost means a closer shape match. This is a distance, not a confidence score. These are candidates, not definitive identifications.</p>
+                            </div>
+                            <div id="matcher-confidence-margin"></div>
+                        </div>
+                        <div id="matcher-progress" class="status-message"></div>
+                        <div id="matcher-results" class="matcher-results">
+                            <div class="empty-list">Prepare and run a query to see results.</div>
+                        </div>
+                        <div class="matcher-forced-score">
+                            <div class="matcher-results-heading">
+                                <div>
+                                    <h3>Development check by Figure + Item</h3>
+                                    <p>Score a known sherd against the same query even if it did not appear in the top five.</p>
+                                </div>
+                            </div>
+                            <form id="matcher-forced-form" class="matcher-forced-form">
+                                <label>Figure
+                                    <input id="matcher-forced-figure" class="form-control" placeholder="e.g. 3.17" required>
+                                </label>
+                                <label>Item
+                                    <input id="matcher-forced-item" class="form-control" placeholder="e.g. 10" required>
+                                </label>
+                                <button type="submit" id="matcher-forced-score-btn" class="btn btn-secondary" disabled>Score this sherd</button>
+                            </form>
+                            <div id="matcher-forced-status" class="status-message"></div>
+                            <div id="matcher-forced-results" class="matcher-results"></div>
+                        </div>
+                        <div class="matcher-evaluation-export">
+                            <div>
+                                <h3>Record this evaluation</h3>
+                                <p>Add this query, ranks 1–5, and the searched sherd above (if scored) to the project Excel workbook. Re-exporting the same run updates it without duplicates.</p>
+                            </div>
+                            <div class="matcher-evaluation-actions">
+                                <button type="button" id="matcher-evaluation-export-btn" class="btn btn-primary" disabled>Add to evaluation workbook</button>
+                                <a id="matcher-evaluation-download" class="btn btn-secondary" href="#" hidden>Download Excel workbook</a>
+                            </div>
+                            <div id="matcher-evaluation-status" class="status-message" aria-live="polite"></div>
+                        </div>
+                    </section>
+                </div>
+
                 <!-- Research Export Tab -->
                 <div class="tab-content" id="export-tab">
                     <div class="research-export-heading">
@@ -983,14 +1157,15 @@
 
     <!-- Scripts -->
     <script src="/static/js/utils.js?v=20251024163500"></script>
-    <script src="/static/js/project-tab.js?v=20251024163500"></script>
+    <script src="/static/js/project-tab.js?v=20260730-1"></script>
     <script src="/static/js/pdf-tab.js?v=20260719"></script>
     <script src="/static/js/model-tab.js?v=20251024163500"></script>
-    <script src="/static/js/annotation-tab.js?v=20251024163500"></script>
-    <script src="/static/js/profiles-tab.js?v=20260724"></script>
-    <script src="/static/js/tabular-tab.js?v=20260719"></script>
+    <script src="/static/js/annotation-tab.js?v=20260730-1"></script>
+    <script src="/static/js/profiles-tab.js?v=20260730-2"></script>
+    <script src="/static/js/tabular-tab.js?v=20260730-1"></script>
+    <script src="/static/js/matcher-tab.js?v=20260730-1"></script>
     <script src="/static/js/export-tab.js?v=20260719"></script>
-    <script src="/static/js/main.js?v=20260716"></script>
+    <script src="/static/js/main.js?v=20260725"></script>
 </body>
 
 </html>

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SherdScope U-Net Dataset Curator</title>
+    <link rel="stylesheet" href="/static/curator.css?v=2">
+</head>
+<body>
+    <header class="topbar">
+        <div>
+            <h1>U-Net profile curator</h1>
+            <p>{{ dataset_name }} · lossless direct-from-PDF candidates</p>
+        </div>
+        <div id="counts" class="counts">Loading…</div>
+    </header>
+
+    <div class="layout">
+        <aside class="queue">
+            <div class="queue-controls">
+                <input id="search" type="search" placeholder="Filter filename">
+                <select id="decision-filter">
+                    <option value="pending">Pending</option>
+                    <option value="all">All</option>
+                    <option value="approved">Approved</option>
+                    <option value="rejected">Rejected</option>
+                </select>
+            </div>
+            <div id="queue-list" class="queue-list"></div>
+        </aside>
+
+        <main class="workspace">
+            <section class="candidate-heading">
+                <div>
+                    <h2 id="candidate-name">Select a candidate</h2>
+                    <p id="candidate-meta"></p>
+                </div>
+                <div class="navigation">
+                    <button id="previous" type="button">← Previous</button>
+                    <button id="next" type="button">Next →</button>
+                </div>
+            </section>
+
+            <section class="tools" aria-label="Mask editing tools">
+                <button type="button" data-tool="brush" class="active">Brush (B)</button>
+                <button type="button" data-tool="eraser">Eraser (E)</button>
+                <button type="button" id="use-original">Original auto (O)</button>
+                <button type="button" id="use-unet">Try U-Net (U)</button>
+                <button type="button" id="recover">Recover profile (G)</button>
+                <button type="button" data-tool="pan">Pan (P)</button>
+                <button type="button" id="undo">Undo (Ctrl+Z)</button>
+                <button type="button" id="zoom-out">Zoom −</button>
+                <button type="button" id="zoom-in">Zoom +</button>
+                <button type="button" id="fit">Fit (F)</button>
+                <label>Brush
+                    <input id="brush-size" type="range" min="2" max="100" value="20">
+                </label>
+                <output id="zoom-level">100%</output>
+            </section>
+
+            <section class="canvases">
+                <figure>
+                    <figcaption>High-resolution crop with editable overlay</figcaption>
+                    <div id="canvas-scroll" class="canvas-scroll">
+                        <canvas id="editor-canvas"></canvas>
+                    </div>
+                </figure>
+                <figure>
+                    <figcaption>Training mask preview</figcaption>
+                    <img id="mask-preview" alt="Current binary training mask">
+                </figure>
+            </section>
+
+            <section class="decision-panel">
+                <label>Review note
+                    <input id="review-note" type="text" placeholder="Optional note">
+                </label>
+                <div>
+                    <button type="button" id="save-draft">Save draft (S)</button>
+                    <button type="button" id="reject" class="danger">Reject (R)</button>
+                    <button type="button" id="approve" class="approve">Approve (A)</button>
+                </div>
+            </section>
+            <div id="status" class="status" aria-live="polite"></div>
+        </main>
+    </div>
+    <script src="/static/curator.js?v=3"></script>
+</body>
+</html>

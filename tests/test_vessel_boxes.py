@@ -77,6 +77,47 @@ def test_model_processor_saves_each_box_confidence_and_instance_mask_separately(
     assert all(path.exists() for path in evidence)
 
 
+def test_model_processor_preserves_dotted_filename_when_saving_page_mask(tmp_path):
+    images = tmp_path / "images"
+    masks = tmp_path / "masks"
+    images.mkdir()
+    masks.mkdir()
+    filename = "Hesban_Complement_3.1-3.50_page_0.png"
+    expected_stem = "Hesban_Complement_3.1-3.50_page_0"
+    legacy_collision = masks / "Hesban_Complement_3_mask_layer.png"
+    legacy_collision.write_bytes(b"existing mask must remain untouched")
+    Image.new("RGB", (40, 30), "white").save(images / filename)
+
+    class TensorLike:
+        def __init__(self, value): self.value = np.asarray(value)
+        def cpu(self): return self
+        def numpy(self): return self.value
+
+    class Boxes:
+        xyxy = TensorLike([[5, 5, 25, 25]])
+        conf = TensorLike([0.9])
+
+    instance_masks = np.zeros((1, 30, 40), dtype=np.float32)
+    instance_masks[0, 5:25, 5:25] = 1
+
+    class Masks:
+        data = TensorLike(instance_masks)
+
+    class Result:
+        boxes = Boxes()
+        masks = Masks()
+
+    class Model:
+        def predict(self, *_args, **_kwargs): return [Result()]
+
+    processor = ModelProcessor(ModelConfig(models_dir=tmp_path, pred_output_dir=tmp_path))
+    processor._process_single_image(filename, images, Model(), 0.5, 1, 0, masks)
+
+    assert (masks / f"{expected_stem}_mask_layer.png").exists()
+    assert read_vessel_boxes(masks, expected_stem) is not None
+    assert legacy_collision.read_bytes() == b"existing mask must remain untouched"
+
+
 def test_overlapping_detections_keep_distinct_ids_across_reordered_model_output(tmp_path):
     first = reconcile_yolo_detections(
         tmp_path, "page", [500, 400],

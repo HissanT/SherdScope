@@ -12,6 +12,7 @@ from catalog.measurements import (
     detect_rim_diameter,
     manual_calibration,
     measure_figure,
+    normalize_calibration,
     verified_measurement,
 )
 from catalog.sidecars import assign_px_per_cm
@@ -118,7 +119,7 @@ def test_detects_faint_broken_and_noisy_structural_rulers(tmp_path):
         assert 24 < result["px_per_cm"] < 27
 
 
-def test_independent_project_median_rejects_outlier_scale(tmp_path):
+def test_structurally_valid_scale_is_not_rejected_by_project_median(tmp_path):
     project = tmp_path / "median"
     (project / "images").mkdir(parents=True)
     (project / "cards").mkdir()
@@ -134,9 +135,25 @@ def test_independent_project_median_rejects_outlier_scale(tmp_path):
     }
     measure_figure(project, figure, project_ratios=[25, "bad ratio"])
     calibration = figure["scale_calibrations"][page.name]
-    assert calibration["status"] == "unresolved"
-    assert calibration["warning"] == "scale_median_disagreement"
-    assert figure["drawings"][0]["measurement"]["status"] == "unresolved"
+    assert calibration["status"] == "verified_automatic"
+    assert "warning" not in calibration
+    assert figure["drawings"][0]["measurement"]["status"] == "verified_automatic"
+
+
+def test_legacy_median_disagreement_is_restored_from_structural_evidence():
+    calibration = normalize_calibration({
+        "status": "unresolved",
+        "warning": "scale_median_disagreement",
+        "project_median_px_per_cm": 38.9,
+        "method": "automatic",
+        "p1": [0, 0],
+        "p2": [513, 0],
+        "real_cm": 10,
+    })
+    assert calibration["status"] == "verified_automatic"
+    assert calibration["px_per_cm"] == 51.3
+    assert "warning" not in calibration
+    assert "project_median_px_per_cm" not in calibration
 
 
 def test_diameter_uses_detected_rim_ink_not_card_bbox(tmp_path):

@@ -16,6 +16,7 @@ import threading
 import shutil
 import tempfile
 import secrets
+import fitz
 from PIL import Image
 
 from processors import (
@@ -97,11 +98,14 @@ from catalog.profile_segmentation import (
     profile_mask_path,
     propose_profile_mask,
     read_profile_review,
+    recover_profile_mask,
     save_profile_mask,
     write_profile_review,
 )
 from routes.research_export import register_research_export_routes
+from routes.matcher import register_matcher_routes
 from services.linkage_jobs import LinkageJobCoordinator
+from services.matcher_jobs import MatcherJobCoordinator
 
 # Stable aliases used by the shared JSON-repair helpers below.
 _re = re
@@ -116,6 +120,8 @@ app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 # Initialize Project Manager
 project_manager = ProjectManager(projects_root="projects")
 register_research_export_routes(app, lambda: project_manager)
+matcher_job_coordinator = MatcherJobCoordinator()
+register_matcher_routes(app, lambda: project_manager, matcher_job_coordinator)
 
 # === Gemma 4 AI model (lazy loaded for bibliographic extraction) ===
 _gemma_model = None
@@ -1891,6 +1897,102 @@ def serve_project_card_modified(project_id, filename):
         return jsonify({'error': str(e), 'success': False}), 404
 
 
+def _profile_card_sources(project_path):
+    """Return crop filename -> source PDF and newest-first source choices."""
+    project_path = Path(project_path)
+    def read_document(path):
+        if not path.is_file():
+            return {}
+        try:
+            with open(path, encoding='utf-8') as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    pages_document = read_document(project_path / 'page_manifest.json')
+    pages = pages_document.get('pages', []) if isinstance(pages_document, dict) else []
+    source_by_image = {
+        Path(str(page.get('image_name') or '')).stem: str(page.get('source_pdf') or '')
+        for page in pages if isinstance(page, dict)
+    }
+    crop_document = read_document(project_path / 'cards' / 'vessel_crops.json')
+    vessels = crop_document.get('vessels', []) if isinstance(crop_document, dict) else []
+    source_by_card = {
+        str(vessel.get('crop_file') or ''): source_by_image.get(
+            Path(str(vessel.get('image') or '')).stem, '')
+        for vessel in vessels if isinstance(vessel, dict) and vessel.get('crop_file')
+    }
+    pdf_root = project_path / 'pdf_source'
+    sources = [path.name for path in sorted(
+        pdf_root.glob('*.pdf'), key=lambda path: path.stat().st_mtime, reverse=True)]
+    return source_by_card, sources
+
+
+def _highres_profile_image(project_path, filename, dpi=600):
+    """Render one vessel crop directly from its PDF for lossless review."""
+    project_path = Path(project_path)
+    cards_path = project_path / 'cards'
+    with open(cards_path / 'vessel_crops.json', encoding='utf-8') as handle:
+        crop_doc = json.load(handle)
+    with open(project_path / 'page_manifest.json', encoding='utf-8') as handle:
+        page_doc = json.load(handle)
+    crop = next((item for item in crop_doc.get('vessels', [])
+                 if item.get('crop_file') == filename), None)
+    if not crop:
+        raise ValueError('Crop provenance was not found')
+    page = next((item for item in page_doc.get('pages', [])
+                 if Path(str(item.get('image_name') or '')).stem == crop.get('image')), None)
+    if not page:
+        raise ValueError('PDF page provenance was not found')
+    source_pdf = project_path / 'pdf_source' / str(page.get('source_pdf') or '')
+    if not source_pdf.is_file():
+        raise ValueError('Source PDF was not found')
+    cache = cards_path / PROFILE_DIR / 'highres_600dpi' / filename
+    dependencies = [source_pdf, cards_path / 'vessel_crops.json', project_path / 'page_manifest.json']
+    if cache.is_file() and cache.stat().st_mtime_ns >= max(path.stat().st_mtime_ns for path in dependencies):
+        return cache
+
+    provenance = crop.get('mask_provenance') or {}
+    source_size = provenance.get('source_image_size')
+    with fitz.open(str(source_pdf)) as document:
+        page_index = int(page.get('pdf_page_index'))
+        if not 0 <= page_index < len(document):
+            raise ValueError('PDF page index is invalid')
+        pdf_page = document[page_index]
+        if not (isinstance(source_size, list) and len(source_size) == 2):
+            source_dpi = int(page.get('render_dpi') or 400)
+            source_size = [
+                round(pdf_page.rect.width * source_dpi / 72),
+                round(pdf_page.rect.height * source_dpi / 72),
+            ]
+        source_width, source_height = map(float, source_size)
+        x1, y1, x2, y2 = map(float, crop.get('crop_bbox') or [])
+        split_side = page.get('split_side')
+        if split_side in {'left', 'right'}:
+            full_width = source_width * 2
+            if split_side == 'right':
+                x1 += source_width
+                x2 += source_width
+        else:
+            full_width = source_width
+        clip = fitz.Rect(
+            pdf_page.rect.x0 + x1 / full_width * pdf_page.rect.width,
+            pdf_page.rect.y0 + y1 / source_height * pdf_page.rect.height,
+            pdf_page.rect.x0 + x2 / full_width * pdf_page.rect.width,
+            pdf_page.rect.y0 + y2 / source_height * pdf_page.rect.height,
+        ) & pdf_page.rect
+        if clip.is_empty:
+            raise ValueError('Crop does not intersect its PDF page')
+        pixmap = pdf_page.get_pixmap(dpi=int(dpi), clip=clip, alpha=False,
+                                     colorspace=fitz.csRGB)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_suffix('.tmp.png')
+        pixmap.save(str(temporary))
+        os.replace(temporary, cache)
+    return cache
+
+
 @app.route('/api/projects/<project_id>/profiles', methods=['GET'])
 def get_project_profiles(project_id):
     """List approved crops and their diagnostic-profile review state."""
@@ -1905,6 +2007,7 @@ def get_project_profiles(project_id):
 
         document = read_profile_review(cards_path)
         records = document.get('profiles', {})
+        source_by_card, profile_sources = _profile_card_sources(cards_path.parent)
         profiles = []
         for card_path in list_card_files(cards_path):
             filename = card_path.name
@@ -1917,10 +2020,12 @@ def get_project_profiles(project_id):
             profiles.append({
                 'filename': filename,
                 'card_url': f'/api/projects/{project_id}/card/{filename}',
+                'highres_card_url': f'/api/projects/{project_id}/profiles/{filename}/highres',
                 'width': width,
                 'height': height,
                 'review_status': record.get('review_status') or 'not_generated',
                 'review_note': record.get('review_note') or '',
+                'source_pdf': source_by_card.get(filename, ''),
                 'proposal': proposal,
                 'auto_mask_url': (
                     f'/api/projects/{project_id}/profile-mask/auto/{filename}'
@@ -1935,10 +2040,25 @@ def get_project_profiles(project_id):
         return jsonify({
             'profiles': profiles,
             'total': len(profiles),
+            'sources': profile_sources,
             'success': True,
         })
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/profiles/<filename>/highres')
+def serve_highres_project_profile(project_id, filename):
+    """Serve the curator-quality 600-DPI crop rendered directly from the PDF."""
+    try:
+        project_path = project_manager.get_project_path(project_id)
+        safe_name = secure_filename(filename)
+        if safe_name != filename:
+            return jsonify({'error': 'Invalid filename', 'success': False}), 400
+        image_path = _highres_profile_image(project_path, filename)
+        return send_file(image_path, mimetype='image/png', max_age=0)
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 404
 
 
 @app.route('/api/projects/<project_id>/profiles/propose', methods=['POST'])
@@ -1953,7 +2073,23 @@ def propose_project_profiles(project_id):
             return jsonify({'error': 'Extract approved crops first.', 'success': False}), 404
 
         data = request.json or {}
-        summary = generate_profile_proposals(cards_path, force=bool(data.get('force')))
+        force = bool(data.get('force'))
+        if force and not bool(data.get('confirm_replace_auto')):
+            return jsonify({
+                'error': ('Auto-regeneration requires explicit confirmation. '
+                          'Reviewed accepted masks will still be preserved.'),
+                'success': False,
+            }), 400
+        source_pdf = str(data.get('source_pdf') or '').strip()
+        source_by_card, sources = _profile_card_sources(cards_path.parent)
+        if source_pdf and source_pdf not in sources:
+            return jsonify({'error': 'Selected source PDF was not found',
+                            'success': False}), 400
+        targets = ({name for name, source in source_by_card.items()
+                    if source == source_pdf} if source_pdf else None)
+        summary = generate_profile_proposals(
+            cards_path, force=force, target_filenames=targets)
+        summary['source_pdf'] = source_pdf
         return jsonify({'summary': summary, 'success': True})
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
@@ -1996,7 +2132,8 @@ def rerun_project_profile_rect(project_id, filename):
         bbox = data.get('bbox') or []
         if len(bbox) != 4:
             return jsonify({'error': 'Rectangle bbox must contain four coordinates', 'success': False}), 400
-        with Image.open(card_path) as raw_img:
+        working_path = _highres_profile_image(cards_path.parent, filename)
+        with Image.open(working_path) as raw_img:
             card_img = raw_img.convert('RGB')
         width, height = card_img.size
         x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
@@ -2019,6 +2156,49 @@ def rerun_project_profile_rect(project_id, filename):
         })
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/projects/<project_id>/profiles/<filename>/recover', methods=['POST'])
+def recover_project_profile(project_id, filename):
+    """Return the curator-style guided recovery proposal without saving it."""
+    try:
+        cards_path = project_manager.get_project_path(project_id, 'cards')
+        if not cards_path or not cards_path.exists():
+            return jsonify({'error': 'Cards folder not found', 'success': False}), 404
+        safe_name = secure_filename(filename)
+        if safe_name != filename:
+            return jsonify({'error': 'Invalid filename', 'success': False}), 400
+        card_path = cards_path / filename
+        if not card_path.exists() or card_path.parent != cards_path:
+            return jsonify({'error': 'Crop image not found', 'success': False}), 404
+        data = request.get_json(silent=True) or {}
+        mask_data = str(data.get('mask_data') or '')
+        if ',' in mask_data:
+            mask_data = mask_data.split(',', 1)[1]
+        working_path = _highres_profile_image(cards_path.parent, filename)
+        with Image.open(working_path) as raw_card:
+            card = raw_card.convert('RGB')
+        try:
+            payload = base64.b64decode(mask_data, validate=True)
+            with Image.open(BytesIO(payload)) as raw_mask:
+                current = raw_mask.convert('L')
+        except Exception as exc:
+            raise ValueError('Current profile mask is not a valid PNG') from exc
+        if current.size != card.size:
+            raise ValueError('Current profile mask dimensions do not match the crop')
+        recovered, evidence = recover_profile_mask(card, current)
+        buffer = BytesIO()
+        Image.fromarray(recovered, mode='L').save(buffer, format='PNG')
+        encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
+        return jsonify({
+            'success': True,
+            'mask_data': f'data:image/png;base64,{encoded}',
+            **evidence,
+        })
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'success': False}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'success': False}), 500
 
 
 @app.route('/api/projects/<project_id>/profiles/<filename>', methods=['POST'])
@@ -3358,7 +3538,11 @@ def get_project_metadata_link_state(project_id):
     if not project_path:
         return jsonify({'error': 'Project not found', 'success': False}), 404
     state = load_linkage_state(project_path)
-    sources = [p.name for p in sorted((project_path / 'pdf_source').glob('*.pdf'))]
+    sources = [p.name for p in sorted(
+        (project_path / 'pdf_source').glob('*.pdf'),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )]
     jobs = linkage_job_coordinator.snapshot(project_id, project_path, ensure_worker=False)
     if (state.get('status') in {'running', 'paused'} and not jobs.get('active') and
             not jobs.get('paused') and not jobs.get('queued')):
@@ -3370,6 +3554,19 @@ def get_project_metadata_link_state(project_id):
         jobs = linkage_job_coordinator.snapshot(project_id, project_path)
     else:
         jobs = linkage_job_coordinator.snapshot(project_id, project_path)
+    # A worker can finish or be interrupted after it has marked an individual
+    # figure queued. If the project itself is complete and the durable queue is
+    # empty, that flag is stale—not an active recalculation. Recover the UI
+    # status while preserving the review/needs-review result and all table data.
+    if (state.get('status') == 'complete' and not jobs.get('active') and
+            not jobs.get('paused') and not jobs.get('queued')):
+        stale_figures = [figure for figure in state.get('figures', [])
+                         if figure.get('processing_status') in {'queued', 'processing'}]
+        if stale_figures:
+            for figure in stale_figures:
+                figure['processing_status'] = (
+                    'ready' if figure.get('status') == 'ready' else 'reviewable')
+            save_linkage_state(project_path, state)
     ocr_health = get_local_ocr_health()
     ocr_available = bool(ocr_health.get('available'))
     summaries = []
@@ -3473,6 +3670,7 @@ def update_project_metadata_link_columns(project_id, figure_id, filename):
         return jsonify({'error': 'Assigned table page not found', 'success': False}), 404
     data = request.get_json(silent=True) or {}
     current_revision = int(figure.get('reviewer_revision', 0) or 0)
+    reviewer_session = str(data.get('reviewer_session') or '')[:128]
     try:
         submitted_revision = int(data.get('reviewer_revision', current_revision))
     except (TypeError, ValueError):
@@ -3481,7 +3679,11 @@ def update_project_metadata_link_columns(project_id, figure_id, filename):
     if submitted_revision != current_revision:
         return jsonify({'error': 'This figure has a newer saved draft',
                         'success': False, 'conflict': True,
-                        'reviewer_revision': current_revision}), 409
+                        'figure': figure,
+                        'reviewer_revision': current_revision,
+                        'same_session': bool(
+                            reviewer_session and
+                            reviewer_session == figure.get('reviewer_session'))}), 409
     if request.method == 'DELETE':
         page.pop('manual_column_edges', None)
         action = 'column_override_reset'
@@ -3510,6 +3712,7 @@ def update_project_metadata_link_columns(project_id, figure_id, filename):
         boundary['column_source'] = 'manual_pending'
         action = 'column_override_saved'
     figure['reviewer_revision'] = current_revision + 1
+    figure['reviewer_session'] = reviewer_session
     figure['review_status'] = 'pending'
     figure['processing_status'] = 'queued'
     figure['draft_saved_at'] = __import__('datetime').datetime.now(
@@ -3655,6 +3858,19 @@ def get_project_metadata_link_evidence(project_id, filename):
             image = image.crop(tuple(int(value) for value in page['crop']))
     else:
         draw = ImageDraw.Draw(image)
+        try:
+            box_opacity = max(0.0, min(1.0, float(request.args.get('overlay', '1'))))
+        except (TypeError, ValueError):
+            box_opacity = 1.0
+        box_layer = None
+        box_draw = draw
+        if box_opacity < 1.0:
+            box_layer = PILImage.new('RGBA', image.size, (0, 0, 0, 0))
+            box_draw = ImageDraw.Draw(box_layer)
+        box_alpha = round(255 * box_opacity)
+        def box_color_with_alpha(color):
+            return (*color, box_alpha)
+
         highlighted_mask = Path(str(request.args.get('highlight', ''))).stem
         font_size = max(40, min(76, round(image.width / 52)))
         try:
@@ -3688,8 +3904,11 @@ def get_project_metadata_link_evidence(project_id, filename):
             label = drawing.get('vessel_number') or '?'
             selected = highlighted_mask and Path(str(drawing.get('mask_file', ''))).stem == highlighted_mask
             box_color = (250, 204, 21) if selected else (255, 80, 0)
-            draw.rectangle((x1, y1, x2, y2), outline=box_color,
-                           width=line_width * 2 if selected else line_width)
+            rendered_box_color = (
+                box_color if box_layer is None else box_color_with_alpha(box_color))
+            if box_opacity > 0:
+                box_draw.rectangle((x1, y1, x2, y2), outline=rendered_box_color,
+                                   width=line_width * 2 if selected else line_width)
             label_text = f"No. {label}"
             text_box = draw.textbbox((0, 0), label_text, font=font, stroke_width=1)
             text_width = text_box[2] - text_box[0]
@@ -3697,9 +3916,15 @@ def get_project_metadata_link_evidence(project_id, filename):
             pad = max(8, font_size // 5)
             tag_top = max(0, y1 - text_height - pad * 2)
             tag_right = min(image.width, x1 + text_width + pad * 2)
-            draw.rectangle((x1, tag_top, tag_right, y1), fill=box_color)
-            draw.text((x1 + pad, tag_top + pad // 2), label_text, fill='white',
-                      font=font, stroke_width=1, stroke_fill=(120, 35, 0))
+            if box_opacity > 0:
+                box_draw.rectangle((x1, tag_top, tag_right, y1),
+                                   fill=rendered_box_color)
+                box_draw.text(
+                    (x1 + pad, tag_top + pad // 2), label_text,
+                    fill=('white' if box_layer is None else (255, 255, 255, box_alpha)),
+                    font=font, stroke_width=1,
+                    stroke_fill=((120, 35, 0) if box_layer is None
+                                 else (120, 35, 0, box_alpha)))
             if request.args.get('measurement') == '1':
                 measurement = drawing.get('measurement', {})
                 endpoints = measurement.get('rim_endpoints')
@@ -3719,6 +3944,8 @@ def get_project_metadata_link_evidence(project_id, filename):
                 if centreline:
                     draw.line(tuple(centreline), fill=(168, 85, 247),
                               width=measurement_line_width)
+        if box_layer is not None and box_opacity > 0:
+            image = PILImage.alpha_composite(image.convert('RGBA'), box_layer).convert('RGB')
     if request.args.get('full') != '1':
         image.thumbnail((1800, 1800), PILImage.Resampling.LANCZOS)
     buffer = BytesIO()
@@ -3747,6 +3974,7 @@ def update_project_metadata_link_figure(project_id, figure_id):
                         'success': False, 'processing': True}), 409
     submitted_revision = data.get('reviewer_revision')
     current_revision = int(figure.get('reviewer_revision', 0) or 0)
+    reviewer_session = str(data.get('reviewer_session') or '')[:128]
     try:
         submitted_revision = (None if submitted_revision is None
                               else int(submitted_revision))
@@ -3756,7 +3984,31 @@ def update_project_metadata_link_figure(project_id, figure_id):
     if submitted_revision is not None and submitted_revision != current_revision:
         return jsonify({'error': 'This figure has a newer saved draft',
                         'success': False, 'conflict': True,
-                        'figure': figure, 'reviewer_revision': current_revision}), 409
+                        'figure': figure, 'reviewer_revision': current_revision,
+                        'same_session': bool(
+                            reviewer_session and
+                            reviewer_session == figure.get('reviewer_session'))}), 409
+    def editable_snapshot(value):
+        return {
+            'figure_id': value.get('figure_id', ''),
+            'figure_caption': value.get('figure_caption', ''),
+            'drawings': [
+                {
+                    'mask_file': item.get('mask_file', ''),
+                    'vessel_number': item.get('vessel_number', ''),
+                    'measurement': item.get('measurement', {}),
+                }
+                for item in value.get('drawings', [])
+            ],
+            'table_rows': value.get('table_rows', []),
+            'table_pages': value.get('table_pages', []),
+            'scale_calibrations': value.get('scale_calibrations', {}),
+            'warning_overrides': value.get('warning_overrides', {}),
+            'review_overrides': value.get('review_overrides', {}),
+            'review_status': value.get('review_status', ''),
+        }
+    editable_before = json.dumps(
+        editable_snapshot(figure), sort_keys=True, default=str)
     changed_fields = []
     if 'figure_id' in data:
         corrected_id = get_profile(state.get('profile', 'hesban11')).normalize_figure(data['figure_id'])
@@ -4053,8 +4305,12 @@ def update_project_metadata_link_figure(project_id, figure_id):
             }
         figure['warning_overrides'] = submitted_overrides
         changed_fields.append('warning_overrides')
+    if changed_fields and json.dumps(
+            editable_snapshot(figure), sort_keys=True, default=str) == editable_before:
+        changed_fields = []
     if changed_fields:
         figure['reviewer_revision'] = current_revision + 1
+        figure['reviewer_session'] = reviewer_session
         figure['draft_saved_at'] = __import__('datetime').datetime.now(
             __import__('datetime').timezone.utc).isoformat()
         if figure.get('review_status') == 'approved':

@@ -15,7 +15,10 @@ from pathlib import Path
 import re
 import zipfile
 
+import numpy as np
 import pandas as pd
+from PIL import Image
+from skimage.measure import label, regionprops
 
 from catalog.linkage import PUBLIC_LINKAGE_MAP, load_linkage_state, migrate_linkage_columns
 from catalog.profile_segmentation import ACCEPTED_DIR, profile_mask_path, read_profile_review
@@ -24,6 +27,9 @@ from catalog.profiles import HESBAN_COLUMN_SPECS
 
 EXPORT_SCHEMA_VERSION = 1
 EXPORT_SETTINGS_NAME = "export_settings.json"
+PROFILE_EXPORT_PADDING_RATIO = 0.12
+PROFILE_EXPORT_MIN_PADDING = 8
+PROFILE_EXPORT_SCALE = 4
 
 EXPORT_COLUMNS = [
     "Image Filename", "Figure", "No.", "Vessel Type", "Rim Diameter (cm)",
@@ -83,6 +89,42 @@ def _resolve_profile_mask(cards_path: Path, card: Path) -> Path | None:
     if path.is_file():
         return path
     return None
+
+
+def _profile_export_png_bytes(source: Path) -> bytes:
+    """Create the clean high-resolution profile mask used in dataset exports."""
+    with Image.open(source) as image:
+        mask = np.asarray(image.convert("L")) > 0
+
+    labels = label(mask, connectivity=2)
+    regions = sorted(regionprops(labels), key=lambda region: region.area, reverse=True)
+    if not regions:
+        output = Image.new("L", (1, 1), 0)
+    else:
+        main = labels == regions[0].label
+        y1, x1, y2, x2 = regions[0].bbox
+        crop = main[y1:y2, x1:x2]
+        blob_height, blob_width = crop.shape
+        padding = max(
+            PROFILE_EXPORT_MIN_PADDING,
+            int(round(max(blob_width, blob_height) * PROFILE_EXPORT_PADDING_RATIO)),
+        )
+        padded = np.zeros(
+            (blob_height + padding * 2, blob_width + padding * 2), dtype=np.uint8
+        )
+        padded[padding:padding + blob_height, padding:padding + blob_width] = (
+            crop.astype(np.uint8) * 255
+        )
+        output = Image.fromarray(padded, mode="L")
+
+    if PROFILE_EXPORT_SCALE > 1:
+        output = output.resize(
+            (output.width * PROFILE_EXPORT_SCALE, output.height * PROFILE_EXPORT_SCALE),
+            Image.Resampling.NEAREST,
+        )
+    payload = BytesIO()
+    output.save(payload, format="PNG")
+    return payload.getvalue()
 
 
 def load_export_settings(project_path: Path) -> dict:
@@ -241,7 +283,12 @@ def dataset_zip_bytes(result: dict, project_name: str) -> bytes:
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("metadata.csv", csv_bytes(result["frame"]))
         for source, export_name, _ in result["images"]:
-            archive.write(source, f"images/{export_name}")
+            if result["summary"].get("image_mode") == "profile":
+                archive.writestr(
+                    f"images/{export_name}", _profile_export_png_bytes(source)
+                )
+            else:
+                archive.write(source, f"images/{export_name}")
         dictionary = StringIO()
         writer = csv.writer(dictionary, lineterminator="\n")
         writer.writerow(["Column", "Description"])

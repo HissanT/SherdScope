@@ -58,6 +58,9 @@ class TabManager {
                 case 'tabular':
                     await refreshTabularTab();
                     break;
+                case 'matcher':
+                    await refreshMatcherTab();
+                    break;
                 case 'export':
                     await refreshExportTab();
                     break;
@@ -169,6 +172,15 @@ async function refreshExportTab() {
     }
 }
 
+async function refreshMatcherTab() {
+    console.log('Refreshing matcher tab...');
+    if (window.loadMatcherTab) {
+        await window.loadMatcherTab();
+    } else {
+        console.warn('loadMatcherTab function not available');
+    }
+}
+
 // Initialize application
 document.addEventListener('DOMContentLoaded', () => {
     console.log('SherdScope Flask app initialized');
@@ -233,6 +245,7 @@ window.PyPotteryApp = {
     refreshProfilesTab,
     refreshTabularTab,
     refreshExportTab,
+    refreshMatcherTab,
     updateTabsState
 };
 

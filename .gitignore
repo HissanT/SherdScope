@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
+.codex_tmp/
+.cleanup_quarantine_*/
 .coverage
 htmlcov/
 
@@ -19,6 +22,7 @@ outputs/
 pdf2img_outputs/
 uploads/
 tmp/
+temp_uploads/
 logs/
 !logs/
 logs/*

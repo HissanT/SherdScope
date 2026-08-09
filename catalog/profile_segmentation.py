@@ -19,6 +19,7 @@ from PIL import Image
 from scipy.ndimage import (
     binary_dilation,
     binary_fill_holes,
+    label as component_labels,
     distance_transform_edt,
 )
 from skimage.filters import threshold_otsu
@@ -300,6 +301,67 @@ def propose_profile_mask(image: Image.Image) -> tuple[np.ndarray, ProfileProposa
         profile_area=int(chosen["area"]))
 
 
+def recover_profile_mask(
+    image: Image.Image,
+    current_mask: np.ndarray | Image.Image,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Recover thick profile ink connected to a reviewed mask.
+
+    This is the in-app version of the training curator's ``G`` recovery tool.
+    It grows only from a thick ink core that touches the current mask, so long
+    construction lines and isolated side branches are not pulled in.
+    """
+    image = image.convert("RGB")
+    if isinstance(current_mask, Image.Image):
+        current = np.asarray(current_mask.convert("L")) > 32
+    else:
+        current = np.asarray(current_mask) > 0
+    if current.shape != (image.height, image.width):
+        raise ValueError("Current profile mask dimensions do not match the crop")
+
+    proposed_raw, evidence = propose_profile_mask(image)
+    proposed = np.asarray(proposed_raw) > 0
+    loose_ink, _threshold = _ink_mask(image, loose=True)
+    guided = np.zeros_like(current, dtype=bool)
+    if loose_ink.any() and current.any():
+        thickness = distance_transform_edt(loose_ink)
+        # Scale the curator's high-resolution radius to ordinary SherdScope crops while
+        # retaining a thick-core requirement that rejects hairline guides.
+        thick_radius = max(3.0, min(6.0, min(image.size) * 0.012))
+        thick_core = loose_ink & (thickness >= thick_radius)
+        labels, count = component_labels(
+            thick_core, structure=np.ones((3, 3), dtype=np.uint8)
+        )
+        if count:
+            contact = binary_dilation(current, iterations=3)
+            touching_labels = np.unique(labels[contact & (labels > 0)])
+            if touching_labels.size:
+                selected_core = np.isin(labels, touching_labels)
+                guided = loose_ink & binary_dilation(selected_core, iterations=5)
+                guided = np.asarray(binary_fill_holes(guided), dtype=bool)
+
+    recovery = guided if current.any() else proposed
+    if not recovery.any():
+        raise ValueError("No thick profile ink was found near the current mask")
+    agreement = 1.0
+    if current.any():
+        overlap = int((current & recovery).sum())
+        agreement = overlap / max(1, min(int(current.sum()), int(recovery.sum())))
+        if agreement < 0.45:
+            raise ValueError(
+                "The recovery proposal does not agree with this mask enough to apply safely"
+            )
+        recovered = current | recovery
+    else:
+        recovered = recovery
+    return recovered.astype(np.uint8) * 255, {
+        "added_pixels": int((recovered & ~current).sum()),
+        "agreement": round(float(agreement), 4),
+        "proposal_confidence": round(float(evidence.confidence), 4),
+        "proposal_reasons": evidence.reasons,
+    }
+
+
 def save_profile_mask(path: Path, mask: np.ndarray | Image.Image) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(mask, Image.Image):
@@ -309,16 +371,24 @@ def save_profile_mask(path: Path, mask: np.ndarray | Image.Image) -> None:
     output.save(path)
 
 
-def generate_profile_proposals(cards_dir: Path, force: bool = False) -> dict[str, Any]:
+def generate_profile_proposals(
+    cards_dir: Path,
+    force: bool = False,
+    target_filenames: set[str] | None = None,
+) -> dict[str, Any]:
     cards_dir = Path(cards_dir)
     document = read_profile_review(cards_dir)
     profiles = document["profiles"]
     generated = 0
     skipped_reviewed = 0
+    skipped_out_of_scope = 0
     failed = 0
 
     for card_path in list_card_files(cards_dir):
         filename = card_path.name
+        if target_filenames is not None and filename not in target_filenames:
+            skipped_out_of_scope += 1
+            continue
         record = dict(profiles.get(filename) or {})
         reviewed = record.get("review_status") in {"approved", "edited", "no_profile"}
         if reviewed and not force:
@@ -328,7 +398,10 @@ def generate_profile_proposals(cards_dir: Path, force: bool = False) -> dict[str
             mask, proposal = propose_profile_mask(Image.open(card_path))
             auto_path = profile_mask_path(cards_dir, filename, AUTO_DIR)
             save_profile_mask(auto_path, mask)
-            if force or not record.get("accepted_mask") or not reviewed:
+            # Automatic proposals and accepted reviewer masks are separate
+            # artifacts. Even an explicit auto-regeneration must never replace
+            # a reviewed accepted mask or return it to the pending queue.
+            if not record.get("accepted_mask") or not reviewed:
                 accepted_path = profile_mask_path(cards_dir, filename, ACCEPTED_DIR)
                 save_profile_mask(accepted_path, mask)
                 record["accepted_mask"] = accepted_path.relative_to(cards_dir).as_posix()
@@ -336,8 +409,8 @@ def generate_profile_proposals(cards_dir: Path, force: bool = False) -> dict[str
                 "filename": filename,
                 "auto_mask": auto_path.relative_to(cards_dir).as_posix(),
                 "proposal": proposal.as_dict(),
-                "review_status": "pending" if force else (record.get("review_status") or "pending"),
-                "review_note": "" if force else (record.get("review_note") or ""),
+                "review_status": record.get("review_status") or "pending",
+                "review_note": record.get("review_note") or "",
             })
             profiles[filename] = record
             generated += 1
@@ -364,6 +437,7 @@ def generate_profile_proposals(cards_dir: Path, force: bool = False) -> dict[str
         "total_cards": len(list_card_files(cards_dir)),
         "generated": generated,
         "skipped_reviewed": skipped_reviewed,
+        "skipped_out_of_scope": skipped_out_of_scope,
         "failed": failed,
     }
 
@@ -380,6 +454,7 @@ __all__ = [
     "list_card_files",
     "profile_mask_path",
     "propose_profile_mask",
+    "recover_profile_mask",
     "read_profile_review",
     "save_profile_mask",
     "write_profile_review",

@@ -205,6 +205,15 @@ def detect_hesban_scale(image_path: Path) -> dict[str, Any]:
 
 def normalize_calibration(calibration: dict[str, Any]) -> dict[str, Any]:
     result = dict(calibration or {})
+    # Older releases rejected otherwise structurally valid automatic rulers
+    # when their px/cm value differed from a single project-wide median. A
+    # source PDF can legitimately contain more than one scan scale, so migrate
+    # those saved false rejections back to automatic calibrations.
+    if (result.get("warning") == "scale_median_disagreement" and
+            result.get("p1") and result.get("p2")):
+        result.pop("warning", None)
+        result.pop("project_median_px_per_cm", None)
+        result["status"] = "verified_automatic"
     result.setdefault("real_cm", 10.0)
     result.setdefault("method", "manual" if result.get("p1") and result.get("p2") else "automatic")
     result.setdefault("status", "verified_manual" if result.get("method") == "manual"
@@ -578,31 +587,12 @@ def measure_figure(project_path: Path, figure: dict[str, Any], *,
                     break
         calibrations[image_name] = detected
 
-    ratios = []
-    for value in project_ratios:
-        try:
-            ratio = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(ratio) and ratio > 0:
-            ratios.append(ratio)
-    # Prefer genuinely independent pages. If this is the first measured
-    # figure, fall back to the within-figure median for consistency checks.
-    reference_ratios = ratios or [
-        float(calibration.get("px_per_cm"))
-        for calibration in calibrations.values()
-        if calibration.get("status") in {"suggested", "verified", "verified_automatic", "verified_manual"} and
-        calibration.get("px_per_cm")
-    ]
-    median = float(np.median(reference_ratios)) if reference_ratios else 0.0
+    # Retain the parameter for API compatibility with existing callers, but do
+    # not reject a structurally valid page ruler against a project-wide median.
+    # Hesban PDFs contain legitimate scan-scale changes within one source file.
+    _ = project_ratios
     for image_name, calibration in calibrations.items():
         calibration = normalize_calibration(calibration)
-        ratio = float(calibration.get("px_per_cm", 0) or 0)
-        if (median and ratio and abs(ratio - median) / median > 0.03 and
-                calibration.get("status") not in {"verified", "verified_manual"}):
-            calibration["status"] = "unresolved"
-            calibration["warning"] = "scale_median_disagreement"
-            calibration["project_median_px_per_cm"] = median
         calibrations[image_name] = calibration
     figure["scale_calibrations"] = calibrations
 

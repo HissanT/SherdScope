@@ -304,6 +304,7 @@ async function selectProject(projectId) {
         
         // Update UI
         currentProjectName.textContent = currentProject.project_name;
+        currentProjectName.title = currentProject.project_name;
         
         // Save to localStorage
         localStorage.setItem('currentProjectId', projectId);
@@ -425,6 +426,7 @@ function restoreSavedProject() {
                 if (data.success) {
                     currentProject = data.project;
                     currentProjectName.textContent = currentProject.project_name;
+                    currentProjectName.title = currentProject.project_name;
                     
                     // Notify other tabs about project (only once)
                     window.dispatchEvent(new CustomEvent('projectChanged', { 

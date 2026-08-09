@@ -9,6 +9,7 @@ source of truth.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -54,7 +55,7 @@ REVIEWER_OWNED_FIGURE_FIELDS = {
     "figure_id", "figure_caption", "table_rows", "table_pages",
     "warning_overrides", "reviewer_revision", "draft_saved_at",
     "review_history", "review_status", "processing_status", "matches",
-    "scale_calibrations", "review_overrides",
+    "scale_calibrations", "review_overrides", "reviewer_session",
 }
 _LINKAGE_STATE_LOCK = threading.RLock()
 
@@ -249,7 +250,16 @@ def bbox_fingerprint(image_name: str, bbox: Any) -> str:
 
 
 def mask_stem(value: Any) -> str:
-    return Path(str(value)).stem
+    """Return a stable card identifier without misreading dots in PDF names.
+
+    Extracted card names are commonly stored without an image extension.  A
+    source PDF name such as ``Hesban_3.1-3.50_...`` therefore must remain
+    intact; ``Path.stem`` would incorrectly truncate it at ``.50_...``.  Strip
+    only extensions that can actually belong to a card image.
+    """
+    text = str(value)
+    suffix = Path(text).suffix.lower()
+    return text[:-len(suffix)] if suffix in {".png", ".jpg", ".jpeg"} else text
 
 
 class PublicationProfile(ABC):
@@ -542,16 +552,18 @@ def _empty_state(profile: str) -> dict[str, Any]:
     }
 
 
-def _figure_key(figure: dict[str, Any]) -> str:
-    existing = str(figure.get("figure_key", "")).strip()
-    if existing:
-        return existing
+def _derived_figure_key(figure: dict[str, Any]) -> str:
     masks = sorted(mask_stem(drawing.get("mask_file", ""))
                    for drawing in figure.get("drawings", []) if drawing.get("mask_file"))
     pages = sorted(str(page.get("image_name", ""))
                    for page in figure.get("drawing_pages", []) if page.get("image_name"))
     seed = "|".join(masks or pages or [str(figure.get("figure_id", "unresolved"))])
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+
+
+def _figure_key(figure: dict[str, Any]) -> str:
+    existing = str(figure.get("figure_key", "")).strip()
+    return existing or _derived_figure_key(figure)
 
 
 def _warning_id(warning: dict[str, Any]) -> str:
@@ -561,6 +573,61 @@ def _warning_id(warning: dict[str, Any]) -> str:
     seed = "|".join(str(warning.get(key, "")) for key in
                     ("code", "message", "page", "row", "column", "mask_file"))
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _collapse_cross_source_duplicate_drawings(
+        figure: dict[str, Any], profile: PublicationProfile,
+        preferred_source: str = "") -> list[str]:
+    """Drop an exact repeated figure contributed by a complementary PDF.
+
+    A combined run can encounter a figure included in both chunks. Only treat
+    it as a duplicate when each source contains the same non-empty, unique set
+    of printed vessel numbers. Continued pages and genuinely ambiguous OCR are
+    therefore left untouched for review.
+    """
+    pages = figure.get("drawing_pages", [])
+    source_order = list(dict.fromkeys(
+        str(page.get("source_pdf") or "") for page in pages
+        if page.get("source_pdf")))
+    if len(source_order) < 2:
+        return []
+    page_sources = {
+        str(page.get("image_name") or ""): str(page.get("source_pdf") or "")
+        for page in pages
+    }
+    numbers_by_source: dict[str, list[str]] = {source: [] for source in source_order}
+    for drawing in figure.get("drawings", []):
+        source = page_sources.get(str(drawing.get("image_name") or ""), "")
+        if source in numbers_by_source:
+            numbers_by_source[source].append(
+                profile.normalize_number(drawing.get("vessel_number")))
+    keep_source = (preferred_source if preferred_source in source_order
+                   else source_order[0])
+    keep_numbers = numbers_by_source.get(keep_source, [])
+    if (not keep_numbers or any(not number for number in keep_numbers) or
+            len(keep_numbers) != len(set(keep_numbers))):
+        return []
+    keep_signature = sorted(keep_numbers, key=natural_key)
+    duplicates = [
+        source for source in source_order if source != keep_source
+        if (len(numbers_by_source.get(source, [])) == len(keep_numbers) and
+            sorted(numbers_by_source[source], key=natural_key) == keep_signature)
+    ]
+    if not duplicates:
+        return []
+    duplicate_pages = {
+        str(page.get("image_name") or "") for page in pages
+        if str(page.get("source_pdf") or "") in duplicates
+    }
+    figure["drawing_pages"] = [
+        page for page in pages
+        if str(page.get("source_pdf") or "") not in duplicates
+    ]
+    figure["drawings"] = [
+        drawing for drawing in figure.get("drawings", [])
+        if str(drawing.get("image_name") or "") not in duplicate_pages
+    ]
+    return duplicates
 
 
 def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
@@ -574,16 +641,57 @@ def _ensure_review_defaults(state: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             figure["reviewer_revision"] = 0
         figure.setdefault("warning_overrides", {})
-        figure.setdefault("scale_calibrations", {})
+        calibrations = figure.setdefault("scale_calibrations", {})
+        # Remove legacy project-median false rejections. Structural ruler
+        # detection is the source of automatic-scale validity; one PDF may
+        # legitimately contain pages rendered from different scan scales.
+        for calibration in calibrations.values():
+            if (isinstance(calibration, dict) and
+                    calibration.get("warning") == "scale_median_disagreement" and
+                    calibration.get("p1") and calibration.get("p2")):
+                calibration.pop("warning", None)
+                calibration.pop("project_median_px_per_cm", None)
+                calibration["status"] = "verified_automatic"
         override_layer = figure.setdefault("review_overrides", {})
         override_layer.setdefault("cells", {})
         override_layer.setdefault("deleted", [])
         override_layer.setdefault("added", [])
         figure.setdefault("draft_saved_at", "")
+        figure.setdefault("reviewer_session", "")
         figure.setdefault("processing_status", (
             "reviewable" if figure.get("matches") or state.get("status") == "complete"
             else "processing"))
         order_figure_table_rows(figure)
+    # Older versions used Path.stem for extensionless card IDs. A dot in a
+    # source PDF name (for example 3.1-3.50) could consequently give unrelated
+    # figures the same persistent key. Repair only collisions, preserving every
+    # already-unique key and all reviewer-owned data.
+    figures_by_key: dict[str, list[dict[str, Any]]] = {}
+    for figure in state.get("figures", []):
+        figures_by_key.setdefault(str(figure.get("figure_key", "")), []).append(figure)
+    used_keys = {
+        key for key, figures in figures_by_key.items() if key and len(figures) == 1
+    }
+    for old_key, figures in figures_by_key.items():
+        if old_key and len(figures) == 1:
+            continue
+        # Exact repeated records are separately deduplicated by the state API;
+        # retaining their stable key is what lets that recovery logic identify
+        # them. Only split a key that was shared by distinct figures.
+        identities = {
+            (str(figure.get("figure_id", "")), _derived_figure_key(figure))
+            for figure in figures
+        }
+        if old_key and len(identities) == 1:
+            used_keys.add(old_key)
+            continue
+        for figure in figures:
+            candidate = _derived_figure_key(figure)
+            if candidate in used_keys:
+                seed = f"{candidate}|{figure.get('figure_id', '')}"
+                candidate = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+            figure["figure_key"] = candidate
+            used_keys.add(candidate)
     return state
 
 
@@ -905,8 +1013,9 @@ class MetadataLinker:
             if not pages:
                 raise MetadataLinkError(f"Source PDF was not found in the page manifest: {self.source_pdf}")
         else:
-            if len(sources) > 1:
-                raise AmbiguousSourceError("Select one source PDF before running metadata linking.")
+            # A project may intentionally contain complementary PDF chunks.
+            # Treat their globally ordered manifest pages as one linking run;
+            # each page still retains its source_pdf provenance.
             pages = list(all_pages)
         pages = sorted(pages, key=lambda p: int(p.get("logical_index", 0)))
         page_by_stem = {Path(p["image_name"]).stem: p for p in pages}
@@ -929,6 +1038,33 @@ class MetadataLinker:
             self.profile.normalize_figure(figure.get("figure_id")): figure
             for figure in state.get("figures", [])
         } if can_resume else {}
+        # A normal fresh run is also used after another PDF is appended to an
+        # existing project. Keep completed figures frozen instead of turning
+        # them back into pending OCR work. Geometry/card edits already pass
+        # through invalidate_linkage_for_card_changes(), which removes approval,
+        # so only genuinely unchanged completed records qualify here.
+        frozen_approved_ids: set[str] = set()
+        if not can_resume:
+            for figure_id, previous_figure in previous_figures.items():
+                previous_sources = {
+                    str(page.get("source_pdf") or "")
+                    for page in previous_figure.get("drawing_pages", [])
+                    if isinstance(page, dict)
+                }
+                if self.source_pdf and self.source_pdf not in previous_sources:
+                    # A source-specific run must not make unrelated reviewed or
+                    # draft figures disappear from the combined project state.
+                    figures[figure_id] = deepcopy(previous_figure)
+                    if (previous_figure.get("review_status") == "approved"
+                            and previous_figure.get("processing_status") == "approved"
+                            and previous_figure.get("status") == "ready"):
+                        frozen_approved_ids.add(figure_id)
+                    continue
+                if (figure_id and previous_figure.get("review_status") == "approved"
+                        and previous_figure.get("processing_status") == "approved"
+                        and previous_figure.get("status") == "ready"):
+                    figures[figure_id] = deepcopy(previous_figure)
+                    frozen_approved_ids.add(figure_id)
         processed_drawing_pages = {
             page.get("image_name") for figure in figures.values()
             for page in figure.get("drawing_pages", [])
@@ -943,6 +1079,12 @@ class MetadataLinker:
             image_path = self.project_path / "images" / page["image_name"]
             context = self.profile.detect_figure_context(page.get("page_text", ""))
             context.update(page)
+            context_figure_id = self.profile.normalize_figure(
+                context.get("figure_id"))
+            if context_figure_id in frozen_approved_ids:
+                # The page may appear again through a newly appended PDF chunk.
+                # The existing approved figure remains the canonical record.
+                continue
             result = self.extractor.extract_drawing_identifiers(image_path, grouped[image_stem], context) or {}
             figure_id = self.profile.normalize_figure(result.get("figure_id") or context.get("figure_id"))
             if not figure_id:
@@ -1013,10 +1155,30 @@ class MetadataLinker:
         state["progress"] = {"current": len(drawing_pages), "total": total_work,
                              "message": "Starting table extraction"}
         for queued_figure in figures.values():
-            if not can_resume or queued_figure.get("processing_status") in {"processing", "queued"}:
+            queued_figure_id = self.profile.normalize_figure(
+                queued_figure.get("figure_id"))
+            if (queued_figure_id not in frozen_approved_ids and
+                    (not can_resume or queued_figure.get("processing_status") in
+                     {"processing", "queued"})):
                 queued_figure["processing_status"] = "queued"
         save_linkage_state(self.project_path, {**state, "figures": list(figures.values())})
         for figure_index, figure in enumerate(figures.values(), 1):
+            normalized_figure_id = self.profile.normalize_figure(
+                figure.get("figure_id"))
+            if normalized_figure_id in frozen_approved_ids:
+                current = len(drawing_pages) + figure_index
+                state["progress"] = {
+                    "current": current, "total": total_work,
+                    "message": (
+                        f"Kept approved figure {figure.get('figure_id')} "
+                        f"({figure_index}/{len(figures)})"
+                    ),
+                }
+                save_linkage_state(
+                    self.project_path, {**state, "figures": list(figures.values())})
+                if progress:
+                    progress(current, total_work, state["progress"]["message"])
+                continue
             if (can_resume and figure.get("processing_status") not in
                     {"processing", "queued"}):
                 continue
@@ -1036,19 +1198,43 @@ class MetadataLinker:
             positions = [p for p in positions if p is not None]
             if not positions:
                 continue
-            start, end = min(positions), max(positions) + self.profile.candidate_lookahead
             seen_rows: set[tuple[str, str]] = set()
             max_drawing_bottom: dict[str, int] = {}
             for drawing in figure["drawings"]:
                 max_drawing_bottom[drawing["image_name"]] = max(
                     max_drawing_bottom.get(drawing["image_name"], 0), int(drawing["bbox"][3]))
 
-            for pos in range(start, min(end + 1, len(pages))):
+            # Search a short window within each contributing PDF separately.
+            # Taking one min/max range across combined chunks would traverse
+            # every intervening figure when the same drawing exists in both.
+            candidate_positions: list[int] = []
+            positions_by_source: dict[str, list[int]] = {}
+            for drawing_page in figure.get("drawing_pages", []):
+                pos = page_pos.get(Path(drawing_page["image_name"]).stem)
+                source = str(drawing_page.get("source_pdf") or "")
+                if pos is not None:
+                    positions_by_source.setdefault(source, []).append(pos)
+            for source, source_positions in positions_by_source.items():
+                source_last = max(source_positions)
+                for pos in range(min(source_positions), min(
+                        source_last + self.profile.candidate_lookahead + 1,
+                        len(pages))):
+                    candidate = pages[pos]
+                    if str(candidate.get("source_pdf") or "") != source:
+                        break
+                    candidate_context = self.profile.detect_figure_context(
+                        candidate.get("page_text", ""))
+                    explicit = candidate_context.get("figure_id", "")
+                    if (pos > source_last and explicit and
+                            explicit != figure["figure_id"]):
+                        break
+                    if pos not in candidate_positions:
+                        candidate_positions.append(pos)
+
+            for pos in candidate_positions:
                 candidate = pages[pos]
                 candidate_context = self.profile.detect_figure_context(candidate.get("page_text", ""))
                 explicit = candidate_context.get("figure_id", "")
-                if pos > max(positions) and explicit and explicit != figure["figure_id"]:
-                    break
                 image_path = self.project_path / "images" / candidate["image_name"]
                 crop = None
                 bottom = max_drawing_bottom.get(candidate["image_name"])
@@ -1175,6 +1361,13 @@ class MetadataLinker:
                         clean["source_printed_page"] = retry.get("printed_page") or candidate.get("printed_page", "")
                         figure["table_rows"].append(clean)
                         missing.remove(normalized_number)
+            table_sources = list(dict.fromkeys(
+                str(page.get("source_pdf") or "")
+                for page in figure.get("table_pages", [])
+                if page.get("source_pdf")))
+            _collapse_cross_source_duplicate_drawings(
+                figure, self.profile,
+                preferred_source=(table_sources[0] if len(table_sources) == 1 else ""))
             try:
                 from catalog.measurements import measure_figure
                 figure_sources = {page.get("source_pdf") for page in figure.get("drawing_pages", [])}
